@@ -1,0 +1,9 @@
+Goals:
+Fix invalid reads.
+Make controller code robust to invalid reads
+add sound to gba. 
+
+
+v1.4 crashes on NSMB and ACWW startup, both of which feature pure white, here is what their error code says:
+ACWW: Invalid read from 0xffffffff, PC = 0x800e120c
+NSMB: Invalid read from 0xffffffff, PC = 0x800e120c

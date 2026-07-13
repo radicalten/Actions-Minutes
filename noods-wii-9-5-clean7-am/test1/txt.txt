@@ -1,0 +1,10 @@
+These are the completed files from clean7 -> sent to Actions-Minutes tested and compiled due to public repos get free minutes.
+
+The ultimate change of converting every single 2d and 3d texture from RGBA8 uint32_t to RGB5A3 unit16_t was far less than expected;
+1-2fps for 2d scenes
+1 fps for 3d scenes
+
+This is likely the true limit for wii running interpreter code. would have to write native GX calls themselves or a JIT or a combination or something to go beyond this. 
+
+
+The most surprising thing was that everything worked even after the heavy changes. it seems that 3D renderer .h/cpp still use some uint32 for correct alpha and edge marking bit 26 bit 15 etc. but I went as far as cson + gemini 3.5 flash high could do. 
