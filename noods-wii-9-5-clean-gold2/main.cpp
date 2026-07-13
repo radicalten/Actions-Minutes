@@ -349,6 +349,7 @@ static void InitializeSettings() {
     Settings::screenGhost  = 0;
     Settings::emulateAudio = 0;
     Settings::audio16Bit   = 0;
+    Settings::monoAudio    = 0; 
     Settings::savesFolder  = 1;
     Settings::statesFolder = 1;
     Settings::cheatsFolder = 1;
