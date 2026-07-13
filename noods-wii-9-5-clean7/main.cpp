@@ -29,6 +29,18 @@ extern "C" {
     #include <tuxedo/ppc/clock.h>
 }
 
+void* ConsoleUI::createTexture(uint16_t* data, int width, int height) {
+    return Wii_CreateTexture(data, width, height);
+}
+
+void* ConsoleUI::createTextureRGBA8(uint32_t* data, int width, int height) {
+    return Wii_CreateTextureRGBA8(data, width, height);
+}
+
+void ConsoleUI::destroyTexture(void* texture) {
+    Wii_DestroyTexture(texture);
+}
+
 #define EMULATION_STACK_SIZE (256 * 1024)
 #define AUDIO_STACK_SIZE     (64  * 1024)
 
