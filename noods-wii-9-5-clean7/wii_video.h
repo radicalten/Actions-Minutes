@@ -6,7 +6,6 @@
 #include <ogc/gx.h>
 #include <stdint.h>
 #include <stdbool.h>
-#include "console_ui.h"
 
 #define NDS_SCREEN_WIDTH  256
 #define NDS_SCREEN_HEIGHT 192
