@@ -347,8 +347,8 @@ static void InitializeSettings() {
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
     Settings::screenGhost  = 0;
-    Settings::emulateAudio = 1;
-    Settings::audio16Bit   = 1;
+    Settings::emulateAudio = 0;
+    Settings::audio16Bit   = 0;
     Settings::monoAudio    = 0; 
     Settings::savesFolder  = 1;
     Settings::statesFolder = 1;
