@@ -32,6 +32,12 @@ class Core;
 struct Vertex;
 struct _Polygon;
 
+// Add above Gpu3DRenderer class
+struct RendererThreadArg {
+    Gpu3DRenderer* renderer;
+    int threadId;
+};
+
 class Gpu3DRenderer {
 public:
     Gpu3DRenderer(Core *core);
@@ -57,6 +63,7 @@ public:
     void writeToonTable(int index, uint16_t mask, uint16_t value);
 
 private:
+    RendererThreadArg threadArgs[4];  // Add this property
     Core *core;
 
     bool resShift = false;
