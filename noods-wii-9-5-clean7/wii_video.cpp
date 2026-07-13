@@ -1,23 +1,3 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
 #include "wii_video.h"
 #include <gccore.h>
 #include <string.h>
@@ -174,33 +154,25 @@ static void DrawCharToStaging(int col, int row, char c,
     }
 }
 
-
-//  tile a buffer of packed RGB5A3 words into GX_TF_RGB5A3 format.
-//  GX_TF_RGB5A3 tiles are 4×4 pixels, each pixel = 2 bytes (big-endian).
-//  One tile = 32 bytes.
-//  src[] : one uint32_t per pixel; the RGB5A3 word is in bits[15:0].
-//          (The gpu_2d.cpp framebuffer is uint32_t[] for alignment, but
-//           only the lower 16 bits carry valid colour data.)
-//  dest  : output tile buffer (32-byte-aligned GX texture memory)
-static void TileImageRGB5A3(const uint32_t* src, u8* dest,
-                              int width, int height) {
-    const int tilesX = width  >> 2;   // width  must be a multiple of 4
-    const int tilesY = height >> 2;   // height must be a multiple of 4
+// Highly optimized tiling. Since the Wii CPU is big-endian, we copy words directly!
+static void TileImageRGB5A3(const uint16_t* src, u8* dest,
+                            int width, int height) {
+    const int tilesX = width  >> 2;   
+    const int tilesY = height >> 2;   
 
     for (int ty = 0; ty < tilesY; ty++) {
         for (int tx = 0; tx < tilesX; tx++) {
-            // Each tile is 32 bytes (4×4 pixels × 2 bytes each)
-            u8* tile = dest + (ty * tilesX + tx) * 32;
+            // Treat the 32-byte target block as aligned 16-bit pointers.
+            uint16_t* tile = (uint16_t*)(dest + (ty * tilesX + tx) * 32);
 
             for (int py = 0; py < 4; py++) {
-                const uint32_t* row = src + (ty * 4 + py) * width + tx * 4;
-                for (int px = 0; px < 4; px++) {
-                    uint16_t rgb5a3 = (uint16_t)(row[px] & 0xFFFF);
-                    // GX expects big-endian 16-bit words
-                    int idx        = (py * 4 + px) * 2;
-                    tile[idx + 0]  = (u8)(rgb5a3 >> 8);   // high byte first
-                    tile[idx + 1]  = (u8)(rgb5a3 & 0xFF); // low byte second
-                }
+                const uint16_t* row = src + (ty * 4 + py) * width + tx * 4;
+                
+                // Directly copy 16-bit halfwords to leverage PowerPC instruction sets (no shifts required!)
+                tile[py * 4 + 0] = row[0];
+                tile[py * 4 + 1] = row[1];
+                tile[py * 4 + 2] = row[2];
+                tile[py * 4 + 3] = row[3];
             }
         }
     }
@@ -221,7 +193,6 @@ static void TileImageRGBA8_ARGB(const uint32_t* src, u8* dest,
                 const uint32_t* row = src + (ty * 4 + py) * width + tx * 4;
                 for (int px = 0; px < 4; px++) {
                     uint32_t p = row[px];
-                    // overlayStaging is 0xAARRGGBB
                     u8 a = (u8)((p >> 24) & 0xFF);
                     u8 r = (u8)((p >> 16) & 0xFF);
                     u8 g = (u8)((p >>  8) & 0xFF);
@@ -292,7 +263,8 @@ void Wii_VideoInit() {
     GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_CLR0, GX_CLR_RGBA, GX_RGBA8, 0);
     GX_SetVtxAttrFmt(GX_VTXFMT0, GX_VA_TEX0, GX_TEX_ST,   GX_F32,   0);
 
-    const size_t ndsBufSize = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2;
+    // Each native pixel requires exactly 2 bytes (RGB5A3)
+    const size_t ndsBufSize = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * sizeof(uint16_t);
 
     wiiVid.texDataTop    = (u8*)hw_mem2_align(ndsBufSize, 32);
     wiiVid.texDataBottom = (u8*)hw_mem2_align(ndsBufSize, 32);
@@ -322,7 +294,6 @@ void Wii_VideoInit() {
 }
 
 void Wii_DebugOverlayInit() {
-    // Overlay keeps RGBA8 
     const size_t bufSize = DEBUG_OVERLAY_WIDTH * DEBUG_OVERLAY_HEIGHT * 4;
     wiiDbg.texData = (u8*)hw_mem2_align(bufSize, 32);
     if (!wiiDbg.texData) wiiDbg.texData = (u8*)memalign(32, bufSize);
@@ -358,7 +329,7 @@ void Wii_DebugOverlayPrint(int line, const char* fmt, ...) {
     while (len < OVERLAY_COLS) buf[len++] = ' ';
     buf[OVERLAY_COLS] = '\0';
 
-    const uint32_t fg = 0xFFFFFFFF; // 0xAARRGGBB
+    const uint32_t fg = 0xFFFFFFFF; 
     const uint32_t bg = 0xC0000000;
 
     for (int col = 0; col < OVERLAY_COLS; col++)
@@ -393,7 +364,7 @@ static void Wii_DebugOverlayFlush() {
                         + srcY * DEBUG_OVERLAY_WIDTH + tx * 4;
 
                     for (int tpx = 0; tpx < 4; tpx++) {
-                        uint32_t p = srcRow[tpx]; // 0xAARRGGBB
+                        uint32_t p = srcRow[tpx]; 
                         u8 a = (u8)((p >> 24) & 0xFF);
                         u8 r = (u8)((p >> 16) & 0xFF);
                         u8 g = (u8)((p >>  8) & 0xFF);
@@ -447,12 +418,12 @@ static void DrawScreenQuad(GXTexObj* texObj,
     GX_End();
 }
 
-void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom, bool gbaMode) {
+void Wii_VideoRender(const uint16_t* srcTop, const uint16_t* srcBottom, bool gbaMode) {
     const int scrW = gbaMode ? GBA_SCREEN_WIDTH  : NDS_SCREEN_WIDTH;
     const int scrH = gbaMode ? GBA_SCREEN_HEIGHT : NDS_SCREEN_HEIGHT;
 
-    // RGB5A3: 2 bytes per pixel
-    const size_t bufSize = (size_t)scrW * scrH * 2;
+    // Buffer size calculated from elements directly (2 bytes per pixel)
+    const size_t bufSize = (size_t)scrW * scrH * sizeof(uint16_t);
 
     if (gbaMode != wiiVid.lastGbaMode) {
         GX_InitTexObj(&wiiVid.texObjTop,
@@ -472,7 +443,6 @@ void Wii_VideoRender(const uint32_t* srcTop, const uint32_t* srcBottom, bool gba
         wiiVid.lastGbaMode = gbaMode;
     }
 
-    // Upload screen textures using the new RGB5A3 tiling function
     if (srcTop) {
         TileImageRGB5A3(srcTop, wiiVid.texDataTop, scrW, scrH);
         DCFlushRange(wiiVid.texDataTop, bufSize);
