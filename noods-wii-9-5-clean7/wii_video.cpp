@@ -532,3 +532,67 @@ void Wii_VideoFlushAsync() {
     VIDEO_SetNextFramebuffer(wiiVid.xfbList[wiiVid.currentXfb]);
     VIDEO_Flush();
 }
+
+// -----------------------------------------------------------------------
+// Wii ConsoleUI platform hooks
+// -----------------------------------------------------------------------
+
+// Internal GX texture allocation record
+struct WiiTexture {
+    u8*      data;
+    GXTexObj obj;
+    size_t   bytes;
+    bool     isHeap; // true = memalign; false = static/MEM2
+};
+
+// Pool for ConsoleUI-created textures (small count, menu items, icons)
+// Uses memalign so GX can DMA them directly
+void* Wii_CreateTexture(uint16_t* data, int width, int height) {
+    // GX_TF_RGB5A3: 4×4 tiles, 2 bytes per pixel
+    size_t bytes = (size_t)width * height * 2;
+    u8* buf = (u8*)memalign(32, bytes);
+    if (!buf) return nullptr;
+
+    TileImageRGB5A3(data, buf, width, height);
+    DCFlushRange(buf, bytes);
+
+    WiiTexture* tex = new WiiTexture();
+    tex->data   = buf;
+    tex->bytes  = bytes;
+    tex->isHeap = true;
+
+    GX_InitTexObj(&tex->obj, buf, (u16)width, (u16)height,
+                  GX_TF_RGB5A3, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&tex->obj, GX_NEAR, GX_NEAR);
+
+    return (void*)tex;
+}
+
+void* Wii_CreateTextureRGBA8(uint32_t* data, int width, int height) {
+    // GX_TF_RGBA8: 4×4 tiles, 4 bytes per pixel
+    size_t bytes = (size_t)width * height * 4;
+    u8* buf = (u8*)memalign(32, bytes);
+    if (!buf) return nullptr;
+
+    TileImageRGBA8_ARGB(data, buf, width, height);
+    DCFlushRange(buf, bytes);
+
+    WiiTexture* tex = new WiiTexture();
+    tex->data   = buf;
+    tex->bytes  = bytes;
+    tex->isHeap = true;
+
+    GX_InitTexObj(&tex->obj, buf, (u16)width, (u16)height,
+                  GX_TF_RGBA8, GX_CLAMP, GX_CLAMP, GX_FALSE);
+    GX_InitTexObjFilterMode(&tex->obj, GX_LINEAR, GX_LINEAR);
+
+    return (void*)tex;
+}
+
+void Wii_DestroyTexture(void* texture) {
+    if (!texture) return;
+    WiiTexture* tex = (WiiTexture*)texture;
+    if (tex->isHeap && tex->data)
+        free(tex->data);
+    delete tex;
+}
