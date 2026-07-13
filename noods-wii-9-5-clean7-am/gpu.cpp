@@ -77,36 +77,38 @@ bool Gpu::getFrame(uint16_t *out, bool gbaCrop) {
                 out[y * 240 + x] = buffers.framebuffer[y * 256 + x];
     }
     else if (core->gbaMode) {
-        // Full GBA display with NDS border fill
-        int      offset = (powCnt1 & BIT(15)) ? 0 : (256 * 192);
-        uint32_t base   = 0x6800000 + gbaBlock * 0x20000;
-        gbaBlock = !gbaBlock;
+    int      offset = (powCnt1 & BIT(15)) ? 0 : (256 * 192);
+    uint32_t base   = 0x6800000 + gbaBlock * 0x20000;
+    gbaBlock = !gbaBlock;
 
-        for (int y = 0; y < 192; y++) {
-            for (int x = 0; x < 256; x++) {
-                if (x >= 8 && x < 248 && y >= 16 && y < 176) {
-                    out[offset + y * 256 + x] =
-                        buffers.framebuffer[(y - 16) * 256 + (x - 8)];
-                }
-                else {
-                    // Border: raw DS RGB5 from VRAM → RGB5A3
-                    uint16_t raw = core->memory.read<uint16_t>(
-                        0, base + (y * 256 + x) * 2);
+    for (int y = 0; y < 192; y++) {
+        for (int x = 0; x < 256; x++) {
+            if (x >= 8 && x < 248 && y >= 16 && y < 176) {
+                out[offset + y * 256 + x] =
+                    buffers.framebuffer[(y - 16) * 256 + (x - 8)];
+            }
+            else {
+                // Guard: only read VRAM if bank is likely mapped
+                uint32_t addr = base + (y * 256 + x) * 2;
+                if (addr < 0x6840000) {  // Stay within VRAM B bounds
+                    uint16_t raw = core->memory.read<uint16_t>(0, addr);
                     uint8_t r5 = ( raw        & 0x1F);
                     uint8_t g5 = ((raw >>  5) & 0x1F);
                     uint8_t b5 = ((raw >> 10) & 0x1F);
                     out[offset + y * 256 + x] = (uint16_t)(
-                        0x8000u
-                        | ((uint16_t)r5 << 10)
-                        | ((uint16_t)g5 <<  5)
-                        |  (uint16_t)b5);
+                        0x8000u | ((uint16_t)r5 << 10)
+                               | ((uint16_t)g5 <<  5)
+                               |  (uint16_t)b5);
+                } else {
+                    out[offset + y * 256 + x] = 0x8000u; // Black border
                 }
             }
         }
-        // Clear the unused screen half
-        memset(&out[256 * 192 - offset], 0,
-               256 * 192 * sizeof(uint16_t));
     }
+    // Fix the memset: clear only the unused half
+    int unusedOffset = (offset == 0) ? (256 * 192) : 0;
+    memset(&out[unusedOffset], 0, 256 * 192 * sizeof(uint16_t));
+}
     else {
         // Normal NDS mode: copy both screens (top + bottom) as RGB5A3
         for (int i = 0; i < 256 * 192 * 2; i++)
@@ -463,16 +465,16 @@ void Gpu::scanline355() {
 
             // hi-res 3D: getLine() now returns uint16_t*
             if (Settings::highRes3D &&
-                (core->gpu2D[0].readDispCnt() & BIT(3))) {
-                // 256×192×4 pixels at full hi-res
-                const int hiResPixels = 256 * 192 * 4;
-                buffers.hiRes3D = new uint16_t[hiResPixels];
-                uint16_t *line0 = core->gpu3DRenderer.getLine(0);
-                memcpy(buffers.hiRes3D, line0,
-                       hiResPixels * sizeof(uint16_t));
-                buffers.top3D = (powCnt1 & BIT(15));
-            }
-
+    (core->gpu2D[0].readDispCnt() & BIT(3))) {
+    const int hiResPixels = 256 * 192 * 4;
+    uint16_t *line0 = core->gpu3DRenderer.getLine(0);
+    if (line0) {  // ← Guard null return
+        buffers.hiRes3D = new uint16_t[hiResPixels];
+        memcpy(buffers.hiRes3D, line0,
+               hiResPixels * sizeof(uint16_t));
+        buffers.top3D = (powCnt1 & BIT(15));
+    }
+}
             PPCIrqState st = PPCIrqLockByMsr();
             framebuffers.push(buffers);
             ready = true;
