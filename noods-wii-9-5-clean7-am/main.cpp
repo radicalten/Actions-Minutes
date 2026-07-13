@@ -171,10 +171,11 @@ static volatile int16_t  g_ndsTouchX   = 0;
 static volatile int16_t  g_ndsTouchY   = 0;
 
 // Tracks whether the last WPAD_Data() read was valid.
-// If it was not, we preserve the previous button state
-// instead of wiping it — this prevents losing controls
-// during transient emulator faults.
 static bool g_lastWpadReadValid = true;
+
+// Core fault tracking
+static volatile bool g_coreFaulted   = false;
+static volatile bool g_coreResetting = false;
 
 struct PerformanceState {
     uint32_t renderFrameCount;
@@ -268,7 +269,8 @@ static sptr AudioThreadMain(void* /*arg*/)
         bool     ok   = false;
         const bool mono = (Settings::monoAudio != 0);
 
-        if (romLoaded && ndsCore) {
+        // Don't pull samples while the core is being reset
+        if (romLoaded && ndsCore && !g_coreResetting) {
             if (ndsCore->gbaMode) {
                 uint32_t* src = PullSpuSamples(WIIAUD_GBA_FRAMES);
                 if (src) {
@@ -404,17 +406,94 @@ static void UpdateFileBrowser(const std::string& path) {
 // 16-bit intermediate frame composite buffer
 alignas(32) static uint16_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2];
 
+// ---------------------------------------------------------------------------
+// Tears down the faulted core and reloads the same ROM cleanly.
+// Must only be called from the emulator thread.
+// ---------------------------------------------------------------------------
+static void ResetFaultedCore()
+{
+    g_coreResetting = true;
+    romLoaded       = false;
+
+    // Snapshot the ROM path before deleting anything
+    PPCIrqState st = PPCIrqLockByMsr();
+    std::string savedPath = romToLoadPath;
+    PPCIrqUnlockByMsr(st);
+
+    // Delete the faulted core
+    delete ndsCore;
+    ndsCore = nullptr;
+
+    // Clear stale frame data so the renderer does not use it
+    const size_t bufSize =
+        NDS_SCREEN_WIDTH * (NDS_SCREEN_HEIGHT * 2) * sizeof(uint16_t);
+    {
+        PPCIrqState st2 = PPCIrqLockByMsr();
+        memset(backBuffer,  0, bufSize);
+        memset(frontBuffer, 0, bufSize);
+        newFrameReady = false;
+        PPCIrqUnlockByMsr(st2);
+    }
+
+    // Brief pause so the audio thread stops trying to pull from
+    // the now-deleted core
+    KThreadSleepMs(32);
+
+    // Reload the same ROM
+    if (!savedPath.empty()) {
+        std::string ndsRom, gbaRom;
+        size_t extPos = savedPath.find_last_of('.');
+        if (extPos != std::string::npos) {
+            std::string ext = savedPath.substr(extPos);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext == ".gba") gbaRom = savedPath;
+            else               ndsRom = savedPath;
+        }
+
+        try {
+            ndsCore = new Core(ndsRom, gbaRom);
+
+            PPCIrqState st3 = PPCIrqLockByMsr();
+            romLoaded       = true;
+            g_coreFaulted   = false;
+            g_coreResetting = false;
+            PPCIrqUnlockByMsr(st3);
+        }
+        catch (...) {
+            ndsCore         = nullptr;
+            g_coreFaulted   = false;
+            g_coreResetting = false;
+        }
+    } else {
+        g_coreFaulted   = false;
+        g_coreResetting = false;
+    }
+}
+
 static sptr EmulatorThreadMain(void* /*arg*/) {
     const size_t pixelCount = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2;
 
+    // Counts consecutive frames with no output — used to detect a
+    // silently faulted core (e.g. after an invalid bus read that
+    // returned 0xFFFFFFFF and corrupted internal core state).
+    int  noFrameCount = 0;
+    const int MAX_NO_FRAMES = 3;
+
     while (runEmulatorThread) {
+
+        // ------------------------------------------------------------
+        // ROM load request
+        // ------------------------------------------------------------
         if (triggerRomLoad) {
+            noFrameCount = 0;
+
             std::string loadPath;
             {
                 PPCIrqState st = PPCIrqLockByMsr();
                 loadPath       = romToLoadPath;
                 triggerRomLoad = false;
                 romLoaded      = false;
+                g_coreFaulted  = false;
                 PPCIrqUnlockByMsr(st);
             }
 
@@ -439,7 +518,20 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
             }
         }
 
+        // ------------------------------------------------------------
+        // Wait out any in-progress reset
+        // ------------------------------------------------------------
+        if (g_coreResetting) {
+            KThreadSleepMs(8);
+            continue;
+        }
+
+        // ------------------------------------------------------------
+        // Main emulation step
+        // ------------------------------------------------------------
         if (romLoaded && ndsCore) {
+
+            // Apply inputs
             {
                 PPCIrqState st  = PPCIrqLockByMsr();
                 uint16_t buttons  = g_ndsButtons;
@@ -461,14 +553,34 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
                 }
             }
 
+            // Run one core step. If the NDS bus handler returns
+            // 0xFFFFFFFF for an invalid read, the core continues
+            // running with corrupted internal state — it does not
+            // throw. We detect this afterwards via the frame output.
             ndsCore->runCore();
 
-            // Get frame outputs directly in 16-bit RGB5A3
-            if (ndsCore->gpu.getFrame(tempBuffer, ndsCore->gbaMode)) {
+            // Check frame output
+            bool gotFrame = ndsCore->gpu.getFrame(tempBuffer,
+                                                   ndsCore->gbaMode);
+            if (gotFrame) {
+                // Successful frame — reset the fault counter
+                noFrameCount = 0;
+
                 PPCIrqState st = PPCIrqLockByMsr();
-                memcpy(backBuffer, tempBuffer, pixelCount * sizeof(uint16_t));
+                memcpy(backBuffer, tempBuffer,
+                       pixelCount * sizeof(uint16_t));
                 newFrameReady = true;
                 PPCIrqUnlockByMsr(st);
+            } else {
+                // No frame this call — may be normal pipelining or
+                // may be a sign the core has lost coherence.
+                noFrameCount++;
+                if (noFrameCount >= MAX_NO_FRAMES && !g_coreResetting) {
+                    // Treat as a soft fault: reload the ROM cleanly
+                    g_coreFaulted = true;
+                    noFrameCount  = 0;
+                    ResetFaultedCore();
+                }
             }
         }
         else {
@@ -520,14 +632,17 @@ static void InitializeNDS() {
     }
 
     emulatorThreadStack = (u8*)Noods_MEM2_Alloc(EMULATION_STACK_SIZE);
-    if (!emulatorThreadStack) emulatorThreadStack = (u8*)malloc(EMULATION_STACK_SIZE);
+    if (!emulatorThreadStack)
+        emulatorThreadStack = (u8*)malloc(EMULATION_STACK_SIZE);
 
     if (Settings::emulateAudio) {
         audioThreadStack = (u8*)Noods_MEM2_Alloc(AUDIO_STACK_SIZE);
-        if (!audioThreadStack) audioThreadStack = (u8*)malloc(AUDIO_STACK_SIZE);
+        if (!audioThreadStack)
+            audioThreadStack = (u8*)malloc(AUDIO_STACK_SIZE);
     }
 
-    if (!emulatorThreadStack || (Settings::emulateAudio && !audioThreadStack)) {
+    if (!emulatorThreadStack ||
+        (Settings::emulateAudio && !audioThreadStack)) {
         while (true) KThreadSleepMs(16);
     }
 
@@ -548,37 +663,36 @@ static void InitializeNDS() {
 
 // ---------------------------------------------------------------------------
 // Validate a WPADData pointer before touching any of its fields.
-//
-// WPAD_Data() may return a pointer whose contents are being updated
-// asynchronously by the WPAD IRQ handler, or may be in a partially
-// written state if an exception (e.g. the emulator's invalid read)
-// interrupted that handler.  We check:
-//   1. The pointer itself is non-null and falls inside the normal
-//      MEM1 heap range (0x80003000 – 0x817FFFFF).  The sentinel
-//      value seen in the error (0xFFFFFFFF) is caught here.
-//   2. The expansion-controller type is one of the four known-good
-//      values, so we never index struct fields through a garbage type.
-// If either check fails we return false and the caller keeps the
-// previous button state rather than corrupting it.
 // ---------------------------------------------------------------------------
 static inline bool IsWpadDataSafe(const WPADData* d)
 {
     if (!d) return false;
 
-    // Sanity-check pointer range: must be inside normal MEM1
     const uintptr_t addr = (uintptr_t)d;
     if (addr < 0x80003000u || addr > 0x817FFFFFu) return false;
 
-    // Validate expansion type field (only four values are legal)
     const u32 expType = d->exp.type;
-    if (expType != WPAD_EXP_NONE     &&
-        expType != WPAD_EXP_NUNCHUK  &&
-        expType != WPAD_EXP_CLASSIC  &&
+    if (expType != WPAD_EXP_NONE        &&
+        expType != WPAD_EXP_NUNCHUK     &&
+        expType != WPAD_EXP_CLASSIC     &&
         expType != WPAD_EXP_GUITARHERO3) {
         return false;
     }
 
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// Re-initialize the WPAD subsystem after a detected fault.
+// ---------------------------------------------------------------------------
+static void RecoverWpad()
+{
+    WPAD_Shutdown();
+    KThreadSleepMs(50);
+    WPAD_Init();
+    WPAD_SetDataFormat(WPAD_CHAN_0, WPAD_FMT_BTNS_ACC_IR);
+    WPAD_SetVRes(WPAD_CHAN_0, 640, 480);
+    WPAD_ScanPads();
 }
 
 static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt,
@@ -612,29 +726,13 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt,
         if (held & WPAD_CLASSIC_BUTTON_Y)     nds |= (1 << NDS_KEY_Y);
         if (held & WPAD_CLASSIC_BUTTON_PLUS)  nds |= (1 << NDS_KEY_START);
         if (held & WPAD_CLASSIC_BUTTON_MINUS) nds |= (1 << NDS_KEY_SELECT);
-        if (held & (WPAD_CLASSIC_BUTTON_FULL_L | WPAD_CLASSIC_BUTTON_ZL)) nds |= (1 << NDS_KEY_L);
-        if (held & (WPAD_CLASSIC_BUTTON_FULL_R | WPAD_CLASSIC_BUTTON_ZR)) nds |= (1 << NDS_KEY_R);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_L | WPAD_CLASSIC_BUTTON_ZL))
+            nds |= (1 << NDS_KEY_L);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_R | WPAD_CLASSIC_BUTTON_ZR))
+            nds |= (1 << NDS_KEY_R);
     }
 
     return nds;
-}
-
-// Replace the ScanWiiInputs() function and add the recovery helper
-
-// ---------------------------------------------------------------------------
-// Re-initialize the WPAD subsystem after a detected fault.
-// Called when IsWpadDataSafe() returns false.
-// ---------------------------------------------------------------------------
-static void RecoverWpad()
-{
-    WPAD_Shutdown();
-    // Small delay to let the Bluetooth/WPAD stack settle
-    KThreadSleepMs(100);
-    WPAD_Init();
-    WPAD_SetDataFormat(WPAD_CHAN_0, WPAD_FMT_BTNS_ACC_IR);
-    WPAD_SetVRes(WPAD_CHAN_0, 640, 480);
-    // Flush any stale scan state
-    WPAD_ScanPads();
 }
 
 static void ScanWiiInputs() {
@@ -649,29 +747,24 @@ static void ScanWiiInputs() {
     WPADData* wdata    = WPAD_Data(0);
     bool      wpadSafe = IsWpadDataSafe(wdata);
 
-    // ------------------------------------------------------------------
-    // If WPAD data is corrupt, re-initialize the subsystem and retry
-    // once. If it is still bad after recovery we skip the Wiimote this
-    // frame but keep GC input working.
-    // ------------------------------------------------------------------
-    if (!wpadSafe)
-    {
+    // If WPAD data looks corrupt, attempt a full reinit and retry once
+    if (!wpadSafe) {
         RecoverWpad();
-
-        // Re-read everything after recovery
-        held    = WPAD_ButtonsHeld(0);
-        pressed = WPAD_ButtonsDown(0);
-        wdata   = WPAD_Data(0);
+        held     = WPAD_ButtonsHeld(0);
+        pressed  = WPAD_ButtonsDown(0);
+        wdata    = WPAD_Data(0);
         wpadSafe = IsWpadDataSafe(wdata);
     }
 
     g_lastWpadReadValid = wpadSafe;
 
+    // Snapshot expansion type once from a validated pointer
     u32  expType    = wpadSafe ? wdata->exp.type : (u32)WPAD_EXP_NONE;
     bool hasNunchuk = wpadSafe && (expType == WPAD_EXP_NUNCHUK);
     bool hasClassic = wpadSafe && (expType == WPAD_EXP_CLASSIC);
     u32  heldExt    = hasNunchuk ? held : 0;
 
+    // HOME is always honoured
     if ((pressed & WPAD_BUTTON_HOME) ||
         (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_HOME))) {
         runEmulatorThread = false;
@@ -691,7 +784,8 @@ static void ScanWiiInputs() {
 
             if (hasClassic && wpadSafe) {
                 float ly = wdata->exp.classic.ljs.mag *
-                           cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+                           cosf(wdata->exp.classic.ljs.ang *
+                                3.14159265f / 180.0f);
                 if (wdata->exp.classic.ljs.mag > 0.5f) {
                     if (ly >  0.5f) classicLStickUp   = true;
                     if (ly < -0.5f) classicLStickDown = true;
@@ -758,10 +852,12 @@ static void ScanWiiInputs() {
             }
 
             bool leftPressed  = (pressed & WPAD_BUTTON_LEFT)
-                              || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_LEFT))
+                              || (hasClassic &&
+                                  (pressed & WPAD_CLASSIC_BUTTON_LEFT))
                               || (gcPressed & PAD_BUTTON_LEFT);
             bool rightPressed = (pressed & WPAD_BUTTON_RIGHT)
-                              || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_RIGHT))
+                              || (hasClassic &&
+                                  (pressed & WPAD_CLASSIC_BUTTON_RIGHT))
                               || (gcPressed & PAD_BUTTON_RIGHT);
 
             if (leftPressed) {
@@ -779,7 +875,8 @@ static void ScanWiiInputs() {
             }
 
             bool aPressed = (pressed & WPAD_BUTTON_A)
-                          || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_A))
+                          || (hasClassic &&
+                              (pressed & WPAD_CLASSIC_BUTTON_A))
                           || (gcPressed & PAD_BUTTON_A);
 
             if (aPressed) {
@@ -813,7 +910,7 @@ static void ScanWiiInputs() {
                       || (gcPressed & PAD_BUTTON_B);
 
         if (bPressed) {
-            if (currentDir != "sd:/" &&
+            if (currentDir != "sd:/"  &&
                 currentDir != "sd://" &&
                 currentDir != "sd:") {
                 size_t slash = currentDir.find_last_of(
@@ -828,11 +925,16 @@ static void ScanWiiInputs() {
         }
     }
     else {
-        // If WPAD is still bad after recovery, preserve last known good
-        // Wiimote state but still update GC buttons.
+        // ------------------------------------------------------------------
+        // Emulation input path.
+        //
+        // If WPAD is still unsafe after the recovery attempt above, we
+        // preserve the last committed button state and layer GC inputs on
+        // top — the player never permanently loses control.
+        // ------------------------------------------------------------------
         if (!wpadSafe) {
             PPCIrqState st      = PPCIrqLockByMsr();
-            uint16_t ndsButtons = g_ndsButtons;
+            uint16_t ndsButtons = g_ndsButtons; // keep last good state
             PPCIrqUnlockByMsr(st);
 
             if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
@@ -849,11 +951,12 @@ static void ScanWiiInputs() {
 
             PPCIrqState st2 = PPCIrqLockByMsr();
             g_ndsButtons = ndsButtons;
+            // Leave touch state unchanged
             PPCIrqUnlockByMsr(st2);
             return;
         }
 
-        // Normal path — wdata is fully safe.
+        // Normal path — wdata is fully safe to dereference
         uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt,
                                                hasNunchuk, hasClassic);
 
@@ -989,9 +1092,8 @@ int main(int /*argc*/, char** /*argv*/) {
         const uint16_t* renderTop    = nullptr;
         const uint16_t* renderBottom = nullptr;
 
-        // Snapshot romLoaded and gbaMode under a lock to avoid racing
-        // with the emulator thread which may be destroying/recreating
-        // ndsCore at the same time.
+        // Snapshot these under a lock to avoid racing with the emulator
+        // thread which may be destroying/recreating ndsCore
         bool isRomLoaded = false;
         bool isGbaMode   = false;
         {
@@ -1017,7 +1119,8 @@ int main(int /*argc*/, char** /*argv*/) {
             if (isGbaMode)
                 renderBottom = bottomScreenBuffer;
             else
-                renderBottom = frontBuffer + (NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT);
+                renderBottom = frontBuffer +
+                               (NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT);
         }
         else {
             renderTop    = topScreenBuffer;
@@ -1051,8 +1154,8 @@ int main(int /*argc*/, char** /*argv*/) {
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
-            // Show a small indicator when WPAD data was untrustworthy
-            // so the developer knows a fault occurred this frame.
+            // Show WPAD ERR on line 0 if the last read was bad so the
+            // developer knows a fault frame occurred
             const char* wpadStatus = g_lastWpadReadValid ? " " : "WPAD ERR";
             Wii_DebugOverlayPrint(0, "%s", wpadStatus);
             Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
