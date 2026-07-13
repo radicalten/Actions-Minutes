@@ -1,27 +1,16 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+//interpreter.h (optimized)
 #pragma once
 
 #include <cstdint>
 #include "defines.h"
+
+// PowerPC-specific optimization attributes
+#define PPC_LIKELY(x)    __builtin_expect(!!(x), 1)
+#define PPC_UNLIKELY(x)  __builtin_expect(!!(x), 0)
+#define ALWAYS_INLINE    __attribute__((always_inline)) inline
+#define HOT              __attribute__((hot))
+#define COLD             __attribute__((cold))
+#define ALIGNED(n)       __attribute__((aligned(n)))
 
 class Core;
 class HleBios;
@@ -53,14 +42,14 @@ public:
     void sendInterrupt(int bit);
     void interrupt();
 
-    bool isThumb() { return cpsr & BIT(5); }
-    uint32_t getPC() { return *registers[15]; }
+    ALWAYS_INLINE bool isThumb() { return cpsr & BIT(5); }
+    ALWAYS_INLINE uint32_t getPC() { return *registers[15]; }
     int handleHleIrq();
 
-    uint8_t readIme() { return ime; }
-    uint32_t readIe() { return ie; }
-    uint32_t readIrf() { return irf; }
-    uint8_t readPostFlg() { return postFlg; }
+    uint8_t readIme()    { return ime; }
+    uint32_t readIe()    { return ie; }
+    uint32_t readIrf()   { return irf; }
+    uint8_t readPostFlg(){ return postFlg; }
 
     void writeIme(uint8_t value);
     void writeIe(uint32_t mask, uint32_t value);
@@ -74,9 +63,10 @@ private:
     uint8_t *pcData = nullptr;
     uint32_t pipeline[2] = {};
 
-    uint32_t *registers[32] = {};
-    uint32_t registersUsr[16] = {};
-    uint32_t registersFiq[7] = {};
+    // Align register arrays for better cache performance
+    uint32_t * ALIGNED(16) registers[32] = {};
+    uint32_t ALIGNED(16) registersUsr[16] = {};
+    uint32_t ALIGNED(16) registersFiq[7] = {};
     uint32_t registersSvc[2] = {};
     uint32_t registersAbt[2] = {};
     uint32_t registersIrq[2] = {};
@@ -98,7 +88,7 @@ private:
     static const uint8_t condition[0x100];
     static const uint8_t bitCount[0x100];
 
-    int runOpcode();
+    HOT int runOpcode();
     int exception(uint8_t vector);
     void flushPipeline();
     void swapRegisters(uint32_t value);
@@ -109,55 +99,57 @@ private:
     int unkArm(uint32_t opcode);
     int unkThumb(uint16_t opcode);
 
-    int32_t clampQ(int64_t value);
+    ALWAYS_INLINE int32_t clampQ(int64_t value);
 
-    uint32_t lli(uint32_t opcode);
-    uint32_t llr(uint32_t opcode);
-    uint32_t lri(uint32_t opcode);
-    uint32_t lrr(uint32_t opcode);
-    uint32_t ari(uint32_t opcode);
-    uint32_t arr(uint32_t opcode);
-    uint32_t rri(uint32_t opcode);
-    uint32_t rrr(uint32_t opcode);
-    uint32_t imm(uint32_t opcode);
-    uint32_t lliS(uint32_t opcode);
-    uint32_t llrS(uint32_t opcode);
-    uint32_t lriS(uint32_t opcode);
-    uint32_t lrrS(uint32_t opcode);
-    uint32_t ariS(uint32_t opcode);
-    uint32_t arrS(uint32_t opcode);
-    uint32_t rriS(uint32_t opcode);
-    uint32_t rrrS(uint32_t opcode);
-    uint32_t immS(uint32_t opcode);
+    // Shift operations - all inline for speed
+    ALWAYS_INLINE uint32_t lli(uint32_t opcode);
+    ALWAYS_INLINE uint32_t llr(uint32_t opcode);
+    ALWAYS_INLINE uint32_t lri(uint32_t opcode);
+    ALWAYS_INLINE uint32_t lrr(uint32_t opcode);
+    ALWAYS_INLINE uint32_t ari(uint32_t opcode);
+    ALWAYS_INLINE uint32_t arr(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rri(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rrr(uint32_t opcode);
+    ALWAYS_INLINE uint32_t imm(uint32_t opcode);
+    ALWAYS_INLINE uint32_t lliS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t llrS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t lriS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t lrrS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t ariS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t arrS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rriS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rrrS(uint32_t opcode);
+    ALWAYS_INLINE uint32_t immS(uint32_t opcode);
 
-    int _and(uint32_t opcode, uint32_t op2);
-    int eor(uint32_t opcode, uint32_t op2);
-    int sub(uint32_t opcode, uint32_t op2);
-    int rsb(uint32_t opcode, uint32_t op2);
-    int add(uint32_t opcode, uint32_t op2);
-    int adc(uint32_t opcode, uint32_t op2);
-    int sbc(uint32_t opcode, uint32_t op2);
-    int rsc(uint32_t opcode, uint32_t op2);
-    int tst(uint32_t opcode, uint32_t op2);
-    int teq(uint32_t opcode, uint32_t op2);
-    int cmp(uint32_t opcode, uint32_t op2);
-    int cmn(uint32_t opcode, uint32_t op2);
-    int orr(uint32_t opcode, uint32_t op2);
-    int mov(uint32_t opcode, uint32_t op2);
-    int bic(uint32_t opcode, uint32_t op2);
-    int mvn(uint32_t opcode, uint32_t op2);
-    int ands(uint32_t opcode, uint32_t op2);
-    int eors(uint32_t opcode, uint32_t op2);
-    int subs(uint32_t opcode, uint32_t op2);
-    int rsbs(uint32_t opcode, uint32_t op2);
-    int adds(uint32_t opcode, uint32_t op2);
-    int adcs(uint32_t opcode, uint32_t op2);
-    int sbcs(uint32_t opcode, uint32_t op2);
-    int rscs(uint32_t opcode, uint32_t op2);
-    int orrs(uint32_t opcode, uint32_t op2);
-    int movs(uint32_t opcode, uint32_t op2);
-    int bics(uint32_t opcode, uint32_t op2);
-    int mvns(uint32_t opcode, uint32_t op2);
+    // ALU operations
+    ALWAYS_INLINE int _and(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int eor(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int sub(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int rsb(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int add(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int adc(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int sbc(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int rsc(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int tst(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int teq(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int cmp(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int cmn(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int orr(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int mov(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int bic(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int mvn(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int ands(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int eors(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int subs(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int rsbs(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int adds(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int adcs(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int sbcs(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int rscs(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int orrs(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int movs(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int bics(uint32_t opcode, uint32_t op2);
+    ALWAYS_INLINE int mvns(uint32_t opcode, uint32_t op2);
 
     int _andLli(uint32_t opcode);
     int _andLlr(uint32_t opcode);
@@ -493,13 +485,13 @@ private:
     int negDpT(uint16_t opcode);
     int mulDpT(uint16_t opcode);
 
-    uint32_t ip(uint32_t opcode);
-    uint32_t ipH(uint32_t opcode);
-    uint32_t rp(uint32_t opcode);
-    uint32_t rpll(uint32_t opcode);
-    uint32_t rplr(uint32_t opcode);
-    uint32_t rpar(uint32_t opcode);
-    uint32_t rprr(uint32_t opcode);
+    ALWAYS_INLINE uint32_t ip(uint32_t opcode);
+    ALWAYS_INLINE uint32_t ipH(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rp(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rpll(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rplr(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rpar(uint32_t opcode);
+    ALWAYS_INLINE uint32_t rprr(uint32_t opcode);
 
     int ldrsbOf(uint32_t opcode, uint32_t op2);
     int ldrshOf(uint32_t opcode, uint32_t op2);
