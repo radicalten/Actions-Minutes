@@ -1,4 +1,4 @@
-// gpu_3d_renderer.cpp — complete corrected file
+//gpu_3d_renderer.cpp — complete corrected file
 
 #include <cstring>
 #include <vector>
@@ -6,26 +6,22 @@
 
 #include "core.h"
 
+// VRAM slot counts for bounds-checking getTexture / getPalette
+static const int TEX3D_SLOTS = 9;   // 9 × 128KB = 1152KB texture VRAM
+static const int PAL3D_SLOTS = 6;   // 6 ×  16KB =   96KB palette VRAM
+
 struct RendererThreadArg {
     Gpu3DRenderer* renderer;
     int threadId;
 };
 
 Gpu3DRenderer::Gpu3DRenderer(Core *core): core(core) {
-    // Initialize ready[] to 3 (complete) so getLine() returns
-    // the zero-initialized framebuffer safely before first frame
+    // ready[] initialised to 3 (complete) so early getLine() calls
+    // before the first frame return the zero-filled framebuffer safely.
+    // The member arrays are already zero-initialised by their in-class
+    // default initialisers — no memset needed here.
     for (int i = 0; i < 192 * 2; i++)
         ready[i] = 3;
-
-    // Ensure framebuffers are zero so early getLine() calls
-    // return black pixels rather than garbage
-    memset(framebuffer,   0, sizeof(framebuffer));
-    memset(depthBuffer,   0, sizeof(depthBuffer));
-    memset(attribBuffer,  0, sizeof(attribBuffer));
-    memset(stencilBuffer, 0, sizeof(stencilBuffer));
-    memset(stencilClear,  0, sizeof(stencilClear));
-    memset(polygonTop,    0, sizeof(polygonTop));
-    memset(polygonBot,    0, sizeof(polygonBot));
 }
 
 Gpu3DRenderer::~Gpu3DRenderer() {
@@ -39,25 +35,25 @@ Gpu3DRenderer::~Gpu3DRenderer() {
 }
 
 void Gpu3DRenderer::saveState(FILE *file) {
-    fwrite(&disp3DCnt, sizeof(disp3DCnt), 1, file);
-    fwrite(edgeColor,  2, sizeof(edgeColor) / 2, file);
-    fwrite(&clearColor, sizeof(clearColor), 1, file);
-    fwrite(&clearDepth, sizeof(clearDepth), 1, file);
-    fwrite(&fogColor,  sizeof(fogColor),  1, file);
-    fwrite(&fogOffset, sizeof(fogOffset), 1, file);
-    fwrite(fogTable,   1, sizeof(fogTable), file);
-    fwrite(toonTable,  2, sizeof(toonTable) / 2, file);
+    fwrite(&disp3DCnt,  sizeof(disp3DCnt),  1, file);
+    fwrite(edgeColor,   2, sizeof(edgeColor)  / 2, file);
+    fwrite(&clearColor, sizeof(clearColor),  1, file);
+    fwrite(&clearDepth, sizeof(clearDepth),  1, file);
+    fwrite(&fogColor,   sizeof(fogColor),    1, file);
+    fwrite(&fogOffset,  sizeof(fogOffset),   1, file);
+    fwrite(fogTable,    1, sizeof(fogTable),    file);
+    fwrite(toonTable,   2, sizeof(toonTable) / 2, file);
 }
 
 void Gpu3DRenderer::loadState(FILE *file) {
-    fread(&disp3DCnt, sizeof(disp3DCnt), 1, file);
-    fread(edgeColor,  2, sizeof(edgeColor) / 2, file);
-    fread(&clearColor, sizeof(clearColor), 1, file);
-    fread(&clearDepth, sizeof(clearDepth), 1, file);
-    fread(&fogColor,  sizeof(fogColor),  1, file);
-    fread(&fogOffset, sizeof(fogOffset), 1, file);
-    fread(fogTable,   1, sizeof(fogTable), file);
-    fread(toonTable,  2, sizeof(toonTable) / 2, file);
+    fread(&disp3DCnt,  sizeof(disp3DCnt),  1, file);
+    fread(edgeColor,   2, sizeof(edgeColor)  / 2, file);
+    fread(&clearColor, sizeof(clearColor),  1, file);
+    fread(&clearDepth, sizeof(clearDepth),  1, file);
+    fread(&fogColor,   sizeof(fogColor),    1, file);
+    fread(&fogOffset,  sizeof(fogOffset),   1, file);
+    fread(fogTable,    1, sizeof(fogTable),    file);
+    fread(toonTable,   2, sizeof(toonTable) / 2, file);
 }
 
 uint32_t Gpu3DRenderer::rgba5ToRgba6(uint32_t color) {
@@ -80,10 +76,10 @@ uint16_t *Gpu3DRenderer::getLine(int line) {
 uint16_t *Gpu3DRenderer::getLine1(int line) {
     int lineStride = 256 << resShift;
 
-    // Guard: clamp line to valid range
+    // Clamp line to valid range
     int maxLine = (192 << resShift) - 1;
-    if (line < 0)        line = 0;
-    if (line > maxLine)  line = maxLine;
+    if (line < 0)       line = 0;
+    if (line > maxLine) line = maxLine;
 
     PPCIrqState st = PPCIrqLockByMsr();
     int currentReady = ready[line];
@@ -94,7 +90,7 @@ uint16_t *Gpu3DRenderer::getLine1(int line) {
         int next = line + activeThreads * 2;
 
         st = PPCIrqLockByMsr();
-        int oldVal = ready[next];
+        int oldVal  = ready[next];
         ready[next] = 1;
         PPCIrqUnlockByMsr(st);
 
@@ -134,24 +130,23 @@ uint16_t *Gpu3DRenderer::getLine1(int line) {
 
 void Gpu3DRenderer::drawScanline(int line) {
     if (line == 0) {
-        // Guard polygonCountOut against impossible values
+        // Clamp polygon count to valid range
         int polyCount = core->gpu3D.polygonCountOut;
         if (polyCount < 0)    polyCount = 0;
         if (polyCount > 2048) polyCount = 2048;
 
         for (int i = 0; i < polyCount; i++) {
-            polygonTop[i] = 192 << 1;  // max internal line
+            polygonTop[i] = 192 << 1;
             polygonBot[i] = 0;
 
             _Polygon *polygon = &core->gpu3D.polygonsOut[i];
 
-            // Guard polygon->size
+            // Clamp polygon vertex count
             int polySize = polygon->size;
             if (polySize < 0)  polySize = 0;
             if (polySize > 10) polySize = 10;
 
             for (int j = 0; j < polySize; j++) {
-                // Guard vertex index
                 int vIdx = polygon->vertices + j;
                 if (vIdx < 0 || vIdx >= 6144) continue;
 
@@ -206,13 +201,13 @@ void Gpu3DRenderer::drawScanline(int line) {
         if (resShift) {
             for (int i = line * 2; i < line * 2 + 2; i++) {
                 drawScanline1(i);
-                if (i > 0) finishScanline(i - 1);
+                if (i > 0)   finishScanline(i - 1);
                 if (i == 383) finishScanline(383);
             }
         }
         else {
             drawScanline1(line);
-            if (line > 0) finishScanline(line - 1);
+            if (line > 0)   finishScanline(line - 1);
             if (line == 191) finishScanline(191);
         }
     }
@@ -231,7 +226,7 @@ void Gpu3DRenderer::drawThreaded(int thread) {
     for (i = thread; i < end; i += activeThreads) {
         PPCIrqState st = PPCIrqLockByMsr();
         int oldVal = ready[i];
-        ready[i] = 1;
+        ready[i]   = 1;
         PPCIrqUnlockByMsr(st);
 
         switch (oldVal) {
@@ -252,21 +247,21 @@ void Gpu3DRenderer::drawThreaded(int thread) {
         int prev = i - activeThreads;
 
         PPCIrqState st2 = PPCIrqLockByMsr();
-        bool isPrevLeftReady  = (prev > 0)       ?
-            (ready[prev - 1] < 2) : false;
+        bool isPrevLeftReady  =
+            (prev > 0)       ? (ready[prev - 1] < 2) : false;
         bool isPrevReady      = (ready[prev] < 2);
-        bool isPrevRightReady = (prev < end - 1) ?
-            (ready[prev + 1] < 2) : false;
+        bool isPrevRightReady =
+            (prev < end - 1) ? (ready[prev + 1] < 2) : false;
         PPCIrqUnlockByMsr(st2);
 
         while (isPrevLeftReady || isPrevReady || isPrevRightReady) {
             KThreadYield();
             st2 = PPCIrqLockByMsr();
-            isPrevLeftReady  = (prev > 0)       ?
-                (ready[prev - 1] < 2) : false;
+            isPrevLeftReady  =
+                (prev > 0)       ? (ready[prev - 1] < 2) : false;
             isPrevReady      = (ready[prev] < 2);
-            isPrevRightReady = (prev < end - 1) ?
-                (ready[prev + 1] < 2) : false;
+            isPrevRightReady =
+                (prev < end - 1) ? (ready[prev + 1] < 2) : false;
             PPCIrqUnlockByMsr(st2);
         }
 
@@ -281,21 +276,21 @@ void Gpu3DRenderer::drawThreaded(int thread) {
     if (prev < 0 || prev >= end) return;
 
     PPCIrqState st = PPCIrqLockByMsr();
-    bool isPrevLeftReady  = (prev > 0)       ?
-        (ready[prev - 1] < 2) : false;
+    bool isPrevLeftReady  =
+        (prev > 0)       ? (ready[prev - 1] < 2) : false;
     bool isPrevReady      = (ready[prev] < 2);
-    bool isPrevRightReady = (prev < end - 1) ?
-        (ready[prev + 1] < 2) : false;
+    bool isPrevRightReady =
+        (prev < end - 1) ? (ready[prev + 1] < 2) : false;
     PPCIrqUnlockByMsr(st);
 
     while (isPrevLeftReady || isPrevReady || isPrevRightReady) {
         KThreadYield();
         st = PPCIrqLockByMsr();
-        isPrevLeftReady  = (prev > 0)       ?
-            (ready[prev - 1] < 2) : false;
+        isPrevLeftReady  =
+            (prev > 0)       ? (ready[prev - 1] < 2) : false;
         isPrevReady      = (ready[prev] < 2);
-        isPrevRightReady = (prev < end - 1) ?
-            (ready[prev + 1] < 2) : false;
+        isPrevRightReady =
+            (prev < end - 1) ? (ready[prev + 1] < 2) : false;
         PPCIrqUnlockByMsr(st);
     }
 
@@ -315,10 +310,10 @@ void Gpu3DRenderer::drawScanline1(int line) {
     int32_t  depth  =
         (clearDepth == 0x7FFF) ? 0xFFFFFF : (clearDepth << 9);
     uint32_t attrib =
-        ((clearColor & BIT(15)) >> 2)         |
-        ((clearColor & 0x3F000000) >> 18)     |
-        ((clearColor & 0x3F000000) >> 24)     |
-        (0x3F << 15)                          |
+        ((clearColor & BIT(15)) >> 2)     |
+        ((clearColor & 0x3F000000) >> 18) |
+        ((clearColor & 0x3F000000) >> 24) |
+        (0x3F << 15)                      |
         (((clearColor & 0x001F0000) &&
           ((clearColor & 0x001F0000) >> 16) < 31) << 12);
 
@@ -334,7 +329,7 @@ void Gpu3DRenderer::drawScanline1(int line) {
     memset(&stencilBuffer[line * lineStride], 0, lineStride);
     stencilClear[line] = false;
 
-    // Guard polygonCountOut
+    // Clamp polygon count
     int polyCount = core->gpu3D.polygonCountOut;
     if (polyCount < 0)    polyCount = 0;
     if (polyCount > 2048) polyCount = 2048;
@@ -346,7 +341,7 @@ void Gpu3DRenderer::drawScanline1(int line) {
             continue;
 
         _Polygon *polygon = &core->gpu3D.polygonsOut[i];
-        if (polygon->alpha < 0x3F ||
+        if (polygon->alpha < 0x3F  ||
             polygon->textureFmt == 1 ||
             polygon->textureFmt == 6)
             translucent.push_back(i);
@@ -363,49 +358,44 @@ void Gpu3DRenderer::finishScanline(int line) {
     int end        = (192 << resShift) - 1;
 
     if (disp3DCnt & BIT(5)) {
-        int offset = line * lineStride;
-        int w      = lineStride - 1;
-
+        int     offset = line * lineStride;
+        int     w      = lineStride - 1;
         int32_t clearD =
             (clearDepth == 0x7FFF) ? 0xFFFFFF : (clearDepth << 9);
 
         for (int i = offset; i <= offset + w; i++) {
-            if (attribBuffer[0][i] & BIT(14)) {
-                uint32_t id[4] = {
-                    (((i & w) > 0)  ? attribBuffer[0][i - 1]
-                                    : (clearColor >> 24)) & 0x3F,
-                    (((i & w) < w)  ? attribBuffer[0][i + 1]
-                                    : (clearColor >> 24)) & 0x3F,
-                    ((line > 0)     ? attribBuffer[0][i - lineStride]
-                                    : (clearColor >> 24)) & 0x3F,
-                    ((line < end)   ? attribBuffer[0][i + lineStride]
-                                    : (clearColor >> 24)) & 0x3F
-                };
+            if (!(attribBuffer[0][i] & BIT(14))) continue;
 
-                int32_t depth[4] = {
-                    (((i & w) > 0)  ? depthBuffer[0][i - 1]
-                                    : clearD),
-                    (((i & w) < w)  ? depthBuffer[0][i + 1]
-                                    : clearD),
-                    ((line > 0)     ? depthBuffer[0][i - lineStride]
-                                    : clearD),
-                    ((line < end)   ? depthBuffer[0][i + lineStride]
-                                    : clearD)
-                };
+            uint32_t id[4] = {
+                (((i & w) > 0)  ? attribBuffer[0][i - 1]
+                                : (clearColor >> 24)) & 0x3F,
+                (((i & w) < w)  ? attribBuffer[0][i + 1]
+                                : (clearColor >> 24)) & 0x3F,
+                ((line > 0)     ? attribBuffer[0][i - lineStride]
+                                : (clearColor >> 24)) & 0x3F,
+                ((line < end)   ? attribBuffer[0][i + lineStride]
+                                : (clearColor >> 24)) & 0x3F
+            };
 
-                for (int j = 0; j < 4; j++) {
-                    if ((attribBuffer[0][i] & 0x3F) != id[j] &&
-                        depthBuffer[0][i] < depth[j])
-                    {
-                        uint32_t edgeRgba6 = BIT(26) | rgba5ToRgba6(
-                            (0x1F << 15) |
-                            edgeColor[(attribBuffer[0][i] & 0x3F) >> 3]);
-                        framebuffer[0][i] = rgba6ToRgb5a3(edgeRgba6);
-                        attribBuffer[0][i] =
-                            (attribBuffer[0][i] & ~(0x3F << 15)) |
-                            (0x20 << 15);
-                        break;
-                    }
+            int32_t depth[4] = {
+                (((i & w) > 0)  ? depthBuffer[0][i - 1]          : clearD),
+                (((i & w) < w)  ? depthBuffer[0][i + 1]          : clearD),
+                ((line > 0)     ? depthBuffer[0][i - lineStride]  : clearD),
+                ((line < end)   ? depthBuffer[0][i + lineStride]  : clearD)
+            };
+
+            for (int j = 0; j < 4; j++) {
+                if ((attribBuffer[0][i] & 0x3F) != id[j] &&
+                    depthBuffer[0][i] < depth[j])
+                {
+                    uint32_t edgeRgba6 = BIT(26) | rgba5ToRgba6(
+                        (0x1F << 15) |
+                        edgeColor[(attribBuffer[0][i] & 0x3F) >> 3]);
+                    framebuffer[0][i] = rgba6ToRgb5a3(edgeRgba6);
+                    attribBuffer[0][i] =
+                        (attribBuffer[0][i] & ~(0x3F << 15)) |
+                        (0x20 << 15);
+                    break;
                 }
             }
         }
@@ -419,10 +409,10 @@ void Gpu3DRenderer::finishScanline(int line) {
         for (int layer = 0;
              layer < ((disp3DCnt & BIT(4)) ? 2 : 1);
              layer++) {
-            int start = line * lineStride;
-            int fend  = start + lineStride;
+            int fstart = line * lineStride;
+            int fend   = fstart + lineStride;
 
-            for (int i = start; i < fend; i++) {
+            for (int i = fstart; i < fend; i++) {
                 if (!(attribBuffer[layer][i] & BIT(13))) continue;
 
                 int32_t fogOff =
@@ -432,23 +422,22 @@ void Gpu3DRenderer::finishScanline(int line) {
                     : ((fogOff > 0) ? 31 : 0);
 
                 uint8_t density;
-                if (n >= 31) {
-                    density = fogTable[31];
-                } else if (n < 0 || fogStep == 0) {
-                    density = fogTable[0];
-                } else {
+                if (n >= 31)              density = fogTable[31];
+                else if (n < 0 || fogStep == 0) density = fogTable[0];
+                else {
                     int m = fogOff % fogStep;
                     density = (m >= 0)
-                        ? ((fogTable[n + 1] * m +
-                            fogTable[n] * (fogStep - m)) / fogStep)
+                        ? ((fogTable[n+1] * m +
+                            fogTable[n]   * (fogStep - m)) / fogStep)
                         : fogTable[0];
                 }
                 if (density == 127) density++;
 
                 uint32_t cur = fbGet(layer, i);
-                uint8_t fa   = (fogRgba6 >> 18) & 0x3F;
-                uint8_t ca   = (cur      >> 18) & 0x3F;
-                uint8_t a    = (fa * density + ca * (128 - density)) / 128;
+                uint8_t  fa  = (fogRgba6 >> 18) & 0x3F;
+                uint8_t  ca  = (cur      >> 18) & 0x3F;
+                uint8_t  a   =
+                    (fa * density + ca * (128 - density)) / 128;
 
                 uint32_t result;
                 if (disp3DCnt & BIT(6)) {
@@ -479,10 +468,10 @@ void Gpu3DRenderer::finishScanline(int line) {
     }
 
     if (disp3DCnt & BIT(4)) {
-        int start = line * lineStride;
-        int lend  = start + lineStride;
+        int lstart = line * lineStride;
+        int lend   = lstart + lineStride;
 
-        for (int i = start; i < lend; i++) {
+        for (int i = lstart; i < lend; i++) {
             if (((attribBuffer[0][i] >> 15) & 0x3F) >= 0x3F)
                 continue;
 
@@ -503,25 +492,35 @@ void Gpu3DRenderer::finishScanline(int line) {
     }
 }
 
+// -----------------------------------------------------------------------
+// Texture / palette helpers — with slot-index bounds checks
+// -----------------------------------------------------------------------
+
 uint8_t *Gpu3DRenderer::getTexture(uint32_t address) {
-    uint8_t *slot = core->memory.tex3D[address >> 17];
-    return slot ? &slot[address & 0x1FFFF] : nullptr;
+    uint32_t slot = address >> 17;
+    if (slot >= (uint32_t)TEX3D_SLOTS) return nullptr;  // ← bounds check
+    uint8_t *base = core->memory.tex3D[slot];
+    return base ? &base[address & 0x1FFFF] : nullptr;
 }
 
 uint8_t *Gpu3DRenderer::getPalette(uint32_t address) {
-    uint8_t *slot = core->memory.pal3D[address >> 14];
-    return slot ? &slot[address & 0x3FFF] : nullptr;
+    uint32_t slot = address >> 14;
+    if (slot >= (uint32_t)PAL3D_SLOTS) return nullptr;  // ← bounds check
+    uint8_t *base = core->memory.pal3D[slot];
+    return base ? &base[address & 0x3FFF] : nullptr;
 }
+
+// -----------------------------------------------------------------------
+// Interpolation helpers — unchanged
+// -----------------------------------------------------------------------
 
 uint32_t Gpu3DRenderer::interpolateLinear(
     uint32_t v1, uint32_t v2,
     uint32_t x1, uint32_t x, uint32_t x2) {
     if (x <= x1) return v1;
     if (x >= x2) return v2;
-    if (v1 <= v2)
-        return v1 + (v2 - v1) * (x - x1) / (x2 - x1);
-    else
-        return v2 + (v1 - v2) * (x2 - x) / (x2 - x1);
+    if (v1 <= v2) return v1 + (v2 - v1) * (x - x1) / (x2 - x1);
+    else          return v2 + (v1 - v2) * (x2 - x) / (x2 - x1);
 }
 
 uint32_t Gpu3DRenderer::interpolateLinRev(
@@ -529,10 +528,8 @@ uint32_t Gpu3DRenderer::interpolateLinRev(
     uint32_t x1, uint32_t x, uint32_t x2) {
     if (x <= x1) return v1;
     if (x >= x2) return v2;
-    if (v1 <= v2)
-        return v2 - (v2 - v1) * (x2 - x) / (x2 - x1);
-    else
-        return v1 - (v1 - v2) * (x - x1) / (x2 - x1);
+    if (v1 <= v2) return v2 - (v2 - v1) * (x2 - x) / (x2 - x1);
+    else          return v1 - (v1 - v2) * (x - x1) / (x2 - x1);
 }
 
 uint32_t Gpu3DRenderer::interpolateFactor(
@@ -559,17 +556,21 @@ uint32_t Gpu3DRenderer::interpolateColor(
     return (a << 18) | (b << 12) | (g << 6) | r;
 }
 
+// -----------------------------------------------------------------------
+// readTexture — all getTexture/getPalette calls already null-checked
+// -----------------------------------------------------------------------
+
 uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
     if (polygon->repeatS) {
         if (polygon->flipS && (s & polygon->sizeS)) s = -1 - s;
         s &= polygon->sizeS - 1;
-    } else if (s < 0) { s = 0; }
+    } else if (s < 0)                  { s = 0; }
     else if (s >= polygon->sizeS) { s = polygon->sizeS - 1; }
 
     if (polygon->repeatT) {
         if (polygon->flipT && (t & polygon->sizeT)) t = -1 - t;
         t &= polygon->sizeT - 1;
-    } else if (t < 0) { t = 0; }
+    } else if (t < 0)                  { t = 0; }
     else if (t >= polygon->sizeT) { t = polygon->sizeT - 1; }
 
     switch (polygon->textureFmt) {
@@ -577,7 +578,7 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
         uint8_t *data =
             getTexture(polygon->textureAddr + (t * polygon->sizeS + s));
         if (!data) return 0;
-        uint8_t index = *data;
+        uint8_t  index   = *data;
         uint8_t *palette = getPalette(polygon->paletteAddr);
         if (!palette) return 0;
         uint16_t color =
@@ -587,9 +588,10 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
     }
     case 2: {
         uint8_t *data = getTexture(
-            polygon->textureAddr + (t * polygon->sizeS + s) / 4);
+            polygon->textureAddr +
+            (t * polygon->sizeS + s) / 4);
         if (!data) return 0;
-        uint8_t index = (*data >> ((s % 4) * 2)) & 0x03;
+        uint8_t  index = (*data >> ((s % 4) * 2)) & 0x03;
         if (polygon->transparent0 && index == 0) return 0;
         uint8_t *palette = getPalette(polygon->paletteAddr);
         if (!palette) return 0;
@@ -597,40 +599,43 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
     }
     case 3: {
         uint8_t *data = getTexture(
-            polygon->textureAddr + (t * polygon->sizeS + s) / 2);
+            polygon->textureAddr +
+            (t * polygon->sizeS + s) / 2);
         if (!data) return 0;
-        uint8_t index = (*data >> ((s % 2) * 4)) & 0x0F;
+        uint8_t  index = (*data >> ((s % 2) * 4)) & 0x0F;
         if (polygon->transparent0 && index == 0) return 0;
         uint8_t *palette = getPalette(polygon->paletteAddr);
         if (!palette) return 0;
         return rgba5ToRgba6((0x1F << 15) | U8TO16(palette, index * 2));
     }
     case 4: {
-        uint8_t *data = getTexture(
-            polygon->textureAddr + (t * polygon->sizeS + s));
+        uint8_t *data =
+            getTexture(polygon->textureAddr + (t * polygon->sizeS + s));
         if (!data) return 0;
-        uint8_t index = *data;
+        uint8_t  index = *data;
         if (polygon->transparent0 && index == 0) return 0;
         uint8_t *palette = getPalette(polygon->paletteAddr);
         if (!palette) return 0;
         return rgba5ToRgba6((0x1F << 15) | U8TO16(palette, index * 2));
     }
     case 5: {
-        int tile = (t / 4) * (polygon->sizeS / 4) + (s / 4);
-        uint8_t *data = getTexture(
-            polygon->textureAddr + (tile * 4 + t % 4));
+        int      tile    =
+            (t / 4) * (polygon->sizeS / 4) + (s / 4);
+        uint8_t *data    =
+            getTexture(polygon->textureAddr + (tile * 4 + t % 4));
         if (!data) return 0;
-        uint8_t index = (*data >> ((s % 4) * 2)) & 0x03;
+        uint8_t  index   = (*data >> ((s % 4) * 2)) & 0x03;
 
         uint32_t addr2 =
-            0x20000 + (polygon->textureAddr % 0x20000) / 2 +
+            0x20000 +
+            (polygon->textureAddr % 0x20000) / 2 +
             ((polygon->textureAddr / 0x20000 == 2) ? 0x10000 : 0);
         uint8_t *data2 = getTexture(addr2);
         if (!data2) return 0;
 
-        uint16_t palBase = U8TO16(data2, tile * 2);
-        uint8_t *palette = getPalette(
-            polygon->paletteAddr + (palBase & 0x3FFF) * 4);
+        uint16_t palBase  = U8TO16(data2, tile * 2);
+        uint8_t *palette  =
+            getPalette(polygon->paletteAddr + (palBase & 0x3FFF) * 4);
         if (!palette) return 0;
 
         uint32_t c1, c2;
@@ -642,8 +647,10 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
         case 1:
             switch (index) {
             case 2:
-                c1 = rgba5ToRgba6((0x1F<<15) | U8TO16(palette, 0));
-                c2 = rgba5ToRgba6((0x1F<<15) | U8TO16(palette, 2));
+                c1 = rgba5ToRgba6(
+                    (0x1F << 15) | U8TO16(palette, 0));
+                c2 = rgba5ToRgba6(
+                    (0x1F << 15) | U8TO16(palette, 2));
                 return interpolateColor(c1, c2, 0, 1, 2);
             case 3: return 0;
             default:
@@ -656,12 +663,16 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
         case 3:
             switch (index) {
             case 2:
-                c1 = rgba5ToRgba6((0x1F<<15) | U8TO16(palette, 0));
-                c2 = rgba5ToRgba6((0x1F<<15) | U8TO16(palette, 2));
+                c1 = rgba5ToRgba6(
+                    (0x1F << 15) | U8TO16(palette, 0));
+                c2 = rgba5ToRgba6(
+                    (0x1F << 15) | U8TO16(palette, 2));
                 return interpolateColor(c1, c2, 0, 3, 8);
             case 3:
-                c1 = rgba5ToRgba6((0x1F<<15) | U8TO16(palette, 0));
-                c2 = rgba5ToRgba6((0x1F<<15) | U8TO16(palette, 2));
+                c1 = rgba5ToRgba6(
+                    (0x1F << 15) | U8TO16(palette, 0));
+                c2 = rgba5ToRgba6(
+                    (0x1F << 15) | U8TO16(palette, 2));
                 return interpolateColor(c1, c2, 0, 5, 8);
             default:
                 return rgba5ToRgba6(
@@ -671,10 +682,10 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
         return 0;
     }
     case 6: {
-        uint8_t *data = getTexture(
-            polygon->textureAddr + (t * polygon->sizeS + s));
+        uint8_t *data =
+            getTexture(polygon->textureAddr + (t * polygon->sizeS + s));
         if (!data) return 0;
-        uint8_t index = *data;
+        uint8_t  index   = *data;
         uint8_t *palette = getPalette(polygon->paletteAddr);
         if (!palette) return 0;
         uint16_t color =
@@ -692,19 +703,22 @@ uint32_t Gpu3DRenderer::readTexture(_Polygon *polygon, int s, int t) {
     }}
 }
 
+// -----------------------------------------------------------------------
+// drawPolygon — vertex index guard + polygon size guard
+// -----------------------------------------------------------------------
+
 void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
     _Polygon *polygon = &core->gpu3D.polygonsOut[polygonIndex];
 
     // Guard polygon size
     int polySize = polygon->size;
-    if (polySize < 3)  return;   // degenerate polygon
+    if (polySize < 3)  return;    // degenerate — skip silently
     if (polySize > 10) polySize = 10;
 
     Vertex *vertices[10];
     for (int i = 0; i < polySize; i++) {
         int vIdx = polygon->vertices + i;
-        // Guard vertex index — verticesOut has 6144 entries
-        if (vIdx < 0 || vIdx >= 6144) return;
+        if (vIdx < 0 || vIdx >= 6144) return;  // corrupt index
         vertices[i] = &core->gpu3D.verticesOut[vIdx];
     }
 
@@ -900,31 +914,32 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
 
         if (ws[i2] == ws[i2+1] && !(ws[i2] & 0x00FE)) {
             we[ii] = interpolateLinear(
-                ws[i2], ws[i2+1], xe1[ii], xe[ii], xe2[ii]);
+                ws[i2], ws[i2+1],
+                xe1[ii], xe[ii], xe2[ii]);
             re[ii] = interpolateLinear(
-                ((vertices[v[i2]]->color >>  0) & 0x3F) << 3,
-                ((vertices[v[i2+1]]->color >> 0) & 0x3F) << 3,
+                ((vertices[v[i2  ]]->color >>  0) & 0x3F) << 3,
+                ((vertices[v[i2+1]]->color >>  0) & 0x3F) << 3,
                 xe1[ii], xe[ii], xe2[ii]);
             ge[ii] = interpolateLinear(
-                ((vertices[v[i2]]->color >>  6) & 0x3F) << 3,
-                ((vertices[v[i2+1]]->color >> 6) & 0x3F) << 3,
+                ((vertices[v[i2  ]]->color >>  6) & 0x3F) << 3,
+                ((vertices[v[i2+1]]->color >>  6) & 0x3F) << 3,
                 xe1[ii], xe[ii], xe2[ii]);
             be[ii] = interpolateLinear(
-                ((vertices[v[i2]]->color >> 12) & 0x3F) << 3,
-                ((vertices[v[i2+1]]->color >>12) & 0x3F) << 3,
+                ((vertices[v[i2  ]]->color >> 12) & 0x3F) << 3,
+                ((vertices[v[i2+1]]->color >> 12) & 0x3F) << 3,
                 xe1[ii], xe[ii], xe2[ii]);
             se[ii] = interpolateLinear(
-                (int32_t)vertices[v[i2]]->s   + 0xFFFF,
+                (int32_t)vertices[v[i2  ]]->s + 0xFFFF,
                 (int32_t)vertices[v[i2+1]]->s + 0xFFFF,
                 xe1[ii], xe[ii], xe2[ii]) - 0xFFFF;
             te[ii] = interpolateLinear(
-                (int32_t)vertices[v[i2]]->t   + 0xFFFF,
+                (int32_t)vertices[v[i2  ]]->t + 0xFFFF,
                 (int32_t)vertices[v[i2+1]]->t + 0xFFFF,
                 xe1[ii], xe[ii], xe2[ii]) - 0xFFFF;
         } else {
             uint32_t factor;
-            if (xe[ii] <= xe1[ii])       factor = 0;
-            else if (xe[ii] >= xe2[ii])  factor = (1 << 9);
+            if      (xe[ii] <= xe1[ii]) factor = 0;
+            else if (xe[ii] >= xe2[ii]) factor = (1 << 9);
             else {
                 uint32_t wa =
                     (ws[i2] >> 1) +
@@ -935,21 +950,22 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                     ((ws[i2+1] >> 1) * (xe2[ii] - xe[ii]) +
                       wa             * (xe[ii]  - xe1[ii]));
             }
-            we[ii] = interpolateFactor(factor, 9, ws[i2], ws[i2+1]);
+            we[ii] = interpolateFactor(
+                factor, 9, ws[i2], ws[i2+1]);
             re[ii] = interpolateFactor(factor, 9,
-                ((vertices[v[i2]]->color   >>  0) & 0x3F) << 3,
+                ((vertices[v[i2  ]]->color >>  0) & 0x3F) << 3,
                 ((vertices[v[i2+1]]->color >>  0) & 0x3F) << 3);
             ge[ii] = interpolateFactor(factor, 9,
-                ((vertices[v[i2]]->color   >>  6) & 0x3F) << 3,
+                ((vertices[v[i2  ]]->color >>  6) & 0x3F) << 3,
                 ((vertices[v[i2+1]]->color >>  6) & 0x3F) << 3);
             be[ii] = interpolateFactor(factor, 9,
-                ((vertices[v[i2]]->color   >> 12) & 0x3F) << 3,
+                ((vertices[v[i2  ]]->color >> 12) & 0x3F) << 3,
                 ((vertices[v[i2+1]]->color >> 12) & 0x3F) << 3);
             se[ii] = interpolateFactor(factor, 9,
-                (int32_t)vertices[v[i2]]->s   + 0xFFFF,
+                (int32_t)vertices[v[i2  ]]->s + 0xFFFF,
                 (int32_t)vertices[v[i2+1]]->s + 0xFFFF) - 0xFFFF;
             te[ii] = interpolateFactor(factor, 9,
-                (int32_t)vertices[v[i2]]->t   + 0xFFFF,
+                (int32_t)vertices[v[i2  ]]->t + 0xFFFF,
                 (int32_t)vertices[v[i2+1]]->t + 0xFFFF) - 0xFFFF;
         }
     }
@@ -990,7 +1006,7 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         if (x >= (256u << resShift)) break;
 
         bool layer = 0;
-        int  i     = line * lineStride + x;
+        int  i     = line * lineStride + (int)x;
 
         uint32_t factor;
         if (we[0] == we[1] && !(we[0] & 0x7F))
@@ -1009,8 +1025,10 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         int32_t depth;
         if (polygon->wBuffer) {
             depth = (factor == -1u)
-                ? (int32_t)interpolateLinear(we[0], we[1], x1, x, x4)
-                : (int32_t)interpolateFactor(factor, 8, we[0], we[1]);
+                ? (int32_t)interpolateLinear(
+                    we[0], we[1], x1, x, x4)
+                : (int32_t)interpolateFactor(
+                    factor, 8, we[0], we[1]);
             if (polygon->wShift > 0)
                 depth <<= polygon->wShift;
             else if (polygon->wShift < 0)
@@ -1044,11 +1062,12 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                 if (!depthPass[0]) stencilBuffer[i] |= BIT(0);
                 if (!depthPass[1]) stencilBuffer[i] |= BIT(1);
                 continue;
-            } else if (!depthPass[0] ||
-                       !(stencilBuffer[i] & BIT(0)) ||
-                       (attribBuffer[0][i] & 0x3F) == polygon->id) {
-                if (!depthPass[1] ||
-                    !(stencilBuffer[i] & BIT(1)) ||
+            } else if (
+                !depthPass[0]                          ||
+                !(stencilBuffer[i] & BIT(0))           ||
+                (attribBuffer[0][i] & 0x3F) == polygon->id) {
+                if (!depthPass[1]                      ||
+                    !(stencilBuffer[i] & BIT(1))       ||
                     (attribBuffer[1][i] & 0x3F) == polygon->id)
                     continue;
                 layer = 1;
@@ -1060,9 +1079,9 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
 
         uint32_t rv, gv, bv;
         if (factor == -1u) {
-            rv = interpolateLinear(re[0], re[1], x1, x, x4) >> 3;
-            gv = interpolateLinear(ge[0], ge[1], x1, x, x4) >> 3;
-            bv = interpolateLinear(be[0], be[1], x1, x, x4) >> 3;
+            rv = interpolateLinear(re[0],re[1],x1,x,x4) >> 3;
+            gv = interpolateLinear(ge[0],ge[1],x1,x,x4) >> 3;
+            bv = interpolateLinear(be[0],be[1],x1,x,x4) >> 3;
         } else {
             rv = interpolateFactor(factor, 8, re[0], re[1]) >> 3;
             gv = interpolateFactor(factor, 8, ge[0], ge[1]) >> 3;
@@ -1107,9 +1126,12 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
             }
             case 1: case 3: {
                 uint8_t at = (texel >> 18) & 0x3F;
-                uint8_t r  = (((texel>> 0)&0x3F)*at+((color>> 0)&0x3F)*(63-at))/64;
-                uint8_t g  = (((texel>> 6)&0x3F)*at+((color>> 6)&0x3F)*(63-at))/64;
-                uint8_t b  = (((texel>>12)&0x3F)*at+((color>>12)&0x3F)*(63-at))/64;
+                uint8_t r  = (((texel>> 0)&0x3F)*at +
+                               ((color>> 0)&0x3F)*(63-at)) / 64;
+                uint8_t g  = (((texel>> 6)&0x3F)*at +
+                               ((color>> 6)&0x3F)*(63-at)) / 64;
+                uint8_t b  = (((texel>>12)&0x3F)*at +
+                               ((color>>12)&0x3F)*(63-at)) / 64;
                 uint8_t a  = (color >> 18) & 0x3F;
                 color = (uint32_t(a)<<18)|(uint32_t(b)<<12)|
                         (uint32_t(g)<<6)|r;
@@ -1120,16 +1142,16 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                     rgba5ToRgba6(toonTable[(color & 0x3F) / 2]);
                 uint8_t r, g, b;
                 if (disp3DCnt & BIT(1)) {
-                    r = ((((texel>> 0)&0x3F)+1)*(((color>> 0)&0x3F)+1)-1)/64;
-                    g = ((((texel>> 6)&0x3F)+1)*(((color>> 6)&0x3F)+1)-1)/64;
-                    b = ((((texel>>12)&0x3F)+1)*(((color>>12)&0x3F)+1)-1)/64;
-                    r += (toon >>  0) & 0x3F; if (r > 63) r = 63;
-                    g += (toon >>  6) & 0x3F; if (g > 63) g = 63;
-                    b += (toon >> 12) & 0x3F; if (b > 63) b = 63;
+                    r=((((texel>> 0)&0x3F)+1)*(((color>> 0)&0x3F)+1)-1)/64;
+                    g=((((texel>> 6)&0x3F)+1)*(((color>> 6)&0x3F)+1)-1)/64;
+                    b=((((texel>>12)&0x3F)+1)*(((color>>12)&0x3F)+1)-1)/64;
+                    r += (toon>> 0)&0x3F; if(r>63) r=63;
+                    g += (toon>> 6)&0x3F; if(g>63) g=63;
+                    b += (toon>>12)&0x3F; if(b>63) b=63;
                 } else {
-                    r = ((((texel>> 0)&0x3F)+1)*(((toon>> 0)&0x3F)+1)-1)/64;
-                    g = ((((texel>> 6)&0x3F)+1)*(((toon>> 6)&0x3F)+1)-1)/64;
-                    b = ((((texel>>12)&0x3F)+1)*(((toon>>12)&0x3F)+1)-1)/64;
+                    r=((((texel>> 0)&0x3F)+1)*(((toon>> 0)&0x3F)+1)-1)/64;
+                    g=((((texel>> 6)&0x3F)+1)*(((toon>> 6)&0x3F)+1)-1)/64;
+                    b=((((texel>>12)&0x3F)+1)*(((toon>>12)&0x3F)+1)-1)/64;
                 }
                 uint8_t a =
                     ((((texel>>18)&0x3F)+1)*(((color>>18)&0x3F)+1)-1)/64;
@@ -1142,19 +1164,16 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                 rgba5ToRgba6(toonTable[(color & 0x3F) / 2]);
             uint8_t r, g, b;
             if (disp3DCnt & BIT(1)) {
-                r = ((color>> 0)&0x3F)+((toon>> 0)&0x3F);
-                if (r>63) r=63;
-                g = ((color>> 6)&0x3F)+((toon>> 6)&0x3F);
-                if (g>63) g=63;
-                b = ((color>>12)&0x3F)+((toon>>12)&0x3F);
-                if (b>63) b=63;
+                r=((color>> 0)&0x3F)+((toon>> 0)&0x3F); if(r>63)r=63;
+                g=((color>> 6)&0x3F)+((toon>> 6)&0x3F); if(g>63)g=63;
+                b=((color>>12)&0x3F)+((toon>>12)&0x3F); if(b>63)b=63;
             } else {
-                r = (toon >>  0) & 0x3F;
-                g = (toon >>  6) & 0x3F;
-                b = (toon >> 12) & 0x3F;
+                r=(toon>> 0)&0x3F;
+                g=(toon>> 6)&0x3F;
+                b=(toon>>12)&0x3F;
             }
             color = (color & 0xFC0000u) |
-                    (uint32_t(b)<<12) | (uint32_t(g)<<6) | r;
+                    (uint32_t(b)<<12)|(uint32_t(g)<<6)|r;
         }
 
         if (!(color & 0xFC0000u) ||
@@ -1179,8 +1198,8 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
                         x3a, x4a, x3, x, x4);
             }
 
-            framebuffer[layer][i] = rgba6ToRgb5a3(BIT(26) | color);
-            depthBuffer[layer][i] = depth;
+            framebuffer[layer][i]  = rgba6ToRgb5a3(BIT(26) | color);
+            depthBuffer[layer][i]  = depth;
             attribBuffer[layer][i] =
                 (attribBuffer[layer][i] & 0x0FC0u) |
                 (edgeAlpha << 15) | (edge << 14) |
@@ -1190,8 +1209,8 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
             if (!(attribBuffer[layer][i] & BIT(12)) ||
                 ((attribBuffer[layer][i] >> 6) & 0x3F) != polygon->id)
             {
-                uint32_t existing      = fbGet(layer, i);
-                bool existingHasAlpha  = fbHasAlpha(layer, i);
+                uint32_t existing     = fbGet(layer, i);
+                bool existingHasAlpha = fbHasAlpha(layer, i);
 
                 uint32_t blended = BIT(26) |
                     (((disp3DCnt & BIT(3)) && existingHasAlpha)
@@ -1231,6 +1250,10 @@ void Gpu3DRenderer::drawPolygon(int line, int polygonIndex) {
         }
     }
 }
+
+// -----------------------------------------------------------------------
+// Register write handlers — unchanged
+// -----------------------------------------------------------------------
 
 void Gpu3DRenderer::writeDisp3DCnt(uint16_t mask, uint16_t value) {
     if (value & BIT(12)) disp3DCnt &= ~BIT(12);
