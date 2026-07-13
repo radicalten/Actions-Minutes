@@ -1,0 +1,25 @@
+What updated from 9-5-clean to 9-5-clean gold? aka noods-wiiv1.1 to v1.2 
+main.cpp
+wii_video.cpp
+vii_video.h
+
+Changelog:
+New filebrowsing system
+default to 
+sd:/noods/
+sd:/noods/bios/
+sd:/noods/gba/
+sd:/noods/nds/
+
+Support for Wii Classic Controller
+Frameskip 3 enabled by default
+New Audio Code (audio disabled by default)
+new video code (async vs present)
+Home button to exit. 
+
+===
+what changes from 9-5-clean gold to 9-5-clean-gold2?
+Well v1.3 and v1.4 changed the gpu to RGB5A3 instead of RGBA8. Turns out that makes Pokemon HGSS crash from v1.3 2d RGB5A3, and then NSMB crashes from v1.4 3d RGB5A3.
+
+However, there was one good change from v1.3 which is that the audio finally got fixed for nds to play sound correctly.
+will need to modify wii_audio.h delete wii_audio.cpp and modify main.cpp
