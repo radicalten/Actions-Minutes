@@ -1,22 +1,4 @@
-/*
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+//main.cpp
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -126,15 +108,16 @@ void operator delete[](void* p, size_t) noexcept {
 static Core*     ndsCore   = nullptr;
 static bool      romLoaded = false;
 
-static uint32_t* frontBuffer = nullptr;
-static uint32_t* backBuffer  = nullptr;
+// Direct 16-bit RGB5A3 buffers
+static uint16_t* frontBuffer = nullptr;
+static uint16_t* backBuffer  = nullptr;
 
 static volatile bool newFrameReady     = false;
 static volatile bool runEmulatorThread = true;
 static volatile bool runAudioThread    = true;
 
-static uint32_t* topScreenBuffer    = nullptr;
-static uint32_t* bottomScreenBuffer = nullptr;
+static uint16_t* topScreenBuffer    = nullptr;
+static uint16_t* bottomScreenBuffer = nullptr;
 
 float g_cursorX    = 320.0f;
 float g_cursorY    = 240.0f;
@@ -154,8 +137,8 @@ static std::string romToLoadPath = "";
 static volatile bool triggerRomLoad = false;
 
 static int scrollHoldTimer = 0;
-static const int SCROLL_DELAY_INITIAL = 18; // Frames before scrolling starts
-static const int SCROLL_DELAY_REPEATED = 3;  // Frames between scrolling steps
+static const int SCROLL_DELAY_INITIAL = 18; 
+static const int SCROLL_DELAY_REPEATED = 3;  
 
 #define NDS_KEY_A      0
 #define NDS_KEY_B      1
@@ -182,7 +165,6 @@ struct PerformanceState {
 };
 static PerformanceState perf = {};
 
-// Always stereo layout (L,R pairs) even in mono mode.
 alignas(32) static int16_t s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
 alignas(32) static int16_t s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2];
 
@@ -201,21 +183,17 @@ static void ResampleLinear(const uint32_t* src, int nSrc,
         const int idx0 = pos >> 16;
         const int idx1 = (idx0 + 1 < nSrc) ? idx0 + 1 : nSrc - 1;
 
-        // Fractional part in [0, 65535].
         const int32_t frac = pos & 0xFFFF;
 
-        // Unpack source samples.
         const int16_t l0 = (int16_t)( src[idx0]        & 0xFFFF);
         const int16_t r0 = (int16_t)((src[idx0] >> 16) & 0xFFFF);
         const int16_t l1 = (int16_t)( src[idx1]        & 0xFFFF);
         const int16_t r1 = (int16_t)((src[idx1] >> 16) & 0xFFFF);
 
-        // Linear interpolation.
         const int16_t outL = (int16_t)(l0 + (int32_t)(l1 - l0) * frac / 65536);
         const int16_t outR = (int16_t)(r0 + (int32_t)(r1 - r0) * frac / 65536);
 
         if (mono) {
-            // Average both channels; write to both lanes.
             const int16_t m = (int16_t)(((int32_t)outL + (int32_t)outR) >> 1);
             dst[i * 2 + 0] = m;
             dst[i * 2 + 1] = m;
@@ -240,7 +218,7 @@ static uint32_t* PullSpuSamples(int nFrames)
     if (!p) return nullptr;
 
     memcpy(staging, p, (size_t)nFrames * sizeof(uint32_t));
-    delete[] p;        // getSamples() always heap-allocates; free it here.
+    delete[] p;        
     return staging;
 }
 
@@ -405,7 +383,8 @@ static void UpdateFileBrowser(const std::string& path) {
               CompareBrowserItems);
 }
 
-alignas(32) static uint32_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2];
+// 16-bit intermediate frame composite buffer
+alignas(32) static uint16_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2];
 
 static sptr EmulatorThreadMain(void* /*arg*/) {
     const size_t pixelCount = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2;
@@ -466,9 +445,11 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
 
             ndsCore->runCore();
 
+            // Get frame outputs directly in 16-bit RGB5A3
             if (ndsCore->gpu.getFrame(tempBuffer, ndsCore->gbaMode)) {
                 PPCIrqState st = PPCIrqLockByMsr();
-                memcpy(backBuffer, tempBuffer, pixelCount * sizeof(uint32_t));
+                // We copy 16-bit elements instead of 32-bit (Cutting copy bandwidth in half!)
+                memcpy(backBuffer, tempBuffer, pixelCount * sizeof(uint16_t));
                 newFrameReady = true;
                 PPCIrqUnlockByMsr(st);
             }
@@ -484,13 +465,13 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
 
 static void InitializeNDS() {
     const size_t bufSize =
-        NDS_SCREEN_WIDTH * (NDS_SCREEN_HEIGHT * 2) * sizeof(uint32_t);
+        NDS_SCREEN_WIDTH * (NDS_SCREEN_HEIGHT * 2) * sizeof(uint16_t);
 
-    frontBuffer = (uint32_t*)Noods_MEM2_Alloc(bufSize);
-    if (!frontBuffer) frontBuffer = (uint32_t*)malloc(bufSize);
+    frontBuffer = (uint16_t*)Noods_MEM2_Alloc(bufSize);
+    if (!frontBuffer) frontBuffer = (uint16_t*)malloc(bufSize);
 
-    backBuffer  = (uint32_t*)Noods_MEM2_Alloc(bufSize);
-    if (!backBuffer) backBuffer = (uint32_t*)malloc(bufSize);
+    backBuffer  = (uint16_t*)Noods_MEM2_Alloc(bufSize);
+    if (!backBuffer) backBuffer = (uint16_t*)malloc(bufSize);
 
     if (!frontBuffer || !backBuffer) {
         while (true) KThreadSleepMs(16);
@@ -504,22 +485,24 @@ static void InitializeNDS() {
         UpdateFileBrowser(currentDir);
     }
 
-    const size_t sz = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * sizeof(uint32_t);
-    topScreenBuffer    = (uint32_t*)Noods_MEM2_Alloc(sz);
-    if (!topScreenBuffer) topScreenBuffer = (uint32_t*)malloc(sz);
+    const size_t sz = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * sizeof(uint16_t);
+    topScreenBuffer    = (uint16_t*)Noods_MEM2_Alloc(sz);
+    if (!topScreenBuffer) topScreenBuffer = (uint16_t*)malloc(sz);
 
-    bottomScreenBuffer = (uint32_t*)Noods_MEM2_Alloc(sz);
-    if (!bottomScreenBuffer) bottomScreenBuffer = (uint32_t*)malloc(sz);
+    bottomScreenBuffer = (uint16_t*)Noods_MEM2_Alloc(sz);
+    if (!bottomScreenBuffer) bottomScreenBuffer = (uint16_t*)malloc(sz);
 
     if (topScreenBuffer && bottomScreenBuffer) {
-    const uint32_t red    = 0xFC00u; 
-    const uint32_t yellow = 0xFFE0u; 
+        // Direct RGB5A3 representation
+        const uint16_t red    = 0xFC00u; // Opaque pure red
+        const uint16_t yellow = 0xFFE0u; // Opaque pure yellow
 
-    for (int i = 0; i < NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT; i++) {
-        topScreenBuffer[i]    = red;
-        bottomScreenBuffer[i] = yellow;
+        for (int i = 0; i < NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT; i++) {
+            topScreenBuffer[i]    = red;
+            bottomScreenBuffer[i] = yellow;
+        }
     }
-}
+    
     emulatorThreadStack = (u8*)Noods_MEM2_Alloc(EMULATION_STACK_SIZE);
     if (!emulatorThreadStack) emulatorThreadStack = (u8*)malloc(EMULATION_STACK_SIZE);
 
@@ -550,7 +533,6 @@ static void InitializeNDS() {
 static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool hasClassic) {
     uint16_t nds = 0;
 
-    // Standard Wii Remote mappings (Horizontal or plus Nunchuk)
     if (held & WPAD_BUTTON_RIGHT)  nds |= (1 << NDS_KEY_RIGHT);
     if (held & WPAD_BUTTON_LEFT)   nds |= (1 << NDS_KEY_LEFT);
     if (held & WPAD_BUTTON_UP)     nds |= (1 << NDS_KEY_UP);
@@ -567,7 +549,6 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool has
         if (heldExt & WPAD_NUNCHUK_BUTTON_C) nds |= (1 << NDS_KEY_R);
     }
 
-    // Classic Controller physical mapping
     if (hasClassic) {
         if (held & WPAD_CLASSIC_BUTTON_RIGHT) nds |= (1 << NDS_KEY_RIGHT);
         if (held & WPAD_CLASSIC_BUTTON_LEFT)  nds |= (1 << NDS_KEY_LEFT);
@@ -617,7 +598,6 @@ static void ScanWiiInputs() {
             bool classicLStickUp = false;
             bool classicLStickDown = false;
 
-            // Classic Controller stick parsing for menus
             if (hasClassic && wdata) {
                 float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
                 if (wdata->exp.classic.ljs.mag > 0.5f) {
@@ -638,7 +618,7 @@ static void ScanWiiInputs() {
             bool performDown  = false;
 
             if (upDown || downDown) {
-                scrollHoldTimer = 0; // Reset timer on raw press
+                scrollHoldTimer = 0; 
                 if (upDown)   performUp   = true;
                 if (downDown) performDown = true;
             } else if (upHeld || downHeld) {
@@ -714,7 +694,6 @@ static void ScanWiiInputs() {
             }
         }
 
-        // Handle B button press in file browser: go up directory, or close browser if at root
         if ((pressed & WPAD_BUTTON_B) || (pressed & WPAD_CLASSIC_BUTTON_B) || (gcPressed & PAD_BUTTON_B)) {
             if (currentDir != "sd:/" && currentDir != "sd://" && currentDir != "sd:") {
                 size_t slash = currentDir.find_last_of('/', currentDir.length() - 2);
@@ -742,7 +721,6 @@ static void ScanWiiInputs() {
         if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
         if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
 
-        // Map Classic Left Stick to NDS D-Pad
         if (hasClassic && wdata) {
             float lx = wdata->exp.classic.ljs.mag * sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
             float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
@@ -757,7 +735,6 @@ static void ScanWiiInputs() {
         bool isTouching = false;
         g_cursorShow = false;
 
-        // IR pointer styling
         if (wdata && wdata->ir.valid) {
             g_cursorX    = wdata->ir.x;
             g_cursorY    = wdata->ir.y;
@@ -766,7 +743,6 @@ static void ScanWiiInputs() {
                 isTouching = true;
         }
 
-        // GC C-Stick Stylus Emulator
         s8 cstickX = PAD_SubStickX(0);
         s8 cstickY = PAD_SubStickY(0);
         if (abs(cstickX) > 15 || abs(cstickY) > 15) {
@@ -780,7 +756,6 @@ static void ScanWiiInputs() {
             if (g_cursorY > 480.0f) g_cursorY = 480.0f;
         }
 
-        // Classic Controller Right Stick Stylus Emulator
         if (hasClassic && wdata) {
             float rx = wdata->exp.classic.rjs.mag * sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
             float ry = wdata->exp.classic.rjs.mag * cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
@@ -796,7 +771,6 @@ static void ScanWiiInputs() {
             }
         }
 
-        // Stylus activation
         if (gcHeld & PAD_TRIGGER_Z) {
             isTouching   = true;
             g_cursorShow = true;
@@ -859,14 +833,15 @@ int main(int /*argc*/, char** /*argv*/) {
     while (true) {
         ScanWiiInputs();
 
-        const uint32_t* renderTop    = nullptr;
-        const uint32_t* renderBottom = nullptr;
+        // 16-bit rendering references
+        const uint16_t* renderTop    = nullptr;
+        const uint16_t* renderBottom = nullptr;
 
         if (romLoaded && !showFileBrowser) {
             PPCIrqState st  = PPCIrqLockByMsr();
             bool haveFrame  = newFrameReady;
             if (haveFrame) {
-                uint32_t* tmp = frontBuffer;
+                uint16_t* tmp = frontBuffer;
                 frontBuffer   = backBuffer;
                 backBuffer    = tmp;
                 newFrameReady = false;
