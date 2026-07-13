@@ -234,7 +234,8 @@ void ConsoleUI::mainLoop(MenuTouch (*specialTouch)(),
         // getFrame() now writes native RGB5A3 uint16_t pixels into
         // framebuffer[].  No hi-res ABGR8 path exists any more — the
         // 3D renderer already stores everything as RGB5A3.
-        core->gpu.getFrame(framebuffer, gbaMode);
+        bool haveFrame = core->gpu.getFrame(framebuffer, gbaMode);
+        (void)haveFrame;  // framebuffer retains last good frame if false
         startFrame(0);
 
         void *gbaTexture = nullptr;
@@ -1091,9 +1092,12 @@ sptr ConsoleUI::runCore(void *arg) {
     PPCIrqUnlockByMsr(st);
 
     while (isRunning) {
+        // Let the core's own running flag control execution;
+        // only set it to 1 if it was cleared by endFrame/updateRun
         {
             PPCIrqState st2 = PPCIrqLockByMsr();
-            core->running = 1;
+            if (!core->running)
+                core->running = 1;
             PPCIrqUnlockByMsr(st2);
         }
 
