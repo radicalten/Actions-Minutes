@@ -1,3 +1,4 @@
+//wii_video.h (updated declarations)
 #ifndef WII_VIDEO_H
 #define WII_VIDEO_H
 
@@ -32,15 +33,21 @@ struct WiiDebugOverlay {
 };
 
 void Wii_VideoInit();
-
-// Takes 16-bit pointers for direct uploading
 void Wii_VideoRender(const uint16_t* srcTop, const uint16_t* srcBottom,
                      bool gbaMode = false);
-
 void Wii_VideoFlushAsync();
 void Wii_DrawCursor(float x, float y);
 void Wii_DebugOverlayInit();
 void Wii_DebugOverlayPrint(int line, const char* fmt, ...);
 void Wii_DebugOverlaySetEnabled(bool enabled);
+
+// ConsoleUI platform hook implementations
+// createTexture: emulator framebuffer pixels (RGB5A3 uint16_t)
+void* Wii_CreateTexture(uint16_t* data, int width, int height);
+
+// createTextureRGBA8: UI art pixels (RGBA8 uint32_t — BMP icons, font)
+void* Wii_CreateTextureRGBA8(uint32_t* data, int width, int height);
+
+void  Wii_DestroyTexture(void* texture);
 
 #endif // WII_VIDEO_H
