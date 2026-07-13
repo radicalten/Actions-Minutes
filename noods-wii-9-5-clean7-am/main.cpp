@@ -619,6 +619,24 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt,
     return nds;
 }
 
+// Replace the ScanWiiInputs() function and add the recovery helper
+
+// ---------------------------------------------------------------------------
+// Re-initialize the WPAD subsystem after a detected fault.
+// Called when IsWpadDataSafe() returns false.
+// ---------------------------------------------------------------------------
+static void RecoverWpad()
+{
+    WPAD_Shutdown();
+    // Small delay to let the Bluetooth/WPAD stack settle
+    KThreadSleepMs(100);
+    WPAD_Init();
+    WPAD_SetDataFormat(WPAD_CHAN_0, WPAD_FMT_BTNS_ACC_IR);
+    WPAD_SetVRes(WPAD_CHAN_0, 640, 480);
+    // Flush any stale scan state
+    WPAD_ScanPads();
+}
+
 static void ScanWiiInputs() {
     WPAD_ScanPads();
     PAD_ScanPads();
@@ -628,29 +646,32 @@ static void ScanWiiInputs() {
     u32 gcHeld    = PAD_ButtonsHeld(0);
     u32 gcPressed = PAD_ButtonsDown(0);
 
-    // ------------------------------------------------------------------
-    // Validate WPADData before using any of its fields.
-    // If the pointer or its content looks corrupt (which can happen when
-    // an emulator fault interrupts the WPAD IRQ handler mid-write), we
-    // treat the Wiimote as having no expansion attached and keep the
-    // previously committed button state unchanged.
-    // ------------------------------------------------------------------
-    WPADData* wdata     = WPAD_Data(0);
-    bool      wpadSafe  = IsWpadDataSafe(wdata);
+    WPADData* wdata    = WPAD_Data(0);
+    bool      wpadSafe = IsWpadDataSafe(wdata);
 
-    // Record whether this scan was trustworthy so the rest of the
-    // function can decide whether to commit new input values.
+    // ------------------------------------------------------------------
+    // If WPAD data is corrupt, re-initialize the subsystem and retry
+    // once. If it is still bad after recovery we skip the Wiimote this
+    // frame but keep GC input working.
+    // ------------------------------------------------------------------
+    if (!wpadSafe)
+    {
+        RecoverWpad();
+
+        // Re-read everything after recovery
+        held    = WPAD_ButtonsHeld(0);
+        pressed = WPAD_ButtonsDown(0);
+        wdata   = WPAD_Data(0);
+        wpadSafe = IsWpadDataSafe(wdata);
+    }
+
     g_lastWpadReadValid = wpadSafe;
 
-    // Snapshot the type once; all later accesses use these safe locals.
     u32  expType    = wpadSafe ? wdata->exp.type : (u32)WPAD_EXP_NONE;
     bool hasNunchuk = wpadSafe && (expType == WPAD_EXP_NUNCHUK);
     bool hasClassic = wpadSafe && (expType == WPAD_EXP_CLASSIC);
     u32  heldExt    = hasNunchuk ? held : 0;
 
-    // HOME button is always honoured — even on a bad read we still want
-    // to be able to quit (held/pressed come from WPAD_ButtonsHeld which
-    // returns 0 on error rather than garbage).
     if ((pressed & WPAD_BUTTON_HOME) ||
         (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_HOME))) {
         runEmulatorThread = false;
@@ -668,7 +689,6 @@ static void ScanWiiInputs() {
             bool classicLStickUp   = false;
             bool classicLStickDown = false;
 
-            // Only read analogue stick data when the pointer is known good.
             if (hasClassic && wpadSafe) {
                 float ly = wdata->exp.classic.ljs.mag *
                            cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
@@ -808,17 +828,11 @@ static void ScanWiiInputs() {
         }
     }
     else {
-        // ----------------------------------------------------------------
-        // If the WPAD data pointer was unsafe this frame, skip updating
-        // g_ndsButtons so the emulator keeps the previous button state.
-        // This prevents losing all controls when a transient fault
-        // (e.g. the emulator's invalid read) corrupts the WPAD buffer.
-        // GC controller data (from PAD_*) is always safe to use.
-        // ----------------------------------------------------------------
+        // If WPAD is still bad after recovery, preserve last known good
+        // Wiimote state but still update GC buttons.
         if (!wpadSafe) {
-            // Still apply GC buttons on top of the preserved WPAD state.
             PPCIrqState st      = PPCIrqLockByMsr();
-            uint16_t ndsButtons = g_ndsButtons; // preserve last-known-good
+            uint16_t ndsButtons = g_ndsButtons;
             PPCIrqUnlockByMsr(st);
 
             if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
@@ -835,13 +849,11 @@ static void ScanWiiInputs() {
 
             PPCIrqState st2 = PPCIrqLockByMsr();
             g_ndsButtons = ndsButtons;
-            // Leave g_ndsTouching / g_ndsTouchX / g_ndsTouchY unchanged.
             PPCIrqUnlockByMsr(st2);
-
-            return; // nothing more to do this frame
+            return;
         }
 
-        // Normal path — wdata is safe to dereference fully.
+        // Normal path — wdata is fully safe.
         uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt,
                                                hasNunchuk, hasClassic);
 
@@ -857,7 +869,6 @@ static void ScanWiiInputs() {
         if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
         if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
 
-        // Classic controller left-stick mapped to d-pad
         if (hasClassic) {
             float lx = wdata->exp.classic.ljs.mag *
                        sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
@@ -934,8 +945,8 @@ static void ScanWiiInputs() {
             const float efbHeight = 480.0f;
             const int   totalH    = scrH * 2 + gap;
 
-            const float originX = (fbWidth   - scrW)   / 2.0f;
-            const float originY = (efbHeight - totalH)  / 2.0f;
+            const float originX = (fbWidth   - scrW)  / 2.0f;
+            const float originY = (efbHeight - totalH) / 2.0f;
 
             const float dsLeft   = originX;
             const float dsRight  = originX + scrW;
