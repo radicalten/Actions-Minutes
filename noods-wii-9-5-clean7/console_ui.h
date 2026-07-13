@@ -1,23 +1,4 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+//console_ui.h
 #pragma once
 
 #include <cstdint>
@@ -67,10 +48,15 @@ struct MenuItem {
     uint8_t iconSize;
     bool header;
 
-    MenuItem(std::string name, std::string setting = "", void *iconTex = nullptr, uint8_t iconSize = 0):
-        name(name), setting(setting), iconTex(iconTex), iconSize(iconSize), header(false) {}
+    MenuItem(std::string name, std::string setting = "",
+             void *iconTex = nullptr, uint8_t iconSize = 0):
+        name(name), setting(setting),
+        iconTex(iconTex), iconSize(iconSize), header(false) {}
+
     MenuItem(std::string name, bool header):
-        name(name), setting(""), iconTex(nullptr), iconSize(0), header(header) {}
+        name(name), setting(""),
+        iconTex(nullptr), iconSize(0), header(header) {}
+
     bool operator<(const MenuItem &item) { return (name < item.name); }
 };
 
@@ -78,7 +64,12 @@ class ConsoleUI {
 public:
     static Core *core;
     static volatile uint8_t running;
-    static uint32_t framebuffer[256 * 192 * 8];
+
+    // Framebuffer now stores native RGB5A3 uint16_t pixels.
+    // Size: 256×192×8 halfwords covers all screen combinations including
+    // hi-res (×4 pixels) and dual screens (×2).
+    static uint16_t framebuffer[256 * 192 * 8];
+
     static ScreenLayout layout;
     static bool gbaMode;
 
@@ -91,10 +82,20 @@ public:
 
     static void startFrame(uint32_t color);
     static void endFrame();
-    static void *createTexture(uint32_t *data, int width, int height);
+
+    // createTexture now accepts native uint16_t RGB5A3 pixel data.
+    // The Wii implementation tiles it directly into a GX_TF_RGB5A3 texture.
+    static void *createTexture(uint16_t *data, int width, int height);
+
+    // createTextureRGBA8 accepts full 32-bit RGBA8 pixels for UI elements
+    // (icons, font, etc.) that are built from BMP data and are not
+    // emulator framebuffer pixels.
+    static void *createTextureRGBA8(uint32_t *data, int width, int height);
+
     static void destroyTexture(void *texture);
     static void drawTexture(void *texture, float tx, float ty, float tw, float th,
-        float x, float y, float w, float h, bool filter = true, int rotation = 0,
+        float x, float y, float w, float h,
+        bool filter = true, int rotation = 0,
         uint32_t color = 0xFFFFFFFF);
     static uint32_t getInputHeld();
     static MenuTouch getInputTouch();
@@ -106,7 +107,8 @@ public:
 
     static uint32_t getInputPress();
 
-    static void initialize(int width, int height, std::string root, std::string prefix);
+    static void initialize(int width, int height,
+        std::string root, std::string prefix);
     static void mainLoop(MenuTouch (*specialTouch)() = nullptr,
         ScreenLayout *touchLayout = nullptr);
     static int setPath(std::string path);
