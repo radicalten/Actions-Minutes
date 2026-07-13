@@ -29,14 +29,13 @@ struct RendererThreadArg {
     int threadId;
 };
 
-Gpu3DRenderer::Gpu3DRenderer(Core *core): core(core) {
-    for (int i = 0; i < 192 * 2; i++)
-        ready[i] = 3;
-}
-
 Gpu3DRenderer::~Gpu3DRenderer() {
     for (int i = 0; i < activeThreads; i++) {
         KThreadJoin(&threads[i]);
+    }
+    
+    // Clean up persistent thread stacks
+    for (int i = 0; i < 4; i++) {
         if (threadStacks[i]) {
             free(threadStacks[i]);
             threadStacks[i] = nullptr;
@@ -166,10 +165,8 @@ void Gpu3DRenderer::drawScanline(int line) {
 
         for (int i = 0; i < activeThreads; i++) {
             KThreadJoin(&threads[i]);
-            if (threadStacks[i]) {
-                free(threadStacks[i]);
-                threadStacks[i] = nullptr;
-            }
+            // Removed the free() here
+        }
         }
 
         activeThreads = Settings::threaded3D & 0xF;
@@ -182,15 +179,13 @@ void Gpu3DRenderer::drawScanline(int line) {
             PPCIrqUnlockByMsr(st);
 
             for (uint8_t i = 0; i < activeThreads; i++) {
-                threadStacks[i] = (uint8_t*)malloc(16384);
-                RendererThreadArg* args = (RendererThreadArg*)malloc(sizeof(RendererThreadArg));
-                args->renderer = this;
-                args->threadId = i;
-                KThreadPrepare(&threads[i], drawThreadedEntryPoint, args, threadStacks[i] + 16384, KTHR_MAIN_PRIO);
-                KThreadResume(&threads[i]);
+                // Now safely use preallocated memory
+                if (threadStacks[i]) {
+                    KThreadPrepare(&threads[i], drawThreadedEntryPoint, &threadArgs[i], threadStacks[i] + 16384, KTHR_MAIN_PRIO);
+                    KThreadResume(&threads[i]);
+                }
             }
         }
-    }
 
     if (activeThreads == 0) {
         if (resShift) {
@@ -211,8 +206,7 @@ void Gpu3DRenderer::drawScanline(int line) {
 sptr Gpu3DRenderer::drawThreadedEntryPoint(void* arg) {
     RendererThreadArg* actualArgs = (RendererThreadArg*)arg;
     actualArgs->renderer->drawThreaded(actualArgs->threadId);
-    free(actualArgs);
-    return 0;
+    return 0; // Removed the free() here
 }
 
 void Gpu3DRenderer::drawThreaded(int thread) {
@@ -465,11 +459,16 @@ void Gpu3DRenderer::finishScanline(int line) {
 // Texture / palette helpers — unchanged
 // ---------------------------------------------------------------
 uint8_t *Gpu3DRenderer::getTexture(uint32_t address) {
+    address &= 0x7FFFF; // Mask safely to maximum texture VRAM (512KB)
     uint8_t *slot = core->memory.tex3D[address >> 17];
     return slot ? &slot[address & 0x1FFFF] : nullptr;
 }
 
 uint8_t *Gpu3DRenderer::getPalette(uint32_t address) {
+    // Mask safely to maximum palette VRAM (96KB = 6 banks)
+    if ((address >> 14) >= 6) {
+        address %= 0x18000;
+    }
     uint8_t *slot = core->memory.pal3D[address >> 14];
     return slot ? &slot[address & 0x3FFF] : nullptr;
 }
