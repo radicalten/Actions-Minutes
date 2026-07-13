@@ -181,7 +181,7 @@ void Gpu3DRenderer::drawScanline(int line) {
             for (uint8_t i = 0; i < activeThreads; i++) {
                 // Now safely use preallocated memory
                 if (threadStacks[i]) {
-                    KThreadPrepare(&threads[i], drawThreadedEntryPoint, &threadArgs[i], threadStacks[i] + 16384, KTHR_MAIN_PRIO);
+                    KThreadPrepare(&threads[i], drawThreadedEntryPoint, &threads[i], threadStacks[i] + 16384, KTHR_MAIN_PRIO);
                     KThreadResume(&threads[i]);
                 }
             }
