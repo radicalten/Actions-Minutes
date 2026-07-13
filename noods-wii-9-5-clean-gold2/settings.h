@@ -44,6 +44,7 @@ public:
     static int screenGhost;
     static int emulateAudio;
     static int audio16Bit;
+    static int monoAudio;       // 0 = stereo, 1 = mono
     static int savesFolder;
     static int statesFolder;
     static int cheatsFolder;
@@ -64,5 +65,5 @@ public:
 
 private:
     static std::vector<Setting> settings;
-    Settings() {} // Private to prevent instantiation
+    Settings() {}
 };
