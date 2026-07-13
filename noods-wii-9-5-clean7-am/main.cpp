@@ -1,4 +1,22 @@
-//main.cpp
+/*
+    Copyright (C) 2026 radicalten
+
+    This file is part of NooDS-Wii.
+
+    NooDS-Wii is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by
+    the Free Software Foundation, either version 3 of the License, or
+    (at your option) any later version.
+
+    NooDS-Wii is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
+*/
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -149,8 +167,8 @@ static std::string romToLoadPath = "";
 static volatile bool triggerRomLoad = false;
 
 static int scrollHoldTimer = 0;
-static const int SCROLL_DELAY_INITIAL  = 18;
-static const int SCROLL_DELAY_REPEATED = 3;
+static const int SCROLL_DELAY_INITIAL = 18; 
+static const int SCROLL_DELAY_REPEATED = 3;  
 
 #define NDS_KEY_A      0
 #define NDS_KEY_B      1
@@ -170,13 +188,6 @@ static volatile bool     g_ndsTouching = false;
 static volatile int16_t  g_ndsTouchX   = 0;
 static volatile int16_t  g_ndsTouchY   = 0;
 
-// Tracks whether the last WPAD_Data() read was valid.
-static bool g_lastWpadReadValid = true;
-
-// Core fault tracking
-static volatile bool g_coreFaulted   = false;
-static volatile bool g_coreResetting = false;
-
 struct PerformanceState {
     uint32_t renderFrameCount;
     float    fps;
@@ -187,8 +198,8 @@ static PerformanceState perf = {};
 alignas(32) static int16_t s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
 alignas(32) static int16_t s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2];
 
-static volatile int  s_writeBuf = 0;
-static volatile int  s_readBuf  = 1;
+static volatile int  s_writeBuf = 0;    
+static volatile int  s_readBuf  = 1;    
 static volatile bool s_bufReady = false;
 
 static void ResampleLinear(const uint32_t* src, int nSrc,
@@ -237,7 +248,7 @@ static uint32_t* PullSpuSamples(int nFrames)
     if (!p) return nullptr;
 
     memcpy(staging, p, (size_t)nFrames * sizeof(uint32_t));
-    delete[] p;
+    delete[] p;        
     return staging;
 }
 
@@ -269,8 +280,7 @@ static sptr AudioThreadMain(void* /*arg*/)
         bool     ok   = false;
         const bool mono = (Settings::monoAudio != 0);
 
-        // Don't pull samples while the core is being reset
-        if (romLoaded && ndsCore && !g_coreResetting) {
+        if (romLoaded && ndsCore) {
             if (ndsCore->gbaMode) {
                 uint32_t* src = PullSpuSamples(WIIAUD_GBA_FRAMES);
                 if (src) {
@@ -325,7 +335,7 @@ static void InitializeAudio()
 static void ShutdownAudio()
 {
     runAudioThread = false;
-    s_bufReady = false;
+    s_bufReady = false;       
     ASND_StopVoice(0);
     ASND_End();
     KThreadJoin(&audioThread);
@@ -347,7 +357,7 @@ static void InitializeSettings() {
     Settings::screenGhost  = 0;
     Settings::emulateAudio = 1;
     Settings::audio16Bit   = 1;
-    Settings::monoAudio    = 0;
+    Settings::monoAudio    = 0; 
     Settings::savesFolder  = 1;
     Settings::statesFolder = 1;
     Settings::cheatsFolder = 1;
@@ -406,94 +416,17 @@ static void UpdateFileBrowser(const std::string& path) {
 // 16-bit intermediate frame composite buffer
 alignas(32) static uint16_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2];
 
-// ---------------------------------------------------------------------------
-// Tears down the faulted core and reloads the same ROM cleanly.
-// Must only be called from the emulator thread.
-// ---------------------------------------------------------------------------
-static void ResetFaultedCore()
-{
-    g_coreResetting = true;
-    romLoaded       = false;
-
-    // Snapshot the ROM path before deleting anything
-    PPCIrqState st = PPCIrqLockByMsr();
-    std::string savedPath = romToLoadPath;
-    PPCIrqUnlockByMsr(st);
-
-    // Delete the faulted core
-    delete ndsCore;
-    ndsCore = nullptr;
-
-    // Clear stale frame data so the renderer does not use it
-    const size_t bufSize =
-        NDS_SCREEN_WIDTH * (NDS_SCREEN_HEIGHT * 2) * sizeof(uint16_t);
-    {
-        PPCIrqState st2 = PPCIrqLockByMsr();
-        memset(backBuffer,  0, bufSize);
-        memset(frontBuffer, 0, bufSize);
-        newFrameReady = false;
-        PPCIrqUnlockByMsr(st2);
-    }
-
-    // Brief pause so the audio thread stops trying to pull from
-    // the now-deleted core
-    KThreadSleepMs(32);
-
-    // Reload the same ROM
-    if (!savedPath.empty()) {
-        std::string ndsRom, gbaRom;
-        size_t extPos = savedPath.find_last_of('.');
-        if (extPos != std::string::npos) {
-            std::string ext = savedPath.substr(extPos);
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
-            if (ext == ".gba") gbaRom = savedPath;
-            else               ndsRom = savedPath;
-        }
-
-        try {
-            ndsCore = new Core(ndsRom, gbaRom);
-
-            PPCIrqState st3 = PPCIrqLockByMsr();
-            romLoaded       = true;
-            g_coreFaulted   = false;
-            g_coreResetting = false;
-            PPCIrqUnlockByMsr(st3);
-        }
-        catch (...) {
-            ndsCore         = nullptr;
-            g_coreFaulted   = false;
-            g_coreResetting = false;
-        }
-    } else {
-        g_coreFaulted   = false;
-        g_coreResetting = false;
-    }
-}
-
 static sptr EmulatorThreadMain(void* /*arg*/) {
     const size_t pixelCount = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2;
 
-    // Counts consecutive frames with no output — used to detect a
-    // silently faulted core (e.g. after an invalid bus read that
-    // returned 0xFFFFFFFF and corrupted internal core state).
-    int  noFrameCount = 0;
-    const int MAX_NO_FRAMES = 3;
-
     while (runEmulatorThread) {
-
-        // ------------------------------------------------------------
-        // ROM load request
-        // ------------------------------------------------------------
         if (triggerRomLoad) {
-            noFrameCount = 0;
-
             std::string loadPath;
             {
                 PPCIrqState st = PPCIrqLockByMsr();
                 loadPath       = romToLoadPath;
                 triggerRomLoad = false;
                 romLoaded      = false;
-                g_coreFaulted  = false;
                 PPCIrqUnlockByMsr(st);
             }
 
@@ -518,20 +451,7 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
             }
         }
 
-        // ------------------------------------------------------------
-        // Wait out any in-progress reset
-        // ------------------------------------------------------------
-        if (g_coreResetting) {
-            KThreadSleepMs(8);
-            continue;
-        }
-
-        // ------------------------------------------------------------
-        // Main emulation step
-        // ------------------------------------------------------------
         if (romLoaded && ndsCore) {
-
-            // Apply inputs
             {
                 PPCIrqState st  = PPCIrqLockByMsr();
                 uint16_t buttons  = g_ndsButtons;
@@ -553,35 +473,23 @@ static sptr EmulatorThreadMain(void* /*arg*/) {
                 }
             }
 
-            // Run one core step. If the NDS bus handler returns
-            // 0xFFFFFFFF for an invalid read, the core continues
-            // running with corrupted internal state — it does not
-            // throw. We detect this afterwards via the frame output.
             ndsCore->runCore();
 
-            // Check frame output
-            bool gotFrame = ndsCore->gpu.getFrame(tempBuffer,
-                                                   ndsCore->gbaMode);
-            if (gotFrame) {
-                // Successful frame — reset the fault counter
-                noFrameCount = 0;
-
-                PPCIrqState st = PPCIrqLockByMsr();
-                memcpy(backBuffer, tempBuffer,
-                       pixelCount * sizeof(uint16_t));
-                newFrameReady = true;
-                PPCIrqUnlockByMsr(st);
-            } else {
-                // No frame this call — may be normal pipelining or
-                // may be a sign the core has lost coherence.
-                noFrameCount++;
-                if (noFrameCount >= MAX_NO_FRAMES && !g_coreResetting) {
-                    // Treat as a soft fault: reload the ROM cleanly
-                    g_coreFaulted = true;
-                    noFrameCount  = 0;
-                    ResetFaultedCore();
-                }
-            }
+            // Get frame outputs directly in 16-bit RGB5A3
+            if (ndsCore->gpu.getFrame(tempBuffer, ndsCore->gbaMode)) {
+    PPCIrqState st = PPCIrqLockByMsr();
+    
+    // Use correct size based on mode
+    size_t copyPixels;
+    if (ndsCore->gbaMode) {
+        copyPixels = GBA_SCREEN_WIDTH * GBA_SCREEN_HEIGHT; // 240*160
+    } else {
+        copyPixels = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2; // 256*192*2
+    }
+    memcpy(backBuffer, tempBuffer, copyPixels * sizeof(uint16_t));
+    newFrameReady = true;
+    PPCIrqUnlockByMsr(st);
+}
         }
         else {
             KThreadSleepMs(16);
@@ -622,27 +530,25 @@ static void InitializeNDS() {
     if (!bottomScreenBuffer) bottomScreenBuffer = (uint16_t*)malloc(sz);
 
     if (topScreenBuffer && bottomScreenBuffer) {
-        const uint16_t red    = 0xFC00u;
-        const uint16_t yellow = 0xFFE0u;
+        // Direct RGB5A3 representation
+        const uint16_t red    = 0xFC00u; // Opaque pure red
+        const uint16_t yellow = 0xFFE0u; // Opaque pure yellow
 
         for (int i = 0; i < NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT; i++) {
             topScreenBuffer[i]    = red;
             bottomScreenBuffer[i] = yellow;
         }
     }
-
+    
     emulatorThreadStack = (u8*)Noods_MEM2_Alloc(EMULATION_STACK_SIZE);
-    if (!emulatorThreadStack)
-        emulatorThreadStack = (u8*)malloc(EMULATION_STACK_SIZE);
+    if (!emulatorThreadStack) emulatorThreadStack = (u8*)malloc(EMULATION_STACK_SIZE);
 
     if (Settings::emulateAudio) {
         audioThreadStack = (u8*)Noods_MEM2_Alloc(AUDIO_STACK_SIZE);
-        if (!audioThreadStack)
-            audioThreadStack = (u8*)malloc(AUDIO_STACK_SIZE);
+        if (!audioThreadStack) audioThreadStack = (u8*)malloc(AUDIO_STACK_SIZE);
     }
 
-    if (!emulatorThreadStack ||
-        (Settings::emulateAudio && !audioThreadStack)) {
+    if (!emulatorThreadStack || (Settings::emulateAudio && !audioThreadStack)) {
         while (true) KThreadSleepMs(16);
     }
 
@@ -661,42 +567,7 @@ static void InitializeNDS() {
     perf.startTime = time(nullptr);
 }
 
-// ---------------------------------------------------------------------------
-// Validate a WPADData pointer before touching any of its fields.
-// ---------------------------------------------------------------------------
-static inline bool IsWpadDataSafe(const WPADData* d)
-{
-    if (!d) return false;
-
-    const uintptr_t addr = (uintptr_t)d;
-    if (addr < 0x80003000u || addr > 0x817FFFFFu) return false;
-
-    const u32 expType = d->exp.type;
-    if (expType != WPAD_EXP_NONE        &&
-        expType != WPAD_EXP_NUNCHUK     &&
-        expType != WPAD_EXP_CLASSIC     &&
-        expType != WPAD_EXP_GUITARHERO3) {
-        return false;
-    }
-
-    return true;
-}
-
-// ---------------------------------------------------------------------------
-// Re-initialize the WPAD subsystem after a detected fault.
-// ---------------------------------------------------------------------------
-static void RecoverWpad()
-{
-    WPAD_Shutdown();
-    KThreadSleepMs(50);
-    WPAD_Init();
-    WPAD_SetDataFormat(WPAD_CHAN_0, WPAD_FMT_BTNS_ACC_IR);
-    WPAD_SetVRes(WPAD_CHAN_0, 640, 480);
-    WPAD_ScanPads();
-}
-
-static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt,
-                                 bool hasNunchuk, bool hasClassic) {
+static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool hasClassic) {
     uint16_t nds = 0;
 
     if (held & WPAD_BUTTON_RIGHT)  nds |= (1 << NDS_KEY_RIGHT);
@@ -726,10 +597,8 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt,
         if (held & WPAD_CLASSIC_BUTTON_Y)     nds |= (1 << NDS_KEY_Y);
         if (held & WPAD_CLASSIC_BUTTON_PLUS)  nds |= (1 << NDS_KEY_START);
         if (held & WPAD_CLASSIC_BUTTON_MINUS) nds |= (1 << NDS_KEY_SELECT);
-        if (held & (WPAD_CLASSIC_BUTTON_FULL_L | WPAD_CLASSIC_BUTTON_ZL))
-            nds |= (1 << NDS_KEY_L);
-        if (held & (WPAD_CLASSIC_BUTTON_FULL_R | WPAD_CLASSIC_BUTTON_ZR))
-            nds |= (1 << NDS_KEY_R);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_L | WPAD_CLASSIC_BUTTON_ZL)) nds |= (1 << NDS_KEY_L);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_R | WPAD_CLASSIC_BUTTON_ZR)) nds |= (1 << NDS_KEY_R);
     }
 
     return nds;
@@ -744,86 +613,55 @@ static void ScanWiiInputs() {
     u32 gcHeld    = PAD_ButtonsHeld(0);
     u32 gcPressed = PAD_ButtonsDown(0);
 
-    WPADData* wdata    = WPAD_Data(0);
-    bool      wpadSafe = IsWpadDataSafe(wdata);
+    WPADData* wdata      = WPAD_Data(0);
+    bool      hasNunchuk = wdata && (wdata->exp.type == WPAD_EXP_NUNCHUK);
+    bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
+    u32       heldExt    = hasNunchuk ? held : 0;
 
-    // If WPAD data looks corrupt, attempt a full reinit and retry once
-    if (!wpadSafe) {
-        RecoverWpad();
-        held     = WPAD_ButtonsHeld(0);
-        pressed  = WPAD_ButtonsDown(0);
-        wdata    = WPAD_Data(0);
-        wpadSafe = IsWpadDataSafe(wdata);
-    }
-
-    g_lastWpadReadValid = wpadSafe;
-
-    // Snapshot expansion type once from a validated pointer
-    u32  expType    = wpadSafe ? wdata->exp.type : (u32)WPAD_EXP_NONE;
-    bool hasNunchuk = wpadSafe && (expType == WPAD_EXP_NUNCHUK);
-    bool hasClassic = wpadSafe && (expType == WPAD_EXP_CLASSIC);
-    u32  heldExt    = hasNunchuk ? held : 0;
-
-    // HOME is always honoured
-    if ((pressed & WPAD_BUTTON_HOME) ||
-        (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_HOME))) {
+    if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
         runEmulatorThread = false;
         KThreadJoin(&emulatorThread);
         ShutdownAudio();
         delete ndsCore;
         ndsCore = nullptr;
+
         exit(0);
     }
 
     if (showFileBrowser) {
         if (!dirContents.empty()) {
-            static bool classicLStickUpLast   = false;
+            static bool classicLStickUpLast = false;
             static bool classicLStickDownLast = false;
-            bool classicLStickUp   = false;
+            bool classicLStickUp = false;
             bool classicLStickDown = false;
 
-            if (hasClassic && wpadSafe) {
-                float ly = wdata->exp.classic.ljs.mag *
-                           cosf(wdata->exp.classic.ljs.ang *
-                                3.14159265f / 180.0f);
+            if (hasClassic && wdata) {
+                float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
                 if (wdata->exp.classic.ljs.mag > 0.5f) {
-                    if (ly >  0.5f) classicLStickUp   = true;
+                    if (ly > 0.5f)  classicLStickUp = true;
                     if (ly < -0.5f) classicLStickDown = true;
                 }
             }
 
-            bool upHeld   = (held & WPAD_BUTTON_UP)
-                          || (hasClassic && (held & WPAD_CLASSIC_BUTTON_UP))
-                          || (gcHeld & PAD_BUTTON_UP)
-                          || classicLStickUp;
-            bool downHeld = (held & WPAD_BUTTON_DOWN)
-                          || (hasClassic && (held & WPAD_CLASSIC_BUTTON_DOWN))
-                          || (gcHeld & PAD_BUTTON_DOWN)
-                          || classicLStickDown;
-            bool upDown   = (pressed & WPAD_BUTTON_UP)
-                          || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_UP))
-                          || (gcPressed & PAD_BUTTON_UP)
-                          || (classicLStickUp && !classicLStickUpLast);
-            bool downDown = (pressed & WPAD_BUTTON_DOWN)
-                          || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_DOWN))
-                          || (gcPressed & PAD_BUTTON_DOWN)
-                          || (classicLStickDown && !classicLStickDownLast);
+            bool upHeld   = (held & WPAD_BUTTON_UP)     || (held & WPAD_CLASSIC_BUTTON_UP)     || (gcHeld & PAD_BUTTON_UP)   || classicLStickUp;
+            bool downHeld = (held & WPAD_BUTTON_DOWN)   || (held & WPAD_CLASSIC_BUTTON_DOWN)   || (gcHeld & PAD_BUTTON_DOWN) || classicLStickDown;
+            bool upDown   = (pressed & WPAD_BUTTON_UP)  || (pressed & WPAD_CLASSIC_BUTTON_UP)  || (gcPressed & PAD_BUTTON_UP)  || (classicLStickUp && !classicLStickUpLast);
+            bool downDown = (pressed & WPAD_BUTTON_DOWN)|| (pressed & WPAD_CLASSIC_BUTTON_DOWN)|| (gcPressed & PAD_BUTTON_DOWN)|| (classicLStickDown && !classicLStickDownLast);
 
-            classicLStickUpLast   = classicLStickUp;
+            classicLStickUpLast = classicLStickUp;
             classicLStickDownLast = classicLStickDown;
 
-            bool performUp   = false;
-            bool performDown = false;
+            bool performUp    = false;
+            bool performDown  = false;
 
             if (upDown || downDown) {
-                scrollHoldTimer = 0;
+                scrollHoldTimer = 0; 
                 if (upDown)   performUp   = true;
                 if (downDown) performDown = true;
             } else if (upHeld || downHeld) {
                 scrollHoldTimer++;
                 if (scrollHoldTimer >= SCROLL_DELAY_INITIAL) {
-                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) %
-                            SCROLL_DELAY_REPEATED == 0) {
+                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) % SCROLL_DELAY_REPEATED == 0) {
                         if (upHeld)   performUp   = true;
                         if (downHeld) performDown = true;
                     }
@@ -851,40 +689,27 @@ static void ScanWiiInputs() {
                     displayOffset = selectedItemIndex;
             }
 
-            bool leftPressed  = (pressed & WPAD_BUTTON_LEFT)
-                              || (hasClassic &&
-                                  (pressed & WPAD_CLASSIC_BUTTON_LEFT))
-                              || (gcPressed & PAD_BUTTON_LEFT);
-            bool rightPressed = (pressed & WPAD_BUTTON_RIGHT)
-                              || (hasClassic &&
-                                  (pressed & WPAD_CLASSIC_BUTTON_RIGHT))
-                              || (gcPressed & PAD_BUTTON_RIGHT);
-
-            if (leftPressed) {
+            if ((pressed & WPAD_BUTTON_LEFT) || (pressed & WPAD_CLASSIC_BUTTON_LEFT) || (gcPressed & PAD_BUTTON_LEFT)) {
                 selectedItemIndex -= 5;
-                if (selectedItemIndex < 0) selectedItemIndex = 0;
+                if (selectedItemIndex < 0) {
+                    selectedItemIndex = 0;
+                }
                 displayOffset = std::max(0, selectedItemIndex - 2);
             }
-            if (rightPressed) {
+            if ((pressed & WPAD_BUTTON_RIGHT) || (pressed & WPAD_CLASSIC_BUTTON_RIGHT) || (gcPressed & PAD_BUTTON_RIGHT)) {
                 selectedItemIndex += 5;
-                if (selectedItemIndex >= (int)dirContents.size())
+                if (selectedItemIndex >= (int)dirContents.size()) {
                     selectedItemIndex = (int)dirContents.size() - 1;
-                displayOffset = std::max(
-                    0, std::min((int)dirContents.size() - 5,
-                                selectedItemIndex - 2));
+                }
+                displayOffset = std::max(0, std::min((int)dirContents.size() - 5, selectedItemIndex - 2));
             }
 
-            bool aPressed = (pressed & WPAD_BUTTON_A)
-                          || (hasClassic &&
-                              (pressed & WPAD_CLASSIC_BUTTON_A))
-                          || (gcPressed & PAD_BUTTON_A);
-
-            if (aPressed) {
+            if ((pressed & WPAD_BUTTON_A) || (pressed & WPAD_CLASSIC_BUTTON_A) || (gcPressed & PAD_BUTTON_A)) {
                 BrowserItem selected = dirContents[selectedItemIndex];
                 if (selected.isDirectory) {
                     if (selected.name == "..") {
-                        size_t slash = currentDir.find_last_of(
-                            '/', currentDir.length() - 2);
+                        size_t slash = currentDir.find_last_of('/',
+                                           currentDir.length() - 2);
                         if (slash != std::string::npos)
                             currentDir = currentDir.substr(0, slash + 1);
                     } else {
@@ -899,22 +724,16 @@ static void ScanWiiInputs() {
                     PPCIrqUnlockByMsr(st);
 
                     showFileBrowser = false;
+                    
                     dirContents.clear();
                     dirContents.shrink_to_fit();
                 }
             }
         }
 
-        bool bPressed = (pressed & WPAD_BUTTON_B)
-                      || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_B))
-                      || (gcPressed & PAD_BUTTON_B);
-
-        if (bPressed) {
-            if (currentDir != "sd:/"  &&
-                currentDir != "sd://" &&
-                currentDir != "sd:") {
-                size_t slash = currentDir.find_last_of(
-                    '/', currentDir.length() - 2);
+        if ((pressed & WPAD_BUTTON_B) || (pressed & WPAD_CLASSIC_BUTTON_B) || (gcPressed & PAD_BUTTON_B)) {
+            if (currentDir != "sd:/" && currentDir != "sd://" && currentDir != "sd:") {
+                size_t slash = currentDir.find_last_of('/', currentDir.length() - 2);
                 if (slash != std::string::npos) {
                     currentDir = currentDir.substr(0, slash + 1);
                     UpdateFileBrowser(currentDir);
@@ -925,40 +744,7 @@ static void ScanWiiInputs() {
         }
     }
     else {
-        // ------------------------------------------------------------------
-        // Emulation input path.
-        //
-        // If WPAD is still unsafe after the recovery attempt above, we
-        // preserve the last committed button state and layer GC inputs on
-        // top — the player never permanently loses control.
-        // ------------------------------------------------------------------
-        if (!wpadSafe) {
-            PPCIrqState st      = PPCIrqLockByMsr();
-            uint16_t ndsButtons = g_ndsButtons; // keep last good state
-            PPCIrqUnlockByMsr(st);
-
-            if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
-            if (gcHeld & PAD_BUTTON_B)     ndsButtons |= (1 << NDS_KEY_B);
-            if (gcHeld & PAD_BUTTON_X)     ndsButtons |= (1 << NDS_KEY_X);
-            if (gcHeld & PAD_BUTTON_Y)     ndsButtons |= (1 << NDS_KEY_Y);
-            if (gcHeld & PAD_BUTTON_LEFT)  ndsButtons |= (1 << NDS_KEY_LEFT);
-            if (gcHeld & PAD_BUTTON_RIGHT) ndsButtons |= (1 << NDS_KEY_RIGHT);
-            if (gcHeld & PAD_BUTTON_UP)    ndsButtons |= (1 << NDS_KEY_UP);
-            if (gcHeld & PAD_BUTTON_DOWN)  ndsButtons |= (1 << NDS_KEY_DOWN);
-            if (gcHeld & PAD_TRIGGER_R)    ndsButtons |= (1 << NDS_KEY_R);
-            if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
-            if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
-
-            PPCIrqState st2 = PPCIrqLockByMsr();
-            g_ndsButtons = ndsButtons;
-            // Leave touch state unchanged
-            PPCIrqUnlockByMsr(st2);
-            return;
-        }
-
-        // Normal path — wdata is fully safe to dereference
-        uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt,
-                                               hasNunchuk, hasClassic);
+        uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk, hasClassic);
 
         if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
         if (gcHeld & PAD_BUTTON_B)     ndsButtons |= (1 << NDS_KEY_B);
@@ -972,15 +758,13 @@ static void ScanWiiInputs() {
         if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
         if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
 
-        if (hasClassic) {
-            float lx = wdata->exp.classic.ljs.mag *
-                       sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
-            float ly = wdata->exp.classic.ljs.mag *
-                       cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+        if (hasClassic && wdata) {
+            float lx = wdata->exp.classic.ljs.mag * sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
             if (wdata->exp.classic.ljs.mag > 0.5f) {
-                if (lx >  0.5f) ndsButtons |= (1 << NDS_KEY_RIGHT);
+                if (lx > 0.5f)  ndsButtons |= (1 << NDS_KEY_RIGHT);
                 if (lx < -0.5f) ndsButtons |= (1 << NDS_KEY_LEFT);
-                if (ly >  0.5f) ndsButtons |= (1 << NDS_KEY_UP);
+                if (ly > 0.5f)  ndsButtons |= (1 << NDS_KEY_UP);
                 if (ly < -0.5f) ndsButtons |= (1 << NDS_KEY_DOWN);
             }
         }
@@ -988,7 +772,7 @@ static void ScanWiiInputs() {
         bool isTouching = false;
         g_cursorShow = false;
 
-        if (wdata->ir.valid) {
+        if (wdata && wdata->ir.valid) {
             g_cursorX    = wdata->ir.x;
             g_cursorY    = wdata->ir.y;
             g_cursorShow = true;
@@ -1009,11 +793,9 @@ static void ScanWiiInputs() {
             if (g_cursorY > 480.0f) g_cursorY = 480.0f;
         }
 
-        if (hasClassic) {
-            float rx = wdata->exp.classic.rjs.mag *
-                       sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
-            float ry = wdata->exp.classic.rjs.mag *
-                       cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+        if (hasClassic && wdata) {
+            float rx = wdata->exp.classic.rjs.mag * sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            float ry = wdata->exp.classic.rjs.mag * cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
             if (wdata->exp.classic.rjs.mag > 0.15f) {
                 g_cursorX   += rx * 4.0f;
                 g_cursorY   -= ry * 4.0f;
@@ -1031,8 +813,7 @@ static void ScanWiiInputs() {
             g_cursorShow = true;
         }
 
-        if (hasClassic &&
-            (held & (WPAD_CLASSIC_BUTTON_ZL | WPAD_CLASSIC_BUTTON_ZR))) {
+        if (hasClassic && (held & (WPAD_CLASSIC_BUTTON_ZL | WPAD_CLASSIC_BUTTON_ZR))) {
             isTouching   = true;
             g_cursorShow = true;
         }
@@ -1041,14 +822,16 @@ static void ScanWiiInputs() {
         int16_t touchY = 0;
 
         if (g_cursorShow) {
-            const int   gap       = 2;
-            const int   scrW      = NDS_SCREEN_WIDTH;
-            const int   scrH      = NDS_SCREEN_HEIGHT;
+            const int gap     = 2;
+            const int scrW    = NDS_SCREEN_WIDTH;
+            const int scrH    = NDS_SCREEN_HEIGHT;
+            const int totalW  = scrW;
+            const int totalH  = scrH * 2 + gap;
+
             const float fbWidth   = 640.0f;
             const float efbHeight = 480.0f;
-            const int   totalH    = scrH * 2 + gap;
 
-            const float originX = (fbWidth   - scrW)  / 2.0f;
+            const float originX = (fbWidth  - totalW) / 2.0f;
             const float originY = (efbHeight - totalH) / 2.0f;
 
             const float dsLeft   = originX;
@@ -1058,10 +841,8 @@ static void ScanWiiInputs() {
 
             if (g_cursorX >= dsLeft  && g_cursorX <= dsRight &&
                 g_cursorY >= dsTop   && g_cursorY <= dsBottom) {
-                touchX = (int16_t)(
-                    ((g_cursorX - dsLeft) / (dsRight  - dsLeft)) * 256.0f);
-                touchY = (int16_t)(
-                    ((g_cursorY - dsTop)  / (dsBottom - dsTop))  * 192.0f);
+                touchX = (int16_t)(((g_cursorX - dsLeft)  / (dsRight  - dsLeft))  * 256.0f);
+                touchY = (int16_t)(((g_cursorY - dsTop)   / (dsBottom - dsTop))   * 192.0f);
             } else {
                 isTouching = false;
             }
@@ -1089,21 +870,11 @@ int main(int /*argc*/, char** /*argv*/) {
     while (true) {
         ScanWiiInputs();
 
+        // 16-bit rendering references
         const uint16_t* renderTop    = nullptr;
         const uint16_t* renderBottom = nullptr;
 
-        // Snapshot these under a lock to avoid racing with the emulator
-        // thread which may be destroying/recreating ndsCore
-        bool isRomLoaded = false;
-        bool isGbaMode   = false;
-        {
-            PPCIrqState st = PPCIrqLockByMsr();
-            isRomLoaded    = romLoaded;
-            isGbaMode      = (ndsCore != nullptr) && ndsCore->gbaMode;
-            PPCIrqUnlockByMsr(st);
-        }
-
-        if (isRomLoaded && !showFileBrowser) {
+        if (romLoaded && !showFileBrowser) {
             PPCIrqState st  = PPCIrqLockByMsr();
             bool haveFrame  = newFrameReady;
             if (haveFrame) {
@@ -1116,24 +887,23 @@ int main(int /*argc*/, char** /*argv*/) {
             PPCIrqUnlockByMsr(st);
 
             renderTop = frontBuffer;
-            if (isGbaMode)
+            if (ndsCore && ndsCore->gbaMode)
                 renderBottom = bottomScreenBuffer;
             else
-                renderBottom = frontBuffer +
-                               (NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT);
+                renderBottom = frontBuffer + (NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT);
         }
         else {
             renderTop    = topScreenBuffer;
             renderBottom = bottomScreenBuffer;
         }
-
+        
         static uint32_t lastSecFrames = 0;
-        static time_t   lastSec       = 0;
+        static time_t   lastSec = 0;
         time_t now = time(nullptr);
         if (now != lastSec) {
-            perf.fps      = (float)(perf.renderFrameCount - lastSecFrames);
-            lastSecFrames = perf.renderFrameCount;
-            lastSec       = now;
+                perf.fps = (float)(perf.renderFrameCount - lastSecFrames);
+                lastSecFrames = perf.renderFrameCount;
+                lastSec = now;
         }
 
         if (showFileBrowser) {
@@ -1141,8 +911,7 @@ int main(int /*argc*/, char** /*argv*/) {
 
             int lineIndex = 1;
             for (int i = displayOffset;
-                 i < std::min((int)dirContents.size(), displayOffset + 5);
-                 i++) {
+                 i < std::min((int)dirContents.size(), displayOffset + 5); i++) {
                 const char* prefix = (i == selectedItemIndex) ? "-> " : "   ";
                 const char* suffix = dirContents[i].isDirectory ? "/" : "";
                 Wii_DebugOverlayPrint(lineIndex++, "%s%s%s",
@@ -1154,10 +923,7 @@ int main(int /*argc*/, char** /*argv*/) {
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
-            // Show WPAD ERR on line 0 if the last read was bad so the
-            // developer knows a fault frame occurred
-            const char* wpadStatus = g_lastWpadReadValid ? " " : "WPAD ERR";
-            Wii_DebugOverlayPrint(0, "%s", wpadStatus);
+            Wii_DebugOverlayPrint(0, " ");
             Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
             Wii_DebugOverlayPrint(2, "HOME=Quit");
             Wii_DebugOverlayPrint(3, " ");
@@ -1167,7 +933,8 @@ int main(int /*argc*/, char** /*argv*/) {
             Wii_DebugOverlayPrint(7, " ");
         }
 
-        Wii_VideoRender(renderTop, renderBottom, isGbaMode);
+        bool isGba = (ndsCore && romLoaded && !showFileBrowser) ? ndsCore->gbaMode : false;
+        Wii_VideoRender(renderTop, renderBottom, isGba);
         Wii_VideoFlushAsync();
         VIDEO_WaitVSync();
     }
