@@ -51,16 +51,4 @@ void* Wii_CreateTextureRGBA8(uint32_t* data, int width, int height);
 
 void  Wii_DestroyTexture(void* texture);
 
-void* ConsoleUI::createTexture(uint16_t* data, int width, int height) {
-    return Wii_CreateTexture(data, width, height);
-}
-
-void* ConsoleUI::createTextureRGBA8(uint32_t* data, int width, int height) {
-    return Wii_CreateTextureRGBA8(data, width, height);
-}
-
-void ConsoleUI::destroyTexture(void* texture) {
-    Wii_DestroyTexture(texture);
-}
-
 #endif // WII_VIDEO_H
