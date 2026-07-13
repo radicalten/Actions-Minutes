@@ -1,29 +1,50 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
+//ipc.h (optimized)
 #pragma once
 
 #include <cstdint>
 #include <cstdio>
-#include <queue>
+#include <array>
 
 class Core;
+
+// Fixed-size circular FIFO for IPC - avoids std::deque overhead
+// DS IPC FIFO is exactly 16 words deep
+class IpcFifo {
+public:
+    static constexpr uint32_t CAPACITY = 16;
+
+    void clear() {
+        head = tail = count = 0;
+    }
+
+    bool empty() const { return count == 0; }
+    bool full()  const { return count == CAPACITY; }
+    uint32_t size() const { return count; }
+
+    void push_back(uint32_t val) {
+        buf[tail] = val;
+        tail = (tail + 1) & (CAPACITY - 1);
+        ++count;
+    }
+
+    uint32_t front() const { return buf[head]; }
+
+    void pop_front() {
+        head = (head + 1) & (CAPACITY - 1);
+        --count;
+    }
+
+    // Direct index access (for save state)
+    uint32_t operator[](uint32_t i) const {
+        return buf[(head + i) & (CAPACITY - 1)];
+    }
+
+private:
+    uint32_t buf[CAPACITY] = {};
+    uint32_t head = 0;
+    uint32_t tail = 0;
+    uint32_t count = 0;
+};
 
 class Ipc {
 public:
@@ -31,7 +52,7 @@ public:
     void saveState(FILE *file);
     void loadState(FILE *file);
 
-    uint16_t readIpcSync(bool arm7) { return ipcSync[arm7]; }
+    uint16_t readIpcSync(bool arm7)    { return ipcSync[arm7]; }
     uint16_t readIpcFifoCnt(bool arm7) { return ipcFifoCnt[arm7]; }
     uint32_t readIpcFifoRecv(bool arm7);
 
@@ -41,9 +62,11 @@ public:
 
 private:
     Core *core;
-    std::deque<uint32_t> fifos[2];
 
-    uint16_t ipcSync[2] = {};
+    // Use fast circular FIFOs instead of std::deque
+    IpcFifo fifos[2];
+
+    uint16_t ipcSync[2]    = {};
     uint16_t ipcFifoCnt[2] = { 0x0101, 0x0101 };
     uint32_t ipcFifoRecv[2] = {};
 };
