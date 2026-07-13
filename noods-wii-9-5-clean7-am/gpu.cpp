@@ -1,23 +1,4 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+//gpu.cpp
 #include <cstring>
 #include "core.h"
 
@@ -66,9 +47,19 @@ void Gpu::loadState(FILE *file) {
 }
 
 bool Gpu::getFrame(uint16_t *out, bool gbaCrop) {
-    if (!ready) return false;
-
-    Buffers &buffers = framebuffers.front();
+    // Take the front buffer atomically under lock to avoid race with
+    // emulator thread pushing new buffers and setting ready.
+    PPCIrqState st = PPCIrqLockByMsr();
+    if (!ready) {
+        PPCIrqUnlockByMsr(st);
+        return false;
+    }
+    // Copy the Buffers struct (just pointers + bool) under lock,
+    // then pop so the emulator thread can reuse the slot.
+    Buffers buffers = framebuffers.front();
+    framebuffers.pop();
+    ready = !framebuffers.empty();
+    PPCIrqUnlockByMsr(st);
 
     if (gbaCrop) {
         // GBA crop: 240×160 from the 256×160 framebuffer (offset 0)
@@ -77,38 +68,40 @@ bool Gpu::getFrame(uint16_t *out, bool gbaCrop) {
                 out[y * 240 + x] = buffers.framebuffer[y * 256 + x];
     }
     else if (core->gbaMode) {
-    int      offset = (powCnt1 & BIT(15)) ? 0 : (256 * 192);
-    uint32_t base   = 0x6800000 + gbaBlock * 0x20000;
-    gbaBlock = !gbaBlock;
+        // Full GBA display with NDS border fill
+        int      offset = (powCnt1 & BIT(15)) ? 0 : (256 * 192);
+        uint32_t base   = 0x6800000 + gbaBlock * 0x20000;
+        gbaBlock = !gbaBlock;
 
-    for (int y = 0; y < 192; y++) {
-        for (int x = 0; x < 256; x++) {
-            if (x >= 8 && x < 248 && y >= 16 && y < 176) {
-                out[offset + y * 256 + x] =
-                    buffers.framebuffer[(y - 16) * 256 + (x - 8)];
-            }
-            else {
-                // Guard: only read VRAM if bank is likely mapped
-                uint32_t addr = base + (y * 256 + x) * 2;
-                if (addr < 0x6840000) {  // Stay within VRAM B bounds
-                    uint16_t raw = core->memory.read<uint16_t>(0, addr);
-                    uint8_t r5 = ( raw        & 0x1F);
-                    uint8_t g5 = ((raw >>  5) & 0x1F);
-                    uint8_t b5 = ((raw >> 10) & 0x1F);
-                    out[offset + y * 256 + x] = (uint16_t)(
-                        0x8000u | ((uint16_t)r5 << 10)
-                               | ((uint16_t)g5 <<  5)
-                               |  (uint16_t)b5);
-                } else {
-                    out[offset + y * 256 + x] = 0x8000u; // Black border
+        for (int y = 0; y < 192; y++) {
+            for (int x = 0; x < 256; x++) {
+                if (x >= 8 && x < 248 && y >= 16 && y < 176) {
+                    out[offset + y * 256 + x] =
+                        buffers.framebuffer[(y - 16) * 256 + (x - 8)];
+                }
+                else {
+                    // Border: guard address range before reading VRAM
+                    uint32_t addr = base + (y * 256 + x) * 2;
+                    if (addr < 0x6840000) {
+                        uint16_t raw = core->memory.read<uint16_t>(0, addr);
+                        uint8_t r5 = ( raw        & 0x1F);
+                        uint8_t g5 = ((raw >>  5) & 0x1F);
+                        uint8_t b5 = ((raw >> 10) & 0x1F);
+                        out[offset + y * 256 + x] = (uint16_t)(
+                            0x8000u
+                            | ((uint16_t)r5 << 10)
+                            | ((uint16_t)g5 <<  5)
+                            |  (uint16_t)b5);
+                    } else {
+                        out[offset + y * 256 + x] = 0x8000u;
+                    }
                 }
             }
         }
+        // Clear the unused screen half
+        int unusedOffset = (offset == 0) ? (256 * 192) : 0;
+        memset(&out[unusedOffset], 0, 256 * 192 * sizeof(uint16_t));
     }
-    // Fix the memset: clear only the unused half
-    int unusedOffset = (offset == 0) ? (256 * 192) : 0;
-    memset(&out[unusedOffset], 0, 256 * 192 * sizeof(uint16_t));
-}
     else {
         // Normal NDS mode: copy both screens (top + bottom) as RGB5A3
         for (int i = 0; i < 256 * 192 * 2; i++)
@@ -123,12 +116,9 @@ bool Gpu::getFrame(uint16_t *out, bool gbaCrop) {
                                     : (256 * 192 * 2));
 
         for (int i = 0; i < pixels; i++) {
-            // Average the R5, G5, B5 channels between frames
             uint16_t a = prev[i];
             uint16_t b = out[i];
 
-            // Both must be opaque (bit15=1) for a meaningful average
-            // If either is transparent, just pass through current frame
             if ((a & 0x8000u) && (b & 0x8000u)) {
                 uint8_t r = (uint8_t)((((a >> 10) & 0x1F)
                            + ((b >> 10) & 0x1F)) >> 1);
@@ -147,13 +137,10 @@ bool Gpu::getFrame(uint16_t *out, bool gbaCrop) {
         }
     }
 
+    // Free the buffer contents — they were heap-allocated per frame
     delete[] buffers.framebuffer;
     delete[] buffers.hiRes3D;
 
-    PPCIrqState st = PPCIrqLockByMsr();
-    framebuffers.pop();
-    ready = !framebuffers.empty();
-    PPCIrqUnlockByMsr(st);
     return true;
 }
 
@@ -195,7 +182,6 @@ void Gpu::gbaScanline308() {
 
         if (frames == 0 && framebuffers.size() < 2) {
             Buffers buffers;
-            // 256×160 RGB5A3 pixels
             buffers.framebuffer = new uint16_t[256 * 160];
             memcpy(buffers.framebuffer,
                    core->gpu2D[0].getFramebuffer(),
@@ -289,7 +275,6 @@ void Gpu::scanline256() {
 
             switch ((dispCapCnt & 0x60000000) >> 29) {
             case 0: {
-                // Source: 3D renderer (now uint16_t*) or 2D raw line (uint32_t*)
                 bool use3D    = (dispCapCnt & BIT(24)) != 0;
                 bool resShift = (Settings::highRes3D && use3D);
 
@@ -297,7 +282,6 @@ void Gpu::scanline256() {
                     uint16_t *src3d =
                         core->gpu3DRenderer.getLine(vCount);
                     for (int i = 0; i < width; i++) {
-                        // Convert RGB5A3 → RGB5 for capture memory
                         uint16_t rgb5 = rgb5a3ToRgb5(src3d[i << resShift]);
                         core->memory.write<uint16_t>(
                             0,
@@ -436,8 +420,9 @@ void Gpu::scanline355() {
 
         if (frames == 0 && framebuffers.size() < 2) {
             Buffers buffers;
-            // 256×192×2 RGB5A3 pixels (top + bottom screen)
             buffers.framebuffer = new uint16_t[256 * 192 * 2];
+            buffers.hiRes3D     = nullptr;
+            buffers.top3D       = false;
 
             if (powCnt1 & BIT(0)) {
                 if (powCnt1 & BIT(15)) {
@@ -458,23 +443,23 @@ void Gpu::scanline355() {
                 }
             }
             else {
-                // Both LCDs off: opaque black RGB5A3
                 for (int i = 0; i < 256 * 192 * 2; i++)
                     buffers.framebuffer[i] = 0x8000u;
             }
 
-            // hi-res 3D: getLine() now returns uint16_t*
+            // hi-res 3D: guard getLine(0) for nullptr
             if (Settings::highRes3D &&
-    (core->gpu2D[0].readDispCnt() & BIT(3))) {
-    const int hiResPixels = 256 * 192 * 4;
-    uint16_t *line0 = core->gpu3DRenderer.getLine(0);
-    if (line0) {  // ← Guard null return
-        buffers.hiRes3D = new uint16_t[hiResPixels];
-        memcpy(buffers.hiRes3D, line0,
-               hiResPixels * sizeof(uint16_t));
-        buffers.top3D = (powCnt1 & BIT(15));
-    }
-}
+                (core->gpu2D[0].readDispCnt() & BIT(3))) {
+                uint16_t *line0 = core->gpu3DRenderer.getLine(0);
+                if (line0) {
+                    const int hiResPixels = 256 * 192 * 4;
+                    buffers.hiRes3D = new uint16_t[hiResPixels];
+                    memcpy(buffers.hiRes3D, line0,
+                           hiResPixels * sizeof(uint16_t));
+                    buffers.top3D = (powCnt1 & BIT(15));
+                }
+            }
+
             PPCIrqState st = PPCIrqLockByMsr();
             framebuffers.push(buffers);
             ready = true;
