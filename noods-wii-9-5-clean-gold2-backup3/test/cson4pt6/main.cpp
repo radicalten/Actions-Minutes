@@ -47,6 +47,9 @@ extern "C" {
     #include <tuxedo/ppc/clock.h>
 }
 
+static void InitializeAudio();
+static void ShutdownAudio();
+
 #define EMULATION_STACK_SIZE (256 * 1024)
 #define AUDIO_STACK_SIZE     (64  * 1024)
 
