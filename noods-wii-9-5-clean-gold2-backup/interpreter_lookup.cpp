@@ -38,7 +38,7 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     // ── 0x010–0x01F  ANDS reg ────────────────────────────────────────────────
     &Interpreter::andsLli,    &Interpreter::andsLlr,    &Interpreter::andsLri,    &Interpreter::andsLrr,
     &Interpreter::andsAri,    &Interpreter::andsArr,    &Interpreter::andsRri,    &Interpreter::andsRrr,
-    &Interpreter::andsLli,    &Interpreter::muls,       &Interpreter::andsri,    &Interpreter::ldrhPtrm,
+    &Interpreter::andsLli,    &Interpreter::muls,       &Interpreter::andsLri,    &Interpreter::ldrhPtrm,
     &Interpreter::andsAri,    &Interpreter::ldrsbPtrm,  &Interpreter::andsRri,    &Interpreter::ldrshPtrm,
 
     // ── 0x020–0x02F  EOR reg ────────────────────────────────────────────────
@@ -102,15 +102,15 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     &Interpreter::adcsAri,    &Interpreter::ldrsbPtrp,  &Interpreter::adcsRri,    &Interpreter::ldrshPtrp,
 
     // ── 0x0C0–0x0CF  SBC reg / SMULL ────────────────────────────────────────
-    &Interpreter::sbcLli,     &Interpreter::sbcLlr,     &Interpreter::sbcri,     &Interpreter::sbcLrr,
+    &Interpreter::sbcLli,     &Interpreter::sbcLlr,     &Interpreter::sbcLri,     &Interpreter::sbcLrr,
     &Interpreter::sbcAri,     &Interpreter::sbcArr,     &Interpreter::sbcRri,     &Interpreter::sbcRrr,
-    &Interpreter::sbcLli,     &Interpreter::smull,      &Interpreter::sbcri,     &Interpreter::strhPtip,
+    &Interpreter::sbcLli,     &Interpreter::smull,      &Interpreter::sbcLri,     &Interpreter::strhPtip,
     &Interpreter::sbcAri,     &Interpreter::ldrdPtip,   &Interpreter::sbcRri,     &Interpreter::strdPtip,
 
     // ── 0x0D0–0x0DF  SBCS reg / SMULLS ──────────────────────────────────────
-    &Interpreter::sbcsLli,    &Interpreter::sbcsLlr,    &Interpreter::sbcsri,     &Interpreter::sbcsLrr,
+    &Interpreter::sbcsLli,    &Interpreter::sbcsLlr,    &Interpreter::sbcsLri,     &Interpreter::sbcsLrr,
     &Interpreter::sbcsAri,    &Interpreter::sbcsArr,    &Interpreter::sbcsRri,    &Interpreter::sbcsRrr,
-    &Interpreter::sbcsLli,    &Interpreter::smulls,     &Interpreter::sbcsri,     &Interpreter::ldrhPtip,
+    &Interpreter::sbcsLli,    &Interpreter::smulls,     &Interpreter::sbcsLri,     &Interpreter::ldrhPtip,
     &Interpreter::sbcsAri,    &Interpreter::ldrsbPtip,  &Interpreter::sbcsRri,    &Interpreter::ldrshPtip,
 
     // ── 0x0E0–0x0EF  RSC reg / SMLAL ────────────────────────────────────────
@@ -120,9 +120,9 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     &Interpreter::rscAri,     &Interpreter::ldrdPtip,   &Interpreter::rscRri,     &Interpreter::strdPtip,
 
     // ── 0x0F0–0x0FF  RSCS reg / SMLALS ──────────────────────────────────────
-    &Interpreter::rscsLli,    &Interpreter::rscsLlr,    &Interpreter::rscsri,    &Interpreter::rscsLrr,
+    &Interpreter::rscsLli,    &Interpreter::rscsLlr,    &Interpreter::rscsLri,    &Interpreter::rscsLrr,
     &Interpreter::rscsAri,    &Interpreter::rscsArr,    &Interpreter::rscsRri,    &Interpreter::rscsRrr,
-    &Interpreter::rscsLli,    &Interpreter::smlals,     &Interpreter::rscsri,    &Interpreter::ldrhPtip,
+    &Interpreter::rscsLli,    &Interpreter::smlals,     &Interpreter::rscsLri,    &Interpreter::ldrhPtip,
     &Interpreter::rscsAri,    &Interpreter::ldrsbPtip,  &Interpreter::rscsRri,    &Interpreter::ldrshPtip,
 
     // ── 0x100–0x10F  MRS / QADD / SMLAxy / SWP ──────────────────────────────
@@ -198,15 +198,15 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     &Interpreter::movsAri,    &Interpreter::ldrsbPrrp,  &Interpreter::movsRri,    &Interpreter::ldrshPrrp,
 
     // ── 0x1C0–0x1CF  BIC reg ────────────────────────────────────────────────
-    &Interpreter::bicLli,     &Interpreter::bicLlr,     &Interpreter::bicri,     &Interpreter::bicLrr,
+    &Interpreter::bicLli,     &Interpreter::bicLlr,     &Interpreter:bicLri,     &Interpreter::bicLrr,
     &Interpreter::bicAri,     &Interpreter::bicArr,     &Interpreter::bicRri,     &Interpreter::bicRrr,
-    &Interpreter::bicLli,     &Interpreter::unkArm,     &Interpreter::bicri,     &Interpreter::strhOfip,
+    &Interpreter::bicLli,     &Interpreter::unkArm,     &Interpreter::bicLri,     &Interpreter::strhOfip,
     &Interpreter::bicAri,     &Interpreter::ldrdOfip,   &Interpreter::bicRri,     &Interpreter::strdOfip,
 
     // ── 0x1D0–0x1DF  BICS reg ───────────────────────────────────────────────
-    &Interpreter::bicsLli,    &Interpreter::bicsLlr,    &Interpreter::bicsri,     &Interpreter::bicsLrr,
+    &Interpreter::bicsLli,    &Interpreter::bicsLlr,    &Interpreter::bicsLri,     &Interpreter::bicsLrr,
     &Interpreter::bicsAri,    &Interpreter::bicsArr,    &Interpreter::bicsRri,    &Interpreter::bicsRrr,
-    &Interpreter::bicsLli,    &Interpreter::unkArm,     &Interpreter::bicsri,     &Interpreter::ldrhOfip,
+    &Interpreter::bicsLli,    &Interpreter::unkArm,     &Interpreter::bicsLri,     &Interpreter::ldrhOfip,
     &Interpreter::bicsAri,    &Interpreter::ldrsbOfip,  &Interpreter::bicsRri,    &Interpreter::ldrshOfip,
 
     // ── 0x1E0–0x1EF  MVN reg ────────────────────────────────────────────────
@@ -216,9 +216,9 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     &Interpreter::mvnAri,     &Interpreter::ldrdPrip,   &Interpreter::mvnRri,     &Interpreter::strdPrip,
 
     // ── 0x1F0–0x1FF  MVNS reg ───────────────────────────────────────────────
-    &Interpreter::mvnsLli,    &Interpreter::mvnsLlr,    &Interpreter::mvnsri,    &Interpreter::mvnsLrr,
+    &Interpreter::mvnsLli,    &Interpreter::mvnsLlr,    &Interpreter::mvnsLri,    &Interpreter::mvnsLrr,
     &Interpreter::mvnsAri,    &Interpreter::mvnsArr,    &Interpreter::mvnsRri,    &Interpreter::mvnsRrr,
-    &Interpreter::mvnsLli,    &Interpreter::unkArm,     &Interpreter::mvnsri,    &Interpreter::ldrhPrip,
+    &Interpreter::mvnsLli,    &Interpreter::unkArm,     &Interpreter::mvnsLri,    &Interpreter::ldrhPrip,
     &Interpreter::mvnsAri,    &Interpreter::ldrsbPrip,  &Interpreter::mvnsRri,    &Interpreter::ldrshPrip,
 
     // ════════════════════════════════════════════════════════════════════════
