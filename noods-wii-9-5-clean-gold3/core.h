@@ -1,4 +1,4 @@
-//core.h (optimized)
+//core.h (optimized, fixed)
 #pragma once
 
 #include <cstdint>
@@ -39,13 +39,12 @@ extern "C" {
 #include "wifi.h"
 
 // PowerPC optimization macros
-#define PPC_LIKELY(x)    __builtin_expect(!!(x), 1)
-#define PPC_UNLIKELY(x)  __builtin_expect(!!(x), 0)
-#define ALWAYS_INLINE    __attribute__((always_inline)) inline
-#define HOT              __attribute__((hot))
-#define COLD             __attribute__((cold))
-// Correct alignment attribute: applies to the variable, not array elements
-#define ALIGNED(n)       __attribute__((aligned(n)))
+#define PPC_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define PPC_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define ALWAYS_INLINE   __attribute__((always_inline)) inline
+#define HOT             __attribute__((hot))
+#define COLD            __attribute__((cold))
+#define ALIGNED(n)      __attribute__((aligned(n)))
 
 enum CoreError {
     ERROR_BIOS,
@@ -89,22 +88,30 @@ enum SchedTask {
     MAX_TASKS
 };
 
+// Keep task first in the struct to match all existing call sites:
+//   SchedEvent(task, cycles)
+// cycles is hot for comparisons but the constructor signature
+// is used throughout the codebase so we keep the original order.
 struct SchedEvent {
-    uint32_t  cycles;  // Put cycles first for faster comparisons (cache line)
     SchedTask task;
+    uint32_t  cycles;
 
-    SchedEvent(SchedTask task, uint32_t cycles): cycles(cycles), task(task) {}
+    SchedEvent() : task(MAX_TASKS), cycles(0) {}
+    SchedEvent(SchedTask task, uint32_t cycles)
+        : task(task), cycles(cycles) {}
 
-    // Compare only cycles for sorted insertion
-    bool operator<(const SchedEvent& e) const { return cycles < e.cycles; }
+    // Only cycles matters for ordering
+    bool operator<(const SchedEvent &e) const {
+        return cycles < e.cycles;
+    }
 };
 
 class Core {
 public:
-    void* operator new  (size_t size);
-    void  operator delete  (void* p) noexcept;
-    void* operator new[](size_t size);
-    void  operator delete[](void* p) noexcept;
+    void *operator new  (size_t size);
+    void  operator delete  (void *p) noexcept;
+    void *operator new[](size_t size);
+    void  operator delete[](void *p) noexcept;
 
     int  id      = 0;
     int  fps     = 0;
@@ -136,31 +143,23 @@ public:
     Timers          timers[2];
     Wifi            wifi;
 
-    // volatile prevents compiler from caching; guarded by PPCIrqLockByMsr for writes
+    // volatile: compiler cannot cache; writes guarded by PPCIrqLockByMsr
     volatile uint8_t running;
 
-    // Fixed-capacity event queue: DS never needs more than MAX_TASKS simultaneous events
-    // Use a small sorted array instead of std::vector to avoid heap allocation and
-    // improve cache locality. MAX_TASKS = 32 => 32 * 8 bytes = 256 bytes
-    static constexpr int MAX_EVENTS = MAX_TASKS;
-    SchedEvent eventsArr[MAX_EVENTS] = { SchedEvent(MAX_TASKS, 0) };
-    int        eventsCount = 0;
-
-    // Keep std::vector for compatibility with existing code that uses events[]
-    // but alias through the fixed array for the hot path
+    // Pre-reserved event list - avoids heap reallocation during emulation
     std::vector<SchedEvent> events;
 
-    std::function<void()>   tasks[MAX_TASKS];
-    uint32_t                globalCycles = 0;
+    std::function<void()> tasks[MAX_TASKS];
+    uint32_t              globalCycles = 0;
 
     Core(std::string ndsRom = "", std::string gbaRom = "", int id = 0,
-         int ndsRomFd  = -1, int gbaRomFd  = -1,
-         int ndsSaveFd = -1, int gbaSaveFd = -1,
+         int ndsRomFd   = -1, int gbaRomFd   = -1,
+         int ndsSaveFd  = -1, int gbaSaveFd  = -1,
          int ndsStateFd = -1, int gbaStateFd = -1,
          int ndsCheatFd = -1);
 
-    void saveState(FILE* file);
-    void loadState(FILE* file);
+    void saveState(FILE *file);
+    void loadState(FILE *file);
 
     void runCore() { (*runFunc)(*this); }
     HOT void schedule(SchedTask task, uint32_t cycles);
@@ -168,9 +167,10 @@ public:
     void endFrame();
 
 private:
-    bool realGbaBios;
-    void (*runFunc)(Core&) = &Interpreter::runCoreNds;
+    bool realGbaBios = false;
+    void (*runFunc)(Core &) = &Interpreter::runCoreNds;
 
+    // FPS timing via PPC timebase
     uint64_t lastFpsTimeTicks = 0;
     int      fpsCount         = 0;
 
