@@ -1,4 +1,4 @@
-Could you help optimize my wii powerpc .cpp files for speed? Core.h/cpp have already been optimized. Here they are for reference:
+Could you help optimize my wii powerpc .cpp files for speed? the program is a DS emulator. Core.h/cpp have already been optimized. Here they are for reference:
 
 //core.h
 #pragma once
@@ -81,18 +81,6 @@ enum SchedTask {
     MAX_TASKS
 };
 
-// ---------------------------------------------------------------------------
-// SchedCallback — a zero-overhead two-word closure.
-//
-//   fn  : plain function pointer, signature void(void*, int)
-//   obj : opaque pointer forwarded as the first argument (the "this")
-//   arg : small integer second argument (channel/index, 0 when unused)
-//
-// For tasks that carry no integer argument (arg == 0 always) the compiler
-// will constant-fold the second parameter away after inlining the trampoline,
-// leaving a single indirect branch — identical cost to a raw method pointer
-// on PowerPC where member-function pointers are two words anyway.
-// ---------------------------------------------------------------------------
 struct SchedCallback {
     void (*fn)(void* obj, int arg);  // trampoline function
     void*  obj;                      // receiver object
@@ -159,8 +147,6 @@ public:
 
     std::vector<SchedEvent> events;
 
-    // Flat array of two-word callbacks — fits in two cache lines (32 tasks).
-    // Each entry is 12 bytes on 32-bit PPC: fn(4) + obj(4) + arg(4).
     SchedCallback tasks[MAX_TASKS];
 
     uint32_t globalCycles = 0;
@@ -174,7 +160,6 @@ public:
     void saveState(FILE* file);
     void loadState(FILE* file);
 
-    // Hot path: single load + indirect branch, no virtual dispatch.
     inline void runCore() { (*runFunc)(*this); }
 
     void schedule(SchedTask task, uint32_t cycles);
@@ -191,23 +176,6 @@ private:
     void updateRun();
     void resetCycles();
 
-    // -----------------------------------------------------------------------
-    // Static trampoline shims.
-    //
-    // Each shim is a plain function that recovers the typed pointer from the
-    // opaque void* and calls the real member function.  Because they are
-    // static and their bodies are trivial the compiler inlines them at the
-    // SchedCallback::operator() call site, so the generated code is:
-    //
-    //   lwz   r3, obj(callback)      ; load receiver
-    //   lwz   r4, arg(callback)      ; load channel (often optimised away)
-    //   lwz   r12, fn(callback)      ; load trampoline address
-    //   mtctr r12
-    //   bctrl                        ; single indirect branch
-    //
-    // That is the minimum possible cost for a runtime-dispatched call on PPC.
-    // -----------------------------------------------------------------------
-
     // Core self-tasks (arg ignored)
     static void shim_updateRun   (void* o, int) { static_cast<Core*>(o)->updateRun();    }
     static void shim_resetCycles (void* o, int) { static_cast<Core*>(o)->resetCycles();  }
@@ -222,7 +190,6 @@ private:
         static_cast<Dma*>(o)->transfer(a);
     }
 
-    // Gpu scanlines (arg ignored)
     static void shim_gpuScanline256  (void* o, int) { static_cast<Gpu*>(o)->scanline256();     }
     static void shim_gpuScanline355  (void* o, int) { static_cast<Gpu*>(o)->scanline355();     }
     static void shim_gpuGbaScanline240(void* o, int) { static_cast<Gpu*>(o)->gbaScanline240(); }
@@ -236,7 +203,6 @@ private:
         static_cast<Interpreter*>(o)->interrupt();
     }
 
-    // Spu (arg ignored)
     static void shim_spuSample   (void* o, int) { static_cast<Spu*>(o)->runSample();    }
     static void shim_spuGbaSample(void* o, int) { static_cast<Spu*>(o)->runGbaSample(); }
 
@@ -267,9 +233,6 @@ extern "C" {
 extern void* Noods_MEM2_Alloc(size_t size);
 extern void  Noods_MEM2_Free(void* ptr);
 
-// ---------------------------------------------------------------------------
-// Custom allocators — route to MEM2
-// ---------------------------------------------------------------------------
 void* Core::operator new(size_t size) {
     void* p = Noods_MEM2_Alloc(size);
     if (!p) throw std::bad_alloc();
@@ -284,9 +247,6 @@ void* Core::operator new[](size_t size) {
 }
 void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
 
-// ---------------------------------------------------------------------------
-// Constructor
-// ---------------------------------------------------------------------------
 Core::Core(std::string ndsRom, std::string gbaRom, int id,
            int ndsRomFd,  int gbaRomFd,
            int ndsSaveFd, int gbaSaveFd,
@@ -312,13 +272,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
       lastFpsTimeTicks(0),
       fpsCount(0)
 {
-    // ------------------------------------------------------------------
-    // Bind task table.
-    //
-    // Layout: SchedCallback(trampoline, receiver_ptr, int_arg)
-    // Tasks that take no integer argument pass 0; the compiler will
-    // constant-fold the unused parameter in release builds.
-    // ------------------------------------------------------------------
 
     // Core self-tasks
     tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
@@ -374,9 +327,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
     tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
 
-    // ------------------------------------------------------------------
-    // BIOS / firmware loading
-    // ------------------------------------------------------------------
     bool required = !Settings::directBoot ||
                     (ndsRom == "" && gbaRom == "" &&
                      ndsRomFd == -1 && gbaRomFd == -1);
@@ -386,9 +336,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     if (!spi.loadFirmware()  && required) throw ERROR_FIRM;
     realGbaBios = memory.loadGbaBios();
 
-    // ------------------------------------------------------------------
-    // Initial scheduling
-    // ------------------------------------------------------------------
     schedule(RESET_CYCLES,    0x7FFFFFFF);
     schedule(NDS_SCANLINE256, 256 * 6);
     schedule(NDS_SCANLINE355, 355 * 6);
@@ -402,9 +349,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     interpreter[0].init();
     interpreter[1].init();
 
-    // ------------------------------------------------------------------
-    // GBA ROM
-    // ------------------------------------------------------------------
     if (gbaRom != "" || gbaRomFd != -1) {
         if (!cartridgeGba.setRom(gbaRom, gbaRomFd, gbaSaveFd, gbaStateFd, -1))
             throw ERROR_ROM;
@@ -415,9 +359,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         }
     }
 
-    // ------------------------------------------------------------------
-    // NDS ROM
-    // ------------------------------------------------------------------
     if (ndsRom != "" || ndsRomFd != -1) {
         if (!cartridgeNds.setRom(ndsRom, ndsRomFd, ndsSaveFd, ndsStateFd, ndsCheatFd))
             throw ERROR_ROM;
@@ -449,9 +390,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         }
     }
 
-    // ------------------------------------------------------------------
-    // HLE ARM7
-    // ------------------------------------------------------------------
     if (!gbaMode && Settings::arm7Hle) {
         arm7Hle = true;
         hleArm7.init();
@@ -464,9 +402,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     PPCIrqUnlockByMsr(st);
 }
 
-// ---------------------------------------------------------------------------
-// State save / load
-// ---------------------------------------------------------------------------
 void Core::saveState(FILE* file) {
     fwrite(&arm7Hle,      sizeof(arm7Hle),      1, file);
     fwrite(&dsiMode,      sizeof(dsiMode),      1, file);
@@ -497,9 +432,6 @@ void Core::loadState(FILE* file) {
     updateRun();
 }
 
-// ---------------------------------------------------------------------------
-// updateRun — select the tightest interpreter loop for the current state
-// ---------------------------------------------------------------------------
 void Core::updateRun() {
     if (interpreter[0].halted && interpreter[1].halted)
         runFunc = &Interpreter::runCoreNone;
@@ -519,9 +451,6 @@ void Core::updateRun() {
     PPCIrqUnlockByMsr(st);
 }
 
-// ---------------------------------------------------------------------------
-// resetCycles — prevent globalCycles overflow every ~2 billion ticks
-// ---------------------------------------------------------------------------
 void Core::resetCycles() {
     const size_t n = events.size();
     for (size_t i = 0; i < n; i++)
@@ -536,18 +465,12 @@ void Core::resetCycles() {
     schedule(RESET_CYCLES, 0x7FFFFFFF);
 }
 
-// ---------------------------------------------------------------------------
-// schedule — insert a new event in sorted order (binary search insertion)
-// ---------------------------------------------------------------------------
 void Core::schedule(SchedTask task, uint32_t cycles) {
     SchedEvent event(task, globalCycles + cycles);
     auto it = std::upper_bound(events.cbegin(), events.cend(), event);
     events.insert(it, event);
 }
 
-// ---------------------------------------------------------------------------
-// enterGbaMode
-// ---------------------------------------------------------------------------
 void Core::enterGbaMode() {
     gbaMode = true;
 
@@ -578,9 +501,6 @@ void Core::enterGbaMode() {
     memory.write<uint16_t>(1, 0x4000088, 0x200);
 }
 
-// ---------------------------------------------------------------------------
-// endFrame
-// ---------------------------------------------------------------------------
 void Core::endFrame() {
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
