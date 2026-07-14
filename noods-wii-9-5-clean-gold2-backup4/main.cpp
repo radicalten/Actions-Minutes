@@ -1,4 +1,3 @@
-// main.cpp
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -142,65 +141,35 @@ static const int SCROLL_DELAY_REPEATED = 3;
 // ---------------------------------------------------------------------------
 // Settings menu state
 // ---------------------------------------------------------------------------
-static bool showSettingsMenu = false;
-static int  settingsMenuIndex   = 0;     // which row is highlighted
-static int  settingsDisplayOffset = 0;   // first visible row
+static bool showSettingsMenu      = false;
+static int  settingsMenuIndex     = 0;
+static int  settingsDisplayOffset = 0;
 
-// ---------------------------------------------------------------------------
-// Each entry the settings menu can display.
-// We keep it as a flat list; header rows have value == nullptr.
-// ---------------------------------------------------------------------------
 struct SettingsEntry {
-    const char* label;      // displayed on the left
-    int*        value;      // nullptr → section header
-    int         maxValue;   // cycles 0..maxValue-1 on A press
-    // Human-readable value names.  If nullptr, we print the integer directly.
+    const char* label;
+    int*        value;
+    int         maxValue;
     const char* const* names;
     int         nameCount;
 };
 
-static const char* const s_toggleNames[]      = { "Off", "On" };
-static const char* const s_frameskipNames[]   = { "None", "1", "2", "3", "4", "5" };
-static const char* const s_filterNames[]      = { "Nearest", "Upscaled", "Linear" };
-static const char* const s_threaded3DNames[]  = { "Off", "1 Thread", "2 Threads" };
+static const char* const s_toggleNames[]    = { "Off", "On" };
+static const char* const s_frameskipNames[] = { "None", "1", "2", "3", "4", "5" };
 
-// The table — built once, used every frame the menu is open.
-// Section headers have value == nullptr.
 static const SettingsEntry s_settingsTable[] = {
-    // ---- General ----
-    { "-- General --",          nullptr,                    0, nullptr,           0 },
-    { "Direct Boot",            &Settings::directBoot,      2, s_toggleNames,     2 },
-    { "FPS Limiter",            &Settings::fpsLimiter,      2, s_toggleNames,     2 },
-    // ---- Graphics ----
-    { "-- Graphics --",         nullptr,                    0, nullptr,           0 },
-    { "Skip Frames",            &Settings::frameskip,       6, s_frameskipNames,  6 },
-    { "Threaded 2D",            &Settings::threaded2D,      2, s_toggleNames,     2 },
-    { "Threaded 3D",            &Settings::threaded3D,      3, s_threaded3DNames, 3 },
-    { "High-Res 3D",            &Settings::highRes3D,       2, s_toggleNames,     2 },
-    { "Simulate Ghosting",      &Settings::screenGhost,     2, s_toggleNames,     2 },
-    { "Screen Filter",          &Settings::screenFilter,    3, s_filterNames,     3 },
-    // ---- Audio ----
-    { "-- Audio --",            nullptr,                    0, nullptr,           0 },
-    { "Audio Emulation",        &Settings::emulateAudio,    2, s_toggleNames,     2 },
-    { "16-bit Output",          &Settings::audio16Bit,      2, s_toggleNames,     2 },
-    { "Mono Audio",             &Settings::monoAudio,       2, s_toggleNames,     2 },
-    // ---- Experimental ----
-    { "-- Experimental --",     nullptr,                    0, nullptr,           0 },
-    { "HLE ARM7",               &Settings::arm7Hle,         2, s_toggleNames,     2 },
-    { "DSi Mode",               &Settings::dsiMode,         2, s_toggleNames,     2 },
+    { "Direct Boot",     &Settings::directBoot,   2, s_toggleNames,    2 },
+    { "Skip Frames",     &Settings::frameskip,    6, s_frameskipNames, 6 },
+    { "FPS Limiter",     &Settings::fpsLimiter,   2, s_toggleNames,    2 },
+    { "Audio Emulation", &Settings::emulateAudio, 2, s_toggleNames,    2 },
+    { "16-bit Output",   &Settings::audio16Bit,   2, s_toggleNames,    2 },
+    { "Mono Audio",      &Settings::monoAudio,    2, s_toggleNames,    2 },
 };
 
 static const int s_settingsCount =
     (int)(sizeof(s_settingsTable) / sizeof(s_settingsTable[0]));
 
-// How many non-header rows are visible at once in the overlay.
-// Overlay has 8 lines: line 0 = title, lines 1-5 = items (5 visible),
-// line 6 = hint, line 7 = blank.
 static const int SETTINGS_VISIBLE = 5;
 
-// ---------------------------------------------------------------------------
-// Return the display string for a settings entry.
-// ---------------------------------------------------------------------------
 static std::string SettingsEntryValue(const SettingsEntry& e) {
     if (!e.value) return "";
     int v = *e.value;
@@ -209,25 +178,13 @@ static std::string SettingsEntryValue(const SettingsEntry& e) {
     return std::to_string(v);
 }
 
-// ---------------------------------------------------------------------------
-// Advance to the next non-header index >= start in direction dir (+1/-1).
-// Returns start unchanged if no non-header row exists.
-// ---------------------------------------------------------------------------
 static int NextSelectableSettings(int start, int dir) {
-    int idx = start;
-    for (int attempts = 0; attempts < s_settingsCount; attempts++) {
-        idx += dir;
-        if (idx < 0)                idx = s_settingsCount - 1;
-        if (idx >= s_settingsCount) idx = 0;
-        if (s_settingsTable[idx].value != nullptr)
-            return idx;
-    }
-    return start; // no selectable row (shouldn't happen)
+    int idx = start + dir;
+    if (idx < 0)                idx = s_settingsCount - 1;
+    if (idx >= s_settingsCount) idx = 0;
+    return idx;
 }
 
-// ---------------------------------------------------------------------------
-// Make sure settingsDisplayOffset keeps the highlighted row visible.
-// ---------------------------------------------------------------------------
 static void ClampSettingsScroll() {
     if (settingsMenuIndex < settingsDisplayOffset)
         settingsDisplayOffset = settingsMenuIndex;
@@ -235,22 +192,12 @@ static void ClampSettingsScroll() {
         settingsDisplayOffset = settingsMenuIndex - SETTINGS_VISIBLE + 1;
 }
 
-// ---------------------------------------------------------------------------
-// Open / reset the settings menu.
-// ---------------------------------------------------------------------------
 static void OpenSettingsMenu() {
-    showSettingsMenu    = true;
-    // Find the first selectable row.
-    settingsMenuIndex   = 0;
-    if (s_settingsTable[0].value == nullptr)
-        settingsMenuIndex = NextSelectableSettings(0, +1);
+    showSettingsMenu      = true;
+    settingsMenuIndex     = 0;
     settingsDisplayOffset = 0;
-    ClampSettingsScroll();
 }
 
-// ---------------------------------------------------------------------------
-// Activate (toggle) the currently highlighted settings entry.
-// ---------------------------------------------------------------------------
 static void ActivateSettingsEntry(int idx) {
     const SettingsEntry& e = s_settingsTable[idx];
     if (!e.value) return;
@@ -282,9 +229,6 @@ struct PerformanceState {
 };
 static PerformanceState perf = {};
 
-// ---------------------------------------------------------------------------
-// Caller-owned staging buffers
-// ---------------------------------------------------------------------------
 #define AUDIO_SPU_FRAMES  WIIAUD_NDS_FRAMES
 
 alignas(32) static uint32_t s_spuStaging[AUDIO_SPU_FRAMES];
@@ -655,8 +599,35 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool has
 }
 
 // ---------------------------------------------------------------------------
-// HandleSettingsInput — called from ScanWiiInputs when showSettingsMenu is
-// true.  Uses the same hold-scroll pattern as the file browser.
+// Settings combo helper — shared between browser and in-game contexts.
+// Returns true on the frame the combo is first completed (edge-triggered).
+// Wii Remote / Classic: B + PLUS
+// GameCube:             B + START
+// ---------------------------------------------------------------------------
+static bool CheckSettingsCombo(u32 pressed, u32 held,
+                                u32 gcPressed, u32 gcHeld,
+                                bool hasClassic)
+{
+    bool bHeld       = (held    & WPAD_BUTTON_B)
+                     || (hasClassic && (held    & WPAD_CLASSIC_BUTTON_B));
+    bool bDown       = (pressed & WPAD_BUTTON_B)
+                     || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_B));
+    bool plusHeld    = (held    & WPAD_BUTTON_PLUS)
+                     || (hasClassic && (held    & WPAD_CLASSIC_BUTTON_PLUS));
+    bool plusDown    = (pressed & WPAD_BUTTON_PLUS)
+                     || (hasClassic && (pressed & WPAD_CLASSIC_BUTTON_PLUS));
+
+    bool gcBHeld     = (gcHeld    & PAD_BUTTON_B);
+    bool gcBDown     = (gcPressed & PAD_BUTTON_B);
+    bool gcStartHeld = (gcHeld    & PAD_BUTTON_START);
+    bool gcStartDown = (gcPressed & PAD_BUTTON_START);
+
+    return (bDown && plusHeld) || (plusDown && bHeld) ||
+           (gcBDown && gcStartHeld) || (gcStartDown && gcBHeld);
+}
+
+// ---------------------------------------------------------------------------
+// HandleSettingsInput — drives the settings menu each frame it is open.
 // ---------------------------------------------------------------------------
 static int settingsScrollHoldTimer = 0;
 
@@ -664,7 +635,7 @@ static void HandleSettingsInput(u32 pressed, u32 held,
                                 u32 gcPressed, u32 gcHeld,
                                 WPADData* wdata, bool hasClassic)
 {
-    // --- Classic left-stick for scrolling ---
+    // Classic left-stick for scrolling.
     bool classicUp   = false;
     bool classicDown = false;
     if (hasClassic && wdata) {
@@ -691,7 +662,6 @@ static void HandleSettingsInput(u32 pressed, u32 held,
                      || (gcHeld & PAD_BUTTON_DOWN)
                      || classicDown;
 
-    // --- Determine whether to scroll this frame ---
     bool doUp   = false;
     bool doDown = false;
 
@@ -710,7 +680,6 @@ static void HandleSettingsInput(u32 pressed, u32 held,
         settingsScrollHoldTimer = 0;
     }
 
-    // --- Move selection, skipping header rows ---
     if (doUp)
         settingsMenuIndex = NextSelectableSettings(settingsMenuIndex, -1);
     if (doDown)
@@ -718,7 +687,7 @@ static void HandleSettingsInput(u32 pressed, u32 held,
 
     ClampSettingsScroll();
 
-    // --- Page up / down with Left / Right ---
+    // Page up / down with Left / Right.
     bool pageUp   = (pressed & WPAD_BUTTON_LEFT)
                   || (pressed & WPAD_CLASSIC_BUTTON_LEFT)
                   || (gcPressed & PAD_BUTTON_LEFT);
@@ -737,15 +706,15 @@ static void HandleSettingsInput(u32 pressed, u32 held,
         ClampSettingsScroll();
     }
 
-    // --- Activate (toggle) with A ---
+    // A or 2 to toggle the highlighted entry.
     bool activate = (pressed & WPAD_BUTTON_A)
                   || (pressed & WPAD_CLASSIC_BUTTON_A)
                   || (gcPressed & PAD_BUTTON_A)
-                  || (pressed & WPAD_BUTTON_2);   // Wiimote-horizontal A
+                  || (pressed & WPAD_BUTTON_2);
     if (activate)
         ActivateSettingsEntry(settingsMenuIndex);
 
-    // --- Close with B / MINUS --- save settings on exit ---
+    // B / MINUS to save and close.
     bool close = (pressed & WPAD_BUTTON_B)
                || (pressed & WPAD_CLASSIC_BUTTON_B)
                || (gcPressed & PAD_BUTTON_B)
@@ -753,10 +722,44 @@ static void HandleSettingsInput(u32 pressed, u32 held,
     if (close) {
         Settings::save();
         showSettingsMenu = false;
-        // Re-populate the file browser so it reflects any path changes.
-        if (showFileBrowser)
-            UpdateFileBrowser(currentDir);
     }
+}
+
+// ---------------------------------------------------------------------------
+// DrawSettingsOverlay
+// Line 0   : title + hint
+// Lines 1-5: up to SETTINGS_VISIBLE entries
+// Line 6   : scroll indicator
+// Line 7   : blank
+// ---------------------------------------------------------------------------
+static void DrawSettingsOverlay() {
+    Wii_DebugOverlayPrint(0, "Settings   [A]=Toggle [B]=Save");
+
+    int lineIdx = 1;
+    for (int row = settingsDisplayOffset;
+         row < s_settingsCount && lineIdx <= SETTINGS_VISIBLE;
+         row++, lineIdx++)
+    {
+        const SettingsEntry& e = s_settingsTable[row];
+        std::string val  = SettingsEntryValue(e);
+        bool selected    = (row == settingsMenuIndex);
+        Wii_DebugOverlayPrint(lineIdx, "%s%-18s %-10s",
+            selected ? "->" : "  ",
+            e.label,
+            val.c_str());
+    }
+
+    while (lineIdx <= SETTINGS_VISIBLE)
+        Wii_DebugOverlayPrint(lineIdx++, " ");
+
+    Wii_DebugOverlayPrint(6,
+        "%s row %d/%d %s",
+        (settingsDisplayOffset > 0) ? "^^" : "  ",
+        settingsMenuIndex + 1,
+        s_settingsCount,
+        (settingsDisplayOffset + SETTINGS_VISIBLE < s_settingsCount) ? "vv" : "  ");
+
+    Wii_DebugOverlayPrint(7, " ");
 }
 
 static void ScanWiiInputs() {
@@ -773,22 +776,19 @@ static void ScanWiiInputs() {
     bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
     u32       heldExt    = hasNunchuk ? held : 0;
 
-    // HOME always quits regardless of menu state.
+    // HOME always quits.
     if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
         runEmulatorThread = false;
         PPCCompilerBarrier();
         KThreadJoin(&emulatorThread);
-
         ShutdownAudio();
-
         delete ndsCore;
         ndsCore = nullptr;
-
         exit(0);
     }
 
     // -----------------------------------------------------------------------
-    // Settings menu — takes priority over the file browser.
+    // Settings menu — highest priority, blocks everything else.
     // -----------------------------------------------------------------------
     if (showSettingsMenu) {
         HandleSettingsInput(pressed, held, gcPressed, gcHeld, wdata, hasClassic);
@@ -907,8 +907,10 @@ static void ScanWiiInputs() {
                     UpdateFileBrowser(currentDir);
                 } else {
                     std::string romPath = currentDir + selected.name;
+
                     PPCIrqState st = PPCIrqLockByMsr();
                     romToLoadPath  = romPath;
+                    romLoaded      = false;
                     triggerRomLoad = true;
                     PPCIrqUnlockByMsr(st);
 
@@ -920,7 +922,7 @@ static void ScanWiiInputs() {
             }
         }
 
-        // B: go up a directory, or close browser if ROM is running.
+        // B: go up a directory, or close browser if a ROM is already loaded.
         if ((pressed & WPAD_BUTTON_B)
          || (pressed & WPAD_CLASSIC_BUTTON_B)
          || (gcPressed & PAD_BUTTON_B)) {
@@ -937,15 +939,12 @@ static void ScanWiiInputs() {
             }
         }
 
-        // PLUS / START: open settings menu from the file browser.
-        if ((pressed & WPAD_BUTTON_PLUS)
-         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)
-         || (gcPressed & PAD_BUTTON_START)) {
+        // B + PLUS / B + START: open settings from inside the browser.
+        if (CheckSettingsCombo(pressed, held, gcPressed, gcHeld, hasClassic))
             OpenSettingsMenu();
-        }
     }
     // -----------------------------------------------------------------------
-    // In-game (emulation running)
+    // In-game (emulation running, browser closed)
     // -----------------------------------------------------------------------
     else {
         uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk, hasClassic);
@@ -1065,73 +1064,10 @@ static void ScanWiiInputs() {
         g_ndsTouchY   = touchY;
         PPCIrqUnlockByMsr(st);
 
-        // MINUS while in-game: open file browser (existing behaviour kept).
-        if (pressed & WPAD_BUTTON_MINUS) {
-            if (!showFileBrowser) {
-                showFileBrowser = true;
-                UpdateFileBrowser(currentDir);
-            }
-        }
-
-        // PLUS while in-game: open settings menu directly.
-        if ((pressed & WPAD_BUTTON_PLUS)
-         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)) {
+        // B + PLUS / B + START: open settings while in-game.
+        if (CheckSettingsCombo(pressed, held, gcPressed, gcHeld, hasClassic))
             OpenSettingsMenu();
-        }
     }
-}
-
-// ---------------------------------------------------------------------------
-// DrawSettingsOverlay — renders the settings menu into the debug-overlay
-// texture each frame that showSettingsMenu is true.
-// Layout (8 overlay lines, each 32 chars wide):
-//   Line 0  : "Settings  [A]=Toggle [B]=Back"  (title + hint)
-//   Lines 1-5 : up to 5 entries, the selected one prefixed with "->"
-//   Line 6  : scroll indicator  e.g. "  ^^ row 4/17 vv"
-//   Line 7  : blank
-// ---------------------------------------------------------------------------
-static void DrawSettingsOverlay() {
-    // Line 0 — title
-    Wii_DebugOverlayPrint(0, "Settings  [A]=Toggle [B]=Save");
-
-    // Lines 1-5 — visible entries
-    int lineIdx = 1;
-    for (int row = settingsDisplayOffset;
-         row < s_settingsCount && lineIdx <= SETTINGS_VISIBLE;
-         row++, lineIdx++)
-    {
-        const SettingsEntry& e = s_settingsTable[row];
-
-        if (!e.value) {
-            // Section header — centred, no arrow
-            Wii_DebugOverlayPrint(lineIdx, "%-32s", e.label);
-        } else {
-            std::string val = SettingsEntryValue(e);
-            bool selected   = (row == settingsMenuIndex);
-            // Label is truncated to leave room for the value (max 10 chars).
-            // Total width = 32.  Arrow = 2, label up to 18, value up to 10,
-            // separator = 1 space → 2+18+1+10 = 31, leave 1 spare.
-            Wii_DebugOverlayPrint(lineIdx, "%s%-18s %-10s",
-                selected ? "->" : "  ",
-                e.label,
-                val.c_str());
-        }
-    }
-
-    // Fill remaining lines with blanks if the list is shorter than 5 entries.
-    while (lineIdx <= SETTINGS_VISIBLE)
-        Wii_DebugOverlayPrint(lineIdx++, " ");
-
-    // Line 6 — scroll indicator
-    Wii_DebugOverlayPrint(6,
-        "%s row %d/%d %s",
-        (settingsDisplayOffset > 0) ? "^^" : "  ",
-        settingsMenuIndex + 1,
-        s_settingsCount,
-        (settingsDisplayOffset + SETTINGS_VISIBLE < s_settingsCount) ? "vv" : "  ");
-
-    // Line 7 — blank
-    Wii_DebugOverlayPrint(7, " ");
 }
 
 int main(int /*argc*/, char** /*argv*/) {
@@ -1177,13 +1113,13 @@ int main(int /*argc*/, char** /*argv*/) {
         static time_t   lastSec       = 0;
         time_t now = time(nullptr);
         if (now != lastSec) {
-            perf.fps          = (float)(perf.renderFrameCount - lastSecFrames);
-            lastSecFrames     = perf.renderFrameCount;
-            lastSec           = now;
+            perf.fps      = (float)(perf.renderFrameCount - lastSecFrames);
+            lastSecFrames = perf.renderFrameCount;
+            lastSec       = now;
         }
 
         // -------------------------------------------------------------------
-        // Overlay rendering — settings menu takes over all 8 lines when open.
+        // Overlay — settings menu takes all 8 lines when open.
         // -------------------------------------------------------------------
         if (showSettingsMenu) {
             DrawSettingsOverlay();
@@ -1201,14 +1137,13 @@ int main(int /*argc*/, char** /*argv*/) {
             }
             while (lineIndex < 6)
                 Wii_DebugOverlayPrint(lineIndex++, " ");
-            Wii_DebugOverlayPrint(6,
-                "A=Load  B=Back  +=Settings");
+            Wii_DebugOverlayPrint(6, "A=Load  B=Back  B++=Settings");
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
             Wii_DebugOverlayPrint(0, " ");
             Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
-            Wii_DebugOverlayPrint(2, "HOME=Quit  -=Browser  +=Settings");
+            Wii_DebugOverlayPrint(2, "HOME=Quit  B++=Settings");
             Wii_DebugOverlayPrint(3, " ");
             Wii_DebugOverlayPrint(4, " ");
             Wii_DebugOverlayPrint(5, " ");
