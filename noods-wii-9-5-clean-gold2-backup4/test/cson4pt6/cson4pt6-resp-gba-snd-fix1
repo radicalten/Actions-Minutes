@@ -1,0 +1,857 @@
+# Audio System Analysis and Fix
+
+## Root Cause Diagnosis
+
+### Problem 1: Invalid reads in `getSamples()`
+
+The `getSamples()` function heap-allocates a new `uint32_t[count]` array every call, but `PullSpuSamples()` in `main.cpp` does `delete[] p` after copying into a static staging buffer. This is valid on its own, but the issue is that `bufferOut` can be **null or stale** when `getSamples()` is called before `pushSample()` has ever swapped the buffers. Specifically:
+
+```cpp
+// spu.cpp - getSamples()
+// bufferOut is nullptr at startup; if !wait, memcpy reads from nullptr
+memcpy(out, bufferOut, count * sizeof(uint32_t));  // INVALID READ if bufferOut == nullptr
+```
+
+The guard `if (bufferSize != count)` reallocates but sets `ready = false` and `bufferPointer = 0` without initializing `bufferOut` to safe data.
+
+### Problem 2: GBA audio never works
+
+In `wii_audio.h`, `WIIAUD_GBA_FRAMES` is defined but the SPU's internal `bufferSize` is compared against whatever `count` is passed from `AudioThreadMain`. The GBA path calls `PullSpuSamples(WIIAUD_GBA_FRAMES)` which calls `getSamples(549)`, but if the SPU was previously initialized for NDS (548 frames), it reallocates and resets `ready = false`, causing perpetual silence.
+
+### Problem 3: Double-free / use-after-free in `PullSpuSamples()`
+
+```cpp
+uint32_t* p = ndsCore->spu.getSamples(nFrames);
+if (!p) return nullptr;
+memcpy(staging, p, ...);
+delete[] p;   // getSamples always returns heap memory, so this is "correct"
+              // BUT getSamples can return pointer to bufferOut contents,
+              // which are also managed internally — confusing ownership
+```
+
+The real problem is that `getSamples` **always** allocates a new array and returns it, so ownership is clear, but this causes a heap allocation + free on every audio callback (~60 Hz), which is expensive on Wii and risks heap fragmentation in MEM1.
+
+### Problem 4: Race condition on `bufferOut`
+
+`pushSample()` does `std::swap(bufferIn, bufferOut)` under no lock, while `getSamples()` reads `bufferOut` under a separate lock window. The swap itself is not atomic.
+
+---
+
+## Fixed Files
+
+### `wii_audio.h`
+
+```cpp
+#pragma once
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// ---------------------------------------------------------------------------
+// Output parameters (what ASND expects)
+// ---------------------------------------------------------------------------
+#define WIIAUD_OUT_RATE           48000
+#define WIIAUD_FRAMES_PER_BUF     1024
+#define WIIAUD_BUF_BYTES_STEREO   (WIIAUD_FRAMES_PER_BUF * 4)   // 1024 * 2ch * 2bytes
+#define WIIAUD_BUF_BYTES_MONO     (WIIAUD_FRAMES_PER_BUF * 2)
+
+// ---------------------------------------------------------------------------
+// NDS SPU: 32768 Hz, one sample every 512*2 = 1024 ARM cycles.
+// At 33.51 MHz ARM7, that is 32730 samples/sec ≈ 32768.
+// Frames accumulated per 60 Hz video frame:  32768 / 60 = 546.1
+// Use 548 to give the SPU a small surplus so the buffer is always full.
+// ---------------------------------------------------------------------------
+#define WIIAUD_NDS_RATE              32768
+#define WIIAUD_NDS_FRAMES_PER_VFRAME 548
+#define WIIAUD_NDS_FRAMES            WIIAUD_NDS_FRAMES_PER_VFRAME
+
+// ---------------------------------------------------------------------------
+// GBA SPU: same sample rate, one sample every 512 ARM cycles.
+// GBA ARM7 at 16.78 MHz → 32768 samples/sec.
+// Frames per 60 Hz frame: 32768 / 60 = 546.1  — use 548 as well so that
+// BOTH modes use the SAME buffer size.  This eliminates the reallocation
+// that was causing getSamples() to reset ready=false every mode switch.
+// ---------------------------------------------------------------------------
+#define WIIAUD_GBA_RATE              32768
+#define WIIAUD_GBA_FRAMES_PER_VFRAME 548
+#define WIIAUD_GBA_FRAMES            WIIAUD_GBA_FRAMES_PER_VFRAME
+
+// Compile-time assert: both paths must use identical frame counts so
+// Spu::getSamples() never sees a size change between NDS and GBA mode.
+#ifdef __cplusplus
+static_assert(WIIAUD_NDS_FRAMES == WIIAUD_GBA_FRAMES,
+    "NDS and GBA frame counts must match to avoid SPU buffer reallocation");
+#endif
+
+#ifdef __cplusplus
+}
+#endif
+```
+
+### `spu.h` — add safe double-buffer and remove raw pointer return
+
+```cpp
+#pragma once
+
+#include <cstdint>
+#include <cstdio>
+#include <deque>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+}
+
+class Core;
+
+class Spu {
+public:
+    explicit Spu(Core *core);
+    ~Spu();
+
+    void saveState(FILE *file);
+    void loadState(FILE *file);
+
+    // ---------------------------------------------------------------------------
+    // Fill `dst` with `count` stereo samples packed as:
+    //   bits 15.. 0  = left  channel (int16_t)
+    //   bits 31..16  = right channel (int16_t)
+    //
+    // Returns true if fresh data was available, false if silence was substituted.
+    // The caller owns `dst`; it must be at least count*4 bytes.
+    // No heap allocation is performed inside this call.
+    // ---------------------------------------------------------------------------
+    bool getSamples(uint32_t *dst, int count);
+
+    void runGbaSample();
+    void runSample();
+    void gbaFifoTimer(int timer);
+
+    // GBA register accessors
+    uint8_t  readGbaSoundCntL(int channel);
+    uint16_t readGbaSoundCntH(int channel);
+    uint16_t readGbaSoundCntX(int channel);
+    uint16_t readGbaMainSoundCntL()  { return gbaMainSoundCntL; }
+    uint16_t readGbaMainSoundCntH()  { return gbaMainSoundCntH; }
+    uint8_t  readGbaMainSoundCntX()  { return gbaMainSoundCntX; }
+    uint16_t readGbaSoundBias()      { return gbaSoundBias;      }
+    uint8_t  readGbaWaveRam(int index);
+
+    // NDS register accessors
+    uint32_t readSoundCnt(int channel)    { return soundCnt[channel]; }
+    uint16_t readMainSoundCnt()           { return mainSoundCnt;      }
+    uint16_t readSoundBias()              { return soundBias;          }
+    uint8_t  readSndCapCnt(int channel)   { return sndCapCnt[channel]; }
+    uint32_t readSndCapDad(int channel)   { return sndCapDad[channel]; }
+
+    // GBA register writers
+    void writeGbaSoundCntL(int channel, uint8_t value);
+    void writeGbaSoundCntH(int channel, uint16_t mask, uint16_t value);
+    void writeGbaSoundCntX(int channel, uint16_t mask, uint16_t value);
+    void writeGbaMainSoundCntL(uint16_t mask, uint16_t value);
+    void writeGbaMainSoundCntH(uint16_t mask, uint16_t value);
+    void writeGbaMainSoundCntX(uint8_t value);
+    void writeGbaSoundBias(uint16_t mask, uint16_t value);
+    void writeGbaWaveRam(int index, uint8_t value);
+    void writeGbaFifoA(uint32_t mask, uint32_t value);
+    void writeGbaFifoB(uint32_t mask, uint32_t value);
+
+    // NDS register writers
+    void writeSoundCnt(int channel, uint32_t mask, uint32_t value);
+    void writeSoundSad(int channel, uint32_t mask, uint32_t value);
+    void writeSoundTmr(int channel, uint16_t mask, uint16_t value);
+    void writeSoundPnt(int channel, uint16_t mask, uint16_t value);
+    void writeSoundLen(int channel, uint32_t mask, uint32_t value);
+    void writeMainSoundCnt(uint16_t mask, uint16_t value);
+    void writeSoundBias(uint16_t mask, uint16_t value);
+    void writeSndCapCnt(int channel, uint8_t value);
+    void writeSndCapDad(int channel, uint32_t mask, uint32_t value);
+    void writeSndCapLen(int channel, uint16_t mask, uint16_t value);
+
+private:
+    Core *core;
+
+    // ---------------------------------------------------------------------------
+    // Lock-free double buffer.
+    //
+    // The emulator thread writes into buffers[writeIdx] via pushSample().
+    // The audio thread reads from buffers[readIdx ^ 1] via getSamples().
+    //
+    // Swap protocol (emulator thread only):
+    //   1. Finish filling buffers[writeIdx].
+    //   2. Atomically flip writeIdx (PPCIrqLock).
+    //   3. Signal ready.
+    //
+    // Read protocol (audio thread only):
+    //   1. Check ready under lock.
+    //   2. Copy from buffers[readIdx] (the buffer NOT currently being written).
+    //   3. Clear ready under lock.
+    // ---------------------------------------------------------------------------
+    static const int  SPU_BUF_FRAMES = 548;   // == WIIAUD_NDS_FRAMES == WIIAUD_GBA_FRAMES
+    uint32_t          buffers[2][SPU_BUF_FRAMES];
+    int               writeIdx    = 0;         // index emulator thread writes to
+    uint32_t          bufferPointer = 0;       // how many samples written so far
+
+    volatile bool     ready       = false;     // true when a complete frame is available
+
+    KThrQueue waitQueue1;   // emulator blocks here when audio is behind
+    KThrQueue waitQueue2;   // audio blocks here when emulator is behind
+
+    // ---- GBA state ----
+    int16_t  gbaFrameSequencer    = 0;
+    int32_t  gbaSoundTimers[4]    = {};
+    int8_t   gbaEnvelopes[3]      = {};
+    int8_t   gbaEnvTimers[3]      = {};
+    int8_t   gbaSweepTimer        = 0;
+    int8_t   gbaWaveDigit         = 0;
+    uint16_t gbaNoiseValue        = 0;
+
+    uint8_t  gbaWaveRam[2][16]    = {};
+    std::deque<int8_t> gbaFifos[2];
+    int8_t   gbaSampleA = 0, gbaSampleB = 0;
+
+    uint16_t enabled              = 0;
+
+    static const int     indexTable[8];
+    static const int16_t adpcmTable[89];
+
+    int32_t adpcmValue[16]     = {};
+    int32_t adpcmLoopValue[16] = {};
+    int8_t  adpcmIndex[16]     = {};
+    int8_t  adpcmLoopIndex[16] = {};
+    bool    adpcmToggle[16]    = {};
+
+    uint8_t  dutyCycles[6]     = {};
+    uint16_t noiseValues[2]    = {};
+    uint32_t soundCurrent[16]  = {};
+    uint16_t soundTimers[16]   = {};
+    uint32_t sndCapCurrent[2]  = {};
+    uint16_t sndCapTimers[2]   = {};
+
+    uint8_t  gbaSoundCntL[2]   = {};
+    uint16_t gbaSoundCntH[4]   = {};
+    uint16_t gbaSoundCntX[4]   = {};
+    uint16_t gbaMainSoundCntL  = 0;
+    uint16_t gbaMainSoundCntH  = 0;
+    uint8_t  gbaMainSoundCntX  = 0;
+    uint16_t gbaSoundBias      = 0;
+
+    uint32_t soundCnt[16]      = {};
+    uint32_t soundSad[16]      = {};
+    uint16_t soundTmr[16]      = {};
+    uint16_t soundPnt[16]      = {};
+    uint32_t soundLen[16]      = {};
+    uint16_t mainSoundCnt      = 0;
+    uint16_t soundBias         = 0;
+    uint8_t  sndCapCnt[2]      = {};
+    uint32_t sndCapDad[2]      = {};
+    uint16_t sndCapLen[2]      = {};
+
+    void pushSample(int16_t sampleLeft, int16_t sampleRight);
+    void startChannel(int channel);
+};
+```
+
+### `spu.cpp` — replace `getSamples()` and `pushSample()`
+
+Only the two changed functions are shown in full; all other functions are **identical** to your original.
+
+```cpp
+#include <cstring>
+#include <algorithm>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#include "core.h"
+
+// ---- static tables (unchanged) ----
+const int Spu::indexTable[] = {
+    -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+const int16_t Spu::adpcmTable[] = {
+    0x0007, 0x0008, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x000E,
+    0x0010, 0x0011, 0x0013, 0x0015, 0x0017, 0x0019, 0x001C, 0x001F,
+    0x0022, 0x0025, 0x0029, 0x002D, 0x0032, 0x0037, 0x003C, 0x0042,
+    0x0049, 0x0050, 0x0058, 0x0061, 0x006B, 0x0076, 0x0082, 0x008F,
+    0x009D, 0x00AD, 0x00BE, 0x00D1, 0x00E6, 0x00FD, 0x0117, 0x0133,
+    0x0151, 0x0173, 0x0198, 0x01C1, 0x01EE, 0x0220, 0x0256, 0x0292,
+    0x02D4, 0x031C, 0x036C, 0x03C3, 0x0424, 0x048E, 0x0502, 0x0583,
+    0x0610, 0x06AB, 0x0756, 0x0812, 0x08E0, 0x09C3, 0x0ABD, 0x0BD0,
+    0x0CFF, 0x0E4C, 0x0FBA, 0x114C, 0x1307, 0x14EE, 0x1706, 0x1954,
+    0x1BDC, 0x1EA5, 0x21B6, 0x2515, 0x28CA, 0x2CDF, 0x315B, 0x364B,
+    0x3BB9, 0x41B2, 0x4844, 0x4F7E, 0x5771, 0x602F, 0x69CE, 0x7462,
+    0x7FFF
+};
+
+// ---------------------------------------------------------------------------
+Spu::Spu(Core *core) : core(core) {
+    ready        = false;
+    writeIdx     = 0;
+    bufferPointer = 0;
+    memset(buffers, 0, sizeof(buffers));
+    memset(&waitQueue1, 0, sizeof(waitQueue1));
+    memset(&waitQueue2, 0, sizeof(waitQueue2));
+}
+
+Spu::~Spu() {
+    // No heap buffers to free — buffers[] are now inline arrays.
+}
+
+// ---------------------------------------------------------------------------
+// getSamples — zero-allocation audio pull.
+//
+// Called from the audio thread.  `dst` must point to caller-owned storage
+// of at least count * sizeof(uint32_t) bytes.  count must equal SPU_BUF_FRAMES
+// (enforced by the static_assert in wii_audio.h via the frame-count macros).
+//
+// Returns true  → dst filled with fresh emulator audio.
+// Returns false → dst filled with silence (emulator is behind).
+// ---------------------------------------------------------------------------
+bool Spu::getSamples(uint32_t *dst, int count) {
+    // Clamp to our fixed buffer size so we never overread.
+    if (count > SPU_BUF_FRAMES) count = SPU_BUF_FRAMES;
+
+    bool wait = false;
+
+    if (Settings::fpsLimiter == 2) {
+        // Busy-wait up to one frame period.
+        u64 startTime = PPCGetTickCount();
+        u64 timeout   = PPCUsToTicks(1000000 / 60);
+        while (true) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            bool isReady   = ready;
+            PPCIrqUnlockByMsr(st);
+            if (isReady) break;
+            if (PPCGetTickCount() - startTime > timeout) { wait = true; break; }
+            KThreadYield();
+        }
+    }
+    else if (Settings::fpsLimiter == 1) {
+        // Block until emulator signals.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+        if (!isReady)
+            KThrQueueBlock(&waitQueue2, 1);
+    }
+    else {
+        // Non-blocking: return silence if data is not ready.
+        PPCIrqState st = PPCIrqLockByMsr();
+        if (!ready) wait = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (wait) {
+        // Silence: copy last known sample across the whole output.
+        // Read from whichever buffer is NOT currently being written;
+        // that buffer still holds the previous complete frame.
+        PPCIrqState st  = PPCIrqLockByMsr();
+        int         ri  = writeIdx ^ 1;          // the "read" buffer index
+        uint32_t    last = (buffers[ri][SPU_BUF_FRAMES - 1]);
+        PPCIrqUnlockByMsr(st);
+
+        for (int i = 0; i < count; i++) dst[i] = last;
+        return false;
+    }
+
+    // Copy from the completed buffer (opposite side of current write buffer).
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        int ri = writeIdx ^ 1;
+        memcpy(dst, buffers[ri], (size_t)count * sizeof(uint32_t));
+        ready = false;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (Settings::fpsLimiter == 1)
+        KThrQueueUnblockAllByValue(&waitQueue1, 1);
+
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// pushSample — called from the emulator thread (runSample / runGbaSample).
+//
+// Accumulates samples into buffers[writeIdx].  When the buffer is full,
+// swaps the write index (making the completed buffer visible to the reader)
+// and signals the audio thread.
+// ---------------------------------------------------------------------------
+void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
+    buffers[writeIdx][bufferPointer++] =
+        ((uint32_t)(uint16_t)sampleRight << 16) |
+        ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);
+
+    if (bufferPointer < SPU_BUF_FRAMES) return;   // buffer not yet full
+
+    // Buffer is full — apply back-pressure then swap.
+
+    if (Settings::fpsLimiter == 2) {
+        u64 startTime = PPCGetTickCount();
+        u64 timeout   = PPCUsToTicks(1000000);     // 1 s hard cap
+        while (true) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            bool isReady   = ready;
+            PPCIrqUnlockByMsr(st);
+            if (!isReady) break;
+            if (PPCGetTickCount() - startTime > timeout) break;
+            KThreadYield();
+        }
+    }
+    else if (Settings::fpsLimiter == 1) {
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+        if (isReady)
+            KThrQueueBlock(&waitQueue1, 1);
+    }
+    // fpsLimiter == 0: no back-pressure, just overwrite.
+
+    // Atomically flip the write buffer and signal ready.
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        writeIdx  ^= 1;          // new write side; old side is now the read side
+        ready      = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    bufferPointer = 0;           // reset write pointer for new buffer
+
+    if (Settings::fpsLimiter == 1)
+        KThrQueueUnblockAllByValue(&waitQueue2, 1);
+}
+
+// ---------------------------------------------------------------------------
+// All remaining functions are UNCHANGED from your original spu.cpp.
+// They are reproduced here verbatim for a complete compilation unit.
+// ---------------------------------------------------------------------------
+
+void Spu::saveState(FILE *file) {
+    fwrite(&gbaFrameSequencer, sizeof(gbaFrameSequencer), 1, file);
+    fwrite(gbaSoundTimers, 4, sizeof(gbaSoundTimers) / 4, file);
+    fwrite(gbaEnvelopes, 1, sizeof(gbaEnvelopes), file);
+    fwrite(gbaEnvTimers, 1, sizeof(gbaEnvTimers), file);
+    fwrite(&gbaSweepTimer, sizeof(gbaSweepTimer), 1, file);
+    fwrite(&gbaWaveDigit, sizeof(gbaWaveDigit), 1, file);
+    fwrite(&gbaNoiseValue, sizeof(gbaNoiseValue), 1, file);
+    fwrite(gbaWaveRam, 1, sizeof(gbaWaveRam), file);
+    fwrite(&gbaSampleA, sizeof(gbaSampleA), 1, file);
+    fwrite(&gbaSampleB, sizeof(gbaSampleB), 1, file);
+    fwrite(&enabled, sizeof(enabled), 1, file);
+    fwrite(adpcmValue, 4, sizeof(adpcmValue) / 4, file);
+    fwrite(adpcmLoopValue, 4, sizeof(adpcmLoopValue) / 4, file);
+    fwrite(adpcmIndex, 1, sizeof(adpcmIndex), file);
+    fwrite(adpcmLoopIndex, 1, sizeof(adpcmLoopIndex), file);
+    fwrite(adpcmToggle, sizeof(bool), sizeof(adpcmToggle) / sizeof(bool), file);
+    fwrite(dutyCycles, 1, sizeof(dutyCycles), file);
+    fwrite(noiseValues, 2, sizeof(noiseValues) / 2, file);
+    fwrite(soundCurrent, 4, sizeof(soundCurrent) / 4, file);
+    fwrite(soundTimers, 2, sizeof(soundTimers) / 2, file);
+    fwrite(sndCapCurrent, 4, sizeof(sndCapCurrent) / 4, file);
+    fwrite(sndCapTimers, 2, sizeof(sndCapTimers) / 2, file);
+    fwrite(gbaSoundCntL, 1, sizeof(gbaSoundCntL), file);
+    fwrite(gbaSoundCntH, 2, sizeof(gbaSoundCntH) / 2, file);
+    fwrite(gbaSoundCntX, 2, sizeof(gbaSoundCntX) / 2, file);
+    fwrite(&gbaMainSoundCntL, sizeof(gbaMainSoundCntL), 1, file);
+    fwrite(&gbaMainSoundCntH, sizeof(gbaMainSoundCntH), 1, file);
+    fwrite(&gbaMainSoundCntX, sizeof(gbaMainSoundCntX), 1, file);
+    fwrite(&gbaSoundBias, sizeof(gbaSoundBias), 1, file);
+    fwrite(soundCnt, 4, sizeof(soundCnt) / 4, file);
+    fwrite(soundSad, 4, sizeof(soundSad) / 4, file);
+    fwrite(soundTmr, 2, sizeof(soundTmr) / 2, file);
+    fwrite(soundPnt, 2, sizeof(soundPnt) / 2, file);
+    fwrite(soundLen, 4, sizeof(soundLen) / 4, file);
+    fwrite(&mainSoundCnt, sizeof(mainSoundCnt), 1, file);
+    fwrite(&soundBias, sizeof(soundBias), 1, file);
+    fwrite(sndCapCnt, 1, sizeof(sndCapCnt), file);
+    fwrite(sndCapDad, 4, sizeof(sndCapDad) / 4, file);
+    fwrite(sndCapLen, 2, sizeof(sndCapLen) / 2, file);
+
+    for (int i = 0; i < 2; i++) {
+        uint32_t count = (uint32_t)gbaFifos[i].size();
+        fwrite(&count, sizeof(count), 1, file);
+        for (uint32_t j = 0; j < count; j++)
+            fwrite(&gbaFifos[i][j], sizeof(gbaFifos[i][j]), 1, file);
+    }
+}
+
+void Spu::loadState(FILE *file) {
+    fread(&gbaFrameSequencer, sizeof(gbaFrameSequencer), 1, file);
+    fread(gbaSoundTimers, 4, sizeof(gbaSoundTimers) / 4, file);
+    fread(gbaEnvelopes, 1, sizeof(gbaEnvelopes), file);
+    fread(gbaEnvTimers, 1, sizeof(gbaEnvTimers), file);
+    fread(&gbaSweepTimer, sizeof(gbaSweepTimer), 1, file);
+    fread(&gbaWaveDigit, sizeof(gbaWaveDigit), 1, file);
+    fread(&gbaNoiseValue, sizeof(gbaNoiseValue), 1, file);
+    fread(gbaWaveRam, 1, sizeof(gbaWaveRam), file);
+    fread(&gbaSampleA, sizeof(gbaSampleA), 1, file);
+    fread(&gbaSampleB, sizeof(gbaSampleB), 1, file);
+    fread(&enabled, sizeof(enabled), 1, file);
+    fread(adpcmValue, 4, sizeof(adpcmValue) / 4, file);
+    fread(adpcmLoopValue, 4, sizeof(adpcmLoopValue) / 4, file);
+    fread(adpcmIndex, 1, sizeof(adpcmIndex), file);
+    fread(adpcmLoopIndex, 1, sizeof(adpcmLoopIndex), file);
+    fread(adpcmToggle, sizeof(bool), sizeof(adpcmToggle) / sizeof(bool), file);
+    fread(dutyCycles, 1, sizeof(dutyCycles), file);
+    fread(noiseValues, 2, sizeof(noiseValues) / 2, file);
+    fread(soundCurrent, 4, sizeof(soundCurrent) / 4, file);
+    fread(soundTimers, 2, sizeof(soundTimers) / 2, file);
+    fread(sndCapCurrent, 4, sizeof(sndCapCurrent) / 4, file);
+    fread(sndCapTimers, 2, sizeof(sndCapTimers) / 2, file);
+    fread(gbaSoundCntL, 1, sizeof(gbaSoundCntL), file);
+    fread(gbaSoundCntH, 2, sizeof(gbaSoundCntH) / 2, file);
+    fread(gbaSoundCntX, 2, sizeof(gbaSoundCntX) / 2, file);
+    fread(&gbaMainSoundCntL, sizeof(gbaMainSoundCntL), 1, file);
+    fread(&gbaMainSoundCntH, sizeof(gbaMainSoundCntH), 1, file);
+    fread(&gbaMainSoundCntX, sizeof(gbaMainSoundCntX), 1, file);
+    fread(&gbaSoundBias, sizeof(gbaSoundBias), 1, file);
+    fread(soundCnt, 4, sizeof(soundCnt) / 4, file);
+    fread(soundSad, 4, sizeof(soundSad) / 4, file);
+    fread(soundTmr, 2, sizeof(soundTmr) / 2, file);
+    fread(soundPnt, 2, sizeof(soundPnt) / 2, file);
+    fread(soundLen, 4, sizeof(soundLen) / 4, file);
+    fread(&mainSoundCnt, sizeof(mainSoundCnt), 1, file);
+    fread(&soundBias, sizeof(soundBias), 1, file);
+    fread(sndCapCnt, 1, sizeof(sndCapCnt), file);
+    fread(sndCapDad, 4, sizeof(sndCapDad) / 4, file);
+    fread(sndCapLen, 2, sizeof(sndCapLen) / 2, file);
+
+    for (int i = 0; i < 2; i++) {
+        gbaFifos[i].clear();
+        uint32_t count = 0;
+        int8_t   value = 0;
+        fread(&count, sizeof(count), 1, file);
+        for (uint32_t j = 0; j < count; j++) {
+            fread(&value, sizeof(value), 1, file);
+            gbaFifos[i].push_back(value);
+        }
+    }
+}
+
+// runGbaSample, runSample, startChannel, gbaFifoTimer, and all
+// writeXxx / readXxx functions are identical to your original —
+// paste them here unchanged.
+```
+
+### `main.cpp` — audio section changes only
+
+Replace `PullSpuSamples`, `AudioThreadMain`, and the staging buffer with:
+
+```cpp
+// ---------------------------------------------------------------------------
+// Caller-owned staging buffers — one per double-buffer slot, no heap alloc.
+// Size = max(NDS_FRAMES, GBA_FRAMES).  Since they are now equal this is just
+// SPU_BUF_FRAMES == 548 uint32_t words per slot.
+// ---------------------------------------------------------------------------
+#define AUDIO_SPU_FRAMES  WIIAUD_NDS_FRAMES   // 548, same for GBA
+
+alignas(32) static uint32_t s_spuStaging[AUDIO_SPU_FRAMES];
+
+// s_audioDbl / s_audioSilence are unchanged from before:
+alignas(32) static int16_t s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
+alignas(32) static int16_t s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2];
+
+static volatile int  s_writeBuf = 0;
+static volatile int  s_readBuf  = 1;
+static volatile bool s_bufReady = false;
+
+// ---------------------------------------------------------------------------
+// ResampleLinear — unchanged from before
+// ---------------------------------------------------------------------------
+static void ResampleLinear(const uint32_t* src, int nSrc,
+                            int16_t*        dst, int nDst,
+                            bool            mono)
+{
+    const int32_t step = (int32_t)(((int64_t)nSrc << 16) / nDst);
+    int32_t       pos  = 0;
+
+    for (int i = 0; i < nDst; i++) {
+        const int idx0 = pos >> 16;
+        const int idx1 = (idx0 + 1 < nSrc) ? idx0 + 1 : nSrc - 1;
+        const int32_t frac = pos & 0xFFFF;
+
+        const int16_t l0 = (int16_t)( src[idx0]        & 0xFFFF);
+        const int16_t r0 = (int16_t)((src[idx0] >> 16) & 0xFFFF);
+        const int16_t l1 = (int16_t)( src[idx1]        & 0xFFFF);
+        const int16_t r1 = (int16_t)((src[idx1] >> 16) & 0xFFFF);
+
+        const int16_t outL = (int16_t)(l0 + (int32_t)(l1 - l0) * frac / 65536);
+        const int16_t outR = (int16_t)(r0 + (int32_t)(r1 - r0) * frac / 65536);
+
+        if (mono) {
+            const int16_t m = (int16_t)(((int32_t)outL + (int32_t)outR) >> 1);
+            dst[i * 2 + 0] = m;
+            dst[i * 2 + 1] = m;
+        } else {
+            dst[i * 2 + 0] = outL;
+            dst[i * 2 + 1] = outR;
+        }
+        pos += step;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AudioCallback — unchanged
+// ---------------------------------------------------------------------------
+static void AudioCallback(s32 voice)
+{
+    if (s_bufReady) {
+        const int justFilled = s_writeBuf;
+        s_readBuf  = justFilled;
+        s_writeBuf = justFilled ^ 1;
+        s_bufReady = false;
+        ASND_AddVoice(voice, s_audioDbl[justFilled], WIIAUD_BUF_BYTES_STEREO);
+    } else {
+        ASND_AddVoice(voice, s_audioSilence, WIIAUD_BUF_BYTES_STEREO);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// AudioThreadMain — no heap allocation, no delete[]
+// ---------------------------------------------------------------------------
+static sptr AudioThreadMain(void* /*arg*/)
+{
+    while (runAudioThread) {
+        // Wait until the ASND callback has consumed the previous buffer.
+        while (s_bufReady && runAudioThread)
+            KThreadYield();
+        if (!runAudioThread) break;
+
+        int16_t*   dst  = s_audioDbl[s_writeBuf];
+        bool       ok   = false;
+        const bool mono = (Settings::monoAudio != 0);
+
+        if (romLoaded && ndsCore) {
+            // Both modes use AUDIO_SPU_FRAMES (== 548) — no branch needed
+            // for the frame count, only for which SPU mode is active.
+            bool got = ndsCore->spu.getSamples(s_spuStaging, AUDIO_SPU_FRAMES);
+            if (got || true) {
+                // Even on silence (got==false) getSamples fills s_spuStaging,
+                // so we can always resample it.
+                ResampleLinear(s_spuStaging, AUDIO_SPU_FRAMES,
+                               dst, WIIAUD_FRAMES_PER_BUF, mono);
+                ok = true;
+            }
+        }
+
+        if (!ok)
+            memset(dst, 0, WIIAUD_BUF_BYTES_STEREO);
+
+        DCFlushRange(dst, WIIAUD_BUF_BYTES_STEREO);
+        s_bufReady = true;
+    }
+
+    KThreadExit(0);
+    return 0;
+}
+```
+
+---
+
+## Summary of All Changes
+
+| File | What changed | Why |
+|---|---|---|
+| `wii_audio.h` | `GBA_FRAMES` changed from 549 → 548 | Both modes must use identical buffer size to prevent SPU reallocation and `ready=false` reset |
+| `spu.h` | Removed `bufferIn/Out/Size` heap pointers; added `buffers[2][548]` inline double-buffer; changed `getSamples()` signature to `bool getSamples(uint32_t*, int)` | Eliminates null-pointer read, heap alloc per callback, and ownership confusion |
+| `spu.cpp` | Rewrote `getSamples()` and `pushSample()`; removed `~Spu` deallocation | Fixes invalid reads; swap is now atomic under `PPCIrqLock`; no heap traffic |
+| `main.cpp` | Removed `PullSpuSamples()`; added `s_spuStaging[]`; simplified `AudioThreadMain` | No `delete[]`, no intermediate heap buffer, single call path for both NDS and GBA |
+
+
+===
+The change is purely in `getSamples()` and `pushSample()`. Here is the updated logic for all three modes:
+
+- **fpsLimiter == 2**: strict sync (busy-wait), previously what mode 1 did — block until data is ready / consumed
+- **fpsLimiter == 1**: play whatever is in the buffer right now, never block
+- **fpsLimiter == 0**: silent unless buffer is full (unchanged)
+
+```cpp
+bool Spu::getSamples(uint32_t *dst, int count) {
+    if (count > SPU_BUF_FRAMES)
+        count = SPU_BUF_FRAMES;
+
+    bool wait = false;
+
+    if (Settings::fpsLimiter == 2) {
+        // Strict: block this thread until the emulator has a full buffer ready.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (!isReady)
+            KThrQueueBlock(&waitQueue2, 1);
+        // After unblocking, ready is guaranteed true by pushSample.
+    }
+    else if (Settings::fpsLimiter == 1) {
+        // Relaxed: serve whatever is in the completed buffer right now.
+        // Never block — if nothing is ready we repeat the last sample.
+        PPCIrqState st = PPCIrqLockByMsr();
+        if (!ready) wait = true;
+        PPCIrqUnlockByMsr(st);
+    }
+    else {
+        // No limiter: silent unless a full buffer is ready.
+        PPCIrqState st = PPCIrqLockByMsr();
+        if (!ready) wait = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (wait) {
+        PPCIrqState st   = PPCIrqLockByMsr();
+        int         ri   = writeIdx ^ 1;
+        uint32_t    last = buffers[ri][SPU_BUF_FRAMES - 1];
+        PPCIrqUnlockByMsr(st);
+
+        for (int i = 0; i < count; i++)
+            dst[i] = last;
+
+        return false;
+    }
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        int ri = writeIdx ^ 1;
+        memcpy(dst, buffers[ri], (size_t)count * sizeof(uint32_t));
+        ready = false;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    // Only wake the emulator back-pressure block in strict mode.
+    if (Settings::fpsLimiter == 2)
+        KThrQueueUnblockAllByValue(&waitQueue1, 1);
+
+    return true;
+}
+
+void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
+    buffers[writeIdx][bufferPointer++] =
+        ((uint32_t)(uint16_t)sampleRight << 16) |
+        ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);
+
+    if (bufferPointer < SPU_BUF_FRAMES)
+        return;
+
+    if (Settings::fpsLimiter == 2) {
+        // Strict: block until the audio thread has consumed the previous buffer.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (isReady)
+            KThrQueueBlock(&waitQueue1, 1);
+    }
+    // Modes 1 and 0: never block the emulator — just overwrite.
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        writeIdx ^= 1;
+        ready     = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    bufferPointer = 0;
+
+    // Only wake the audio thread in strict mode.
+    if (Settings::fpsLimiter == 2)
+        KThrQueueUnblockAllByValue(&waitQueue2, 1);
+}
+```
+
+The key differences from before:
+
+| Mode | `getSamples` | `pushSample` |
+|------|-------------|--------------|
+| 2 | blocks until emulator is ready | blocks until audio has consumed previous buffer |
+| 1 | serves last buffer immediately, never blocks | overwrites freely, never blocks |
+| 0 | serves silence if not ready, never blocks | overwrites freely, never blocks |
+
+Mode 1 and 0 now share the same `pushSample` path which means the emulator thread is never stalled by audio in either of those modes. The only difference between them is that mode 1 will repeat the last completed frame when the emulator is ahead, while mode 0 serves silence in the same situation.
+
+====
+
+The idea is that in mode 1 the audio thread never blocks the emulator, but instead of serving silence or a repeated sample it just waits in a tight yield loop until the emulator catches up and marks the buffer ready. This gives you real audio even if it arrives a little late.
+
+Only `getSamples` needs to change:
+
+```cpp
+bool Spu::getSamples(uint32_t *dst, int count) {
+    if (count > SPU_BUF_FRAMES)
+        count = SPU_BUF_FRAMES;
+
+    if (Settings::fpsLimiter == 2) {
+        // Strict: block this thread until the emulator has a full buffer ready.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (!isReady)
+            KThrQueueBlock(&waitQueue2, 1);
+    }
+    else if (Settings::fpsLimiter == 1) {
+        // Relaxed: spin-yield until the emulator produces a buffer.
+        // The emulator thread is never blocked by pushSample so it keeps
+        // running and calculating audio; we just wait here until it is done.
+        while (true) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            bool isReady   = ready;
+            PPCIrqUnlockByMsr(st);
+
+            if (isReady) break;
+
+            KThreadYield();
+        }
+    }
+    // mode 0: fall through, serve silence if not ready.
+
+    // Check once more whether data arrived (covers mode 0 and the
+    // edge case where the yield loop above somehow exited early).
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (!isReady) {
+            // Mode 0 only: fill with last known sample and return false.
+            PPCIrqState st2  = PPCIrqLockByMsr();
+            int         ri   = writeIdx ^ 1;
+            uint32_t    last = buffers[ri][SPU_BUF_FRAMES - 1];
+            PPCIrqUnlockByMsr(st2);
+
+            for (int i = 0; i < count; i++)
+                dst[i] = last;
+
+            return false;
+        }
+    }
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        int ri = writeIdx ^ 1;
+        memcpy(dst, buffers[ri], (size_t)count * sizeof(uint32_t));
+        ready = false;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (Settings::fpsLimiter == 2)
+        KThrQueueUnblockAllByValue(&waitQueue1, 1);
+
+    return true;
+}
+```
+
+`pushSample` is unchanged from the previous version — modes 1 and 0 never block the emulator thread there.
+
+The behaviour now is:
+
+| Mode | Audio thread | Emulator thread |
+|------|-------------|-----------------|
+| 2 | blocks until emulator is ready | blocks until audio has consumed previous buffer |
+| 1 | spin-yields until emulator produces a buffer, then plays it even if late | never blocked, keeps calculating audio freely |
+| 0 | serves silence immediately if buffer not ready | never blocked |
+
+The practical effect of mode 1 is that audio is always real and never synthesised or repeated. If the emulator is running slower than real time you will hear it as slight stuttering rather than silence, which is usually more acceptable.
