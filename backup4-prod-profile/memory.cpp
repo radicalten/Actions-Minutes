@@ -1,6 +1,11 @@
 #include <cstring>
 #include "core.h"
 
+
+#  define LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  define FORCE_INLINE __attribute__((always_inline)) inline
+
 // ── Macro helpers ────────────────────────────────────────────────────────────
 
 #define DEF_IO_8(addr, func) \
