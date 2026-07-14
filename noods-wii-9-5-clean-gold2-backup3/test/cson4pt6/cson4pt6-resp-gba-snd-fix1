@@ -771,3 +771,87 @@ The key differences from before:
 | 0 | serves silence if not ready, never blocks | overwrites freely, never blocks |
 
 Mode 1 and 0 now share the same `pushSample` path which means the emulator thread is never stalled by audio in either of those modes. The only difference between them is that mode 1 will repeat the last completed frame when the emulator is ahead, while mode 0 serves silence in the same situation.
+
+====
+
+The idea is that in mode 1 the audio thread never blocks the emulator, but instead of serving silence or a repeated sample it just waits in a tight yield loop until the emulator catches up and marks the buffer ready. This gives you real audio even if it arrives a little late.
+
+Only `getSamples` needs to change:
+
+```cpp
+bool Spu::getSamples(uint32_t *dst, int count) {
+    if (count > SPU_BUF_FRAMES)
+        count = SPU_BUF_FRAMES;
+
+    if (Settings::fpsLimiter == 2) {
+        // Strict: block this thread until the emulator has a full buffer ready.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (!isReady)
+            KThrQueueBlock(&waitQueue2, 1);
+    }
+    else if (Settings::fpsLimiter == 1) {
+        // Relaxed: spin-yield until the emulator produces a buffer.
+        // The emulator thread is never blocked by pushSample so it keeps
+        // running and calculating audio; we just wait here until it is done.
+        while (true) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            bool isReady   = ready;
+            PPCIrqUnlockByMsr(st);
+
+            if (isReady) break;
+
+            KThreadYield();
+        }
+    }
+    // mode 0: fall through, serve silence if not ready.
+
+    // Check once more whether data arrived (covers mode 0 and the
+    // edge case where the yield loop above somehow exited early).
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (!isReady) {
+            // Mode 0 only: fill with last known sample and return false.
+            PPCIrqState st2  = PPCIrqLockByMsr();
+            int         ri   = writeIdx ^ 1;
+            uint32_t    last = buffers[ri][SPU_BUF_FRAMES - 1];
+            PPCIrqUnlockByMsr(st2);
+
+            for (int i = 0; i < count; i++)
+                dst[i] = last;
+
+            return false;
+        }
+    }
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        int ri = writeIdx ^ 1;
+        memcpy(dst, buffers[ri], (size_t)count * sizeof(uint32_t));
+        ready = false;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (Settings::fpsLimiter == 2)
+        KThrQueueUnblockAllByValue(&waitQueue1, 1);
+
+    return true;
+}
+```
+
+`pushSample` is unchanged from the previous version — modes 1 and 0 never block the emulator thread there.
+
+The behaviour now is:
+
+| Mode | Audio thread | Emulator thread |
+|------|-------------|-----------------|
+| 2 | blocks until emulator is ready | blocks until audio has consumed previous buffer |
+| 1 | spin-yields until emulator produces a buffer, then plays it even if late | never blocked, keeps calculating audio freely |
+| 0 | serves silence immediately if buffer not ready | never blocked |
+
+The practical effect of mode 1 is that audio is always real and never synthesised or repeated. If the emulator is running slower than real time you will hear it as slight stuttering rather than silence, which is usually more acceptable.
