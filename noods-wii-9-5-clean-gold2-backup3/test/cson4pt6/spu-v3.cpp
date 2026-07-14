@@ -250,6 +250,39 @@ void Spu::loadState(FILE *file) {
     return true;
 }
 
+void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
+    buffers[writeIdx][bufferPointer++] =
+        ((uint32_t)(uint16_t)sampleRight << 16) |
+        ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);
+
+    if (bufferPointer < SPU_BUF_FRAMES)
+        return;
+
+    if (Settings::fpsLimiter == 2) {
+        // Strict: block until the audio thread has consumed the previous buffer.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (isReady)
+            KThrQueueBlock(&waitQueue1, 1);
+    }
+    // Modes 1 and 0: never block the emulator — just overwrite.
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        writeIdx ^= 1;
+        ready     = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    bufferPointer = 0;
+
+    // Only wake the audio thread in strict mode.
+    if (Settings::fpsLimiter == 2)
+        KThrQueueUnblockAllByValue(&waitQueue2, 1);
+}
+
 // ---------------------------------------------------------------------------
 // runGbaSample
 //
