@@ -15,3 +15,14 @@ With this one (gold2-backup3) I would like to conform other files to the core.h/
 Would like to fix the sound driver to play gba sounds and not make invalid reads.
 Would like toggleable settings from a config file where main calls that file instead of having it embedded in main.cpp
 Would like a total fps count toggle in settings as well.
+
+
+======
+gba-sound-fix1
+I have .cpp files for a DS emulator to run on Wii. Currently the core emulator has updating its scheduling mechanism, but not every file is adapted to it yet. 
+Currently my main.cpp and wii_audio.h files are making invalid reads with the sound code. And sound only works for nds games, but it should work for gba as well. 
+I have attached the spu.h/cpp files as well.
+core.h/cpp
+main.cpp
+wii_video.h
+spu.h/cpp
