@@ -27,7 +27,7 @@
 // static initialisation - this is legal in C++ for static data members.
 
 __attribute__((section(".rodata"), aligned(32)))
-int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
+int const (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
 {
     // ── 0x000–0x00F  AND reg / multiply / halfword store-load ────────────────
     &Interpreter::_andLli,    &Interpreter::_andLlr,    &Interpreter::_andLri,    &Interpreter::_andLrr,
@@ -1024,7 +1024,7 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     // ════════════════════════════════════════════════════════════════════════
 
 __attribute__((section(".rodata"), aligned(32)))
-int (Interpreter::* Interpreter::thumbInstrs[])(uint16_t) =
+int const (Interpreter::* Interpreter::thumbInstrs[])(uint16_t) =
 {
     // ── 0x000–0x01F  LSL imm5 (32 entries) ───────────────────────────────────
     // bits 15-11 = 00000; 5-bit shift amount in bits 10-6
@@ -1275,7 +1275,7 @@ int (Interpreter::* Interpreter::thumbInstrs[])(uint16_t) =
 //     making the per-condition layout visually verifiable at a glance.
 // ════════════════════════════════════════════════════════════════════════════
 
-//__attribute__((section(".rodata"), aligned(32)))
+__attribute__((section(".rodata"), aligned(32)))
 const uint8_t Interpreter::condition[256] =
 {
     //        NZCV: 0000 0001 0010 0011  0100 0101 0110 0111
@@ -1335,7 +1335,7 @@ const uint8_t Interpreter::condition[256] =
 // with the expected number of 1-bits for a 4-bit prefix group.
 // ════════════════════════════════════════════════════════════════════════════
 
-//__attribute__((section(".rodata"), aligned(32)))
+__attribute__((section(".rodata"), aligned(32)))
 const uint8_t Interpreter::bitCount[256] =
 {
     // n:  +0 +1 +2 +3  +4 +5 +6 +7  +8 +9 +A +B  +C +D +E +F
