@@ -92,8 +92,8 @@ private:
     uint32_t ie = 0, irf = 0;
     uint8_t postFlg = 0;
 
-    static int const (Interpreter::*armInstrs[0x1000])(uint32_t);
-    static int const (Interpreter::*thumbInstrs[0x400])(uint16_t);
+    static const int (Interpreter::*armInstrs[0x1000])(uint32_t);
+    static const int (Interpreter::*thumbInstrs[0x400])(uint16_t);
 
     static const uint8_t condition[0x100];
     static const uint8_t bitCount[0x100];
