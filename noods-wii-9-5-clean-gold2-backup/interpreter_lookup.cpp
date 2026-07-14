@@ -198,7 +198,7 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     &Interpreter::movsAri,    &Interpreter::ldrsbPrrp,  &Interpreter::movsRri,    &Interpreter::ldrshPrrp,
 
     // ── 0x1C0–0x1CF  BIC reg ────────────────────────────────────────────────
-    &Interpreter::bicLli,     &Interpreter::bicLlr,     &Interpreter:bicLri,     &Interpreter::bicLrr,
+    &Interpreter::bicLli,     &Interpreter::bicLlr,     &Interpreter::bicLri,     &Interpreter::bicLrr,
     &Interpreter::bicAri,     &Interpreter::bicArr,     &Interpreter::bicRri,     &Interpreter::bicRrr,
     &Interpreter::bicLli,     &Interpreter::unkArm,     &Interpreter::bicLri,     &Interpreter::strhOfip,
     &Interpreter::bicAri,     &Interpreter::ldrdOfip,   &Interpreter::bicRri,     &Interpreter::strdOfip,
