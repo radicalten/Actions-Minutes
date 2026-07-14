@@ -1,3 +1,8 @@
+Here is the updated `main.cpp` with the `-- General --` and `-- Audio --` section headers completely removed from the settings table. 
+
+This makes the settings overlay even cleaner, and because all remaining entries are selectable settings, navigation is now direct and immediate.
+
+```cpp
 // main.cpp
 #include <stdio.h>
 #include <stdlib.h>
@@ -163,15 +168,10 @@ static const char* const s_toggleNames[]      = { "Off", "On" };
 static const char* const s_frameskipNames[]   = { "None", "1", "2", "3", "4", "5" };
 
 // The table — built once, used every frame the menu is open.
-// Section headers have value == nullptr.
 static const SettingsEntry s_settingsTable[] = {
-    // ---- General ----
-    { "-- General --",          nullptr,                    0, nullptr,           0 },
     { "Direct Boot",            &Settings::directBoot,      2, s_toggleNames,     2 },
     { "Skip Frames",            &Settings::frameskip,       6, s_frameskipNames,  6 },
     { "FPS Limiter",            &Settings::fpsLimiter,      2, s_toggleNames,     2 },
-    // ---- Audio ----
-    { "-- Audio --",            nullptr,                    0, nullptr,           0 },
     { "Audio Emulation",        &Settings::emulateAudio,    2, s_toggleNames,     2 },
     { "16-bit Output",          &Settings::audio16Bit,      2, s_toggleNames,     2 },
     { "Mono Audio",             &Settings::monoAudio,       2, s_toggleNames,     2 },
@@ -697,7 +697,7 @@ static void HandleSettingsInput(u32 pressed, u32 held,
         settingsScrollHoldTimer = 0;
     }
 
-    // --- Move selection, skipping header rows ---
+    // --- Move selection ---
     if (doUp)
         settingsMenuIndex = NextSelectableSettings(settingsMenuIndex, -1);
     if (doDown)
@@ -1079,7 +1079,7 @@ static void ScanWiiInputs() {
 // Layout (8 overlay lines, each 32 chars wide):
 //   Line 0  : "Settings  [A]=Toggle [B]=Back"  (title + hint)
 //   Lines 1-5 : up to 5 entries, the selected one prefixed with "->"
-//   Line 6  : scroll indicator  e.g. "  ^^ row 4/17 vv"
+//   Line 6  : scroll indicator  e.g. "  ^^ row 4/6 vv"
 //   Line 7  : blank
 // ---------------------------------------------------------------------------
 static void DrawSettingsOverlay() {
@@ -1095,7 +1095,7 @@ static void DrawSettingsOverlay() {
         const SettingsEntry& e = s_settingsTable[row];
 
         if (!e.value) {
-            // Section header — centred, no arrow
+            // Section header — centred, no arrow (natively dead code now, but kept for safety)
             Wii_DebugOverlayPrint(lineIdx, "%-32s", e.label);
         } else {
             std::string val = SettingsEntryValue(e);
@@ -1217,3 +1217,4 @@ int main(int /*argc*/, char** /*argv*/) {
 
     return 0;
 }
+```
