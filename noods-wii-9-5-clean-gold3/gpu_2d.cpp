@@ -84,15 +84,25 @@ void Gpu2D::loadState(FILE *file) {
 // BIT(26)=3D pixel, BIT(18..17)=3D alpha, etc.) are preserved unchanged.
 // Pure shift arithmetic — zero multiply or divide.
 
-ALWAYS_INLINE uint32_t Gpu2D::rgb5ToRgb6(uint32_t color) {
-    //  r: bits [4:0]   → bits [5:1]   (mask 0x0000_003E)
-    //  g: bits [9:5]   → bits [11:6]  (mask 0x0000_0FC0)
-    //  b: bits [14:10] → bits [17:12] (mask 0x0003_F000)
-    uint32_t r = (color <<  1) & 0x0000003Eu;
-    uint32_t g = (color >>  4) & 0x00000FC0u;
-    uint32_t b = (color >>  9) & 0x0003F000u;
+__attribute__((optimize("O3")))
+uint32_t Gpu2D::rgb5ToRgb6(uint32_t color)
+{
+    // Each 5-bit RGB channel is shifted left by 1 to produce a 6-bit channel.
+    // The upper tracking bits (BIT 18..31: 3D alpha, semi-transparent marker,
+    // 3D pixel marker, etc.) are preserved unchanged.
+    // Pure shift arithmetic — zero multiply or divide.
+    //
+    //  src bits  [4:0]   → dst bits  [5:1]   mask 0x0000_003E
+    //  src bits  [9:5]   → dst bits [11:6]   mask 0x0000_0FC0
+    //  src bits [14:10]  → dst bits [17:12]  mask 0x0003_F000
+    //  src bits [31:18]  → dst bits [31:18]  (unchanged)
+    const uint32_t r = (color <<  1) & 0x0000003Eu;
+    const uint32_t g = (color >>  4) & 0x00000FC0u;
+    const uint32_t b = (color >>  9) & 0x0003F000u;
     return (color & 0xFFFC0000u) | b | g | r;
 }
+
+
 
 // ── reloadRegisters / updateWindows ──────────────────────────────────────────
 void Gpu2D::reloadRegisters() {
