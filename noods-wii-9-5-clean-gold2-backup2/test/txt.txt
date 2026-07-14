@@ -1,1 +1,4 @@
+Goal optimizae core.cpp/h so that it uses raw pointers instead of std::function and std::bind, but also doesn't go straight to white/black screen on nds/gba. 
 
+Process:
+1. core-speedup1
