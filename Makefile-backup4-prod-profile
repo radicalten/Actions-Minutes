@@ -17,7 +17,7 @@ LDFLAGS += $(CXXFLAGS) \
 -lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
 TARGET  := myapp
 EXCLUDE :=
-SRCDIR 	:= backup4-prodprofile
+SRCDIR 	:= backup4-prod-profile
 C_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.cpp)))
 SOURCES = $(C_SOURCES) 
 OBJECTS = $(SOURCES:.cpp=.o)
