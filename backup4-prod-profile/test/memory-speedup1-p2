@@ -1,4 +1,4 @@
-Ok these are the files I would like you to optimize for wii powerpc to match core.h/cpp
+Ok these are the files I would like you to optimize for wii powerpc for speed to match core.h/cpp
 
 //memory.h
 #pragma once
