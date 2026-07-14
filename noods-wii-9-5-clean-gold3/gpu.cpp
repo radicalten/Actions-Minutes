@@ -72,40 +72,42 @@ void Gpu::loadState(FILE *file) {
 __attribute__((optimize("O3")))
 uint32_t Gpu::rgb5ToRgb8(uint32_t color)
 {
-    // Bit-replication trick: exact for all 32 input values.
-    //   (v << 3) | (v >> 2)   maps 0→0, 31→255
-    // This avoids any multiply or divide instruction.
+    // 5-bit -> 8-bit via bit replication: (v<<3)|(v>>2)
+    // exact for all 32 values: 0->0, 31->255
     const uint32_t r5 = (color >>  0) & 0x1Fu;
     const uint32_t g5 = (color >>  5) & 0x1Fu;
     const uint32_t b5 = (color >> 10) & 0x1Fu;
     const uint8_t r = (uint8_t)((r5 << 3) | (r5 >> 2));
     const uint8_t g = (uint8_t)((g5 << 3) | (g5 >> 2));
     const uint8_t b = (uint8_t)((b5 << 3) | (b5 >> 2));
-    // Pack as 0xAABBGGRR  (alpha=0xFF, B in bits[23:16], G in [15:8], R in [7:0])
+    // Output 0xAABBGGRR
     return (0xFFu << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
 }
 
 __attribute__((optimize("O3")))
 uint32_t Gpu::rgb6ToRgb8(uint32_t color)
 {
-    // Bit-replication trick: exact for all 64 input values.
-    //   (v << 2) | (v >> 4)   maps 0→0, 63→255
+    // 6-bit -> 8-bit via bit replication: (v<<2)|(v>>4)
+    // exact for all 64 values: 0->0, 63->255
     const uint32_t r6 = (color >>  0) & 0x3Fu;
     const uint32_t g6 = (color >>  6) & 0x3Fu;
     const uint32_t b6 = (color >> 12) & 0x3Fu;
     const uint8_t r = (uint8_t)((r6 << 2) | (r6 >> 4));
     const uint8_t g = (uint8_t)((g6 << 2) | (g6 >> 4));
     const uint8_t b = (uint8_t)((b6 << 2) | (b6 >> 4));
+    // Output 0xAABBGGRR
     return (0xFFu << 24) | ((uint32_t)b << 16) | ((uint32_t)g << 8) | r;
 }
 
 __attribute__((optimize("O3")))
 uint16_t Gpu::rgb6ToRgb5(uint32_t color)
 {
-    // Divide each 6-bit channel by 2 (right-shift 1) to get a 5-bit channel.
-    const uint16_t r = (uint16_t)(((color >>  0) & 0x3Fu) >> 1);
-    const uint16_t g = (uint16_t)(((color >>  6) & 0x3Fu) >> 1);
-    const uint16_t b = (uint16_t)(((color >> 12) & 0x3Fu) >> 1);
+    // Input:  bits[5:0]=r6,  bits[11:6]=g6,  bits[17:12]=b6
+    // Output: bits[4:0]=r5,  bits[9:5]=g5,   bits[14:10]=b5
+    // Each channel: drop LSB (right-shift 1) then repack
+    const uint16_t r = (uint16_t)((color >>  1) & 0x1Fu);
+    const uint16_t g = (uint16_t)((color >>  7) & 0x1Fu);
+    const uint16_t b = (uint16_t)((color >> 13) & 0x1Fu);
     return (uint16_t)(BIT(15) | (b << 10) | (g << 5) | r);
 }
 
