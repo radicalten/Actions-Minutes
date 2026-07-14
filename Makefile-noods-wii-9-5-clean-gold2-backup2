@@ -16,7 +16,7 @@ LDFLAGS += $(CXXFLAGS) \
 -L/opt/devkitpro/libogc/lib/wii \
 -lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
 TARGET  := myapp
-EXCLUDE := noods-wii-9-5-clean-gold2-backup2/wifi.cpp
+EXCLUDE :=
 SRCDIR 	:= noods-wii-9-5-clean-gold2-backup2
 C_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.cpp)))
 SOURCES = $(C_SOURCES) 
