@@ -661,3 +661,113 @@ static sptr AudioThreadMain(void* /*arg*/)
 | `spu.h` | Removed `bufferIn/Out/Size` heap pointers; added `buffers[2][548]` inline double-buffer; changed `getSamples()` signature to `bool getSamples(uint32_t*, int)` | Eliminates null-pointer read, heap alloc per callback, and ownership confusion |
 | `spu.cpp` | Rewrote `getSamples()` and `pushSample()`; removed `~Spu` deallocation | Fixes invalid reads; swap is now atomic under `PPCIrqLock`; no heap traffic |
 | `main.cpp` | Removed `PullSpuSamples()`; added `s_spuStaging[]`; simplified `AudioThreadMain` | No `delete[]`, no intermediate heap buffer, single call path for both NDS and GBA |
+
+
+===
+The change is purely in `getSamples()` and `pushSample()`. Here is the updated logic for all three modes:
+
+- **fpsLimiter == 2**: strict sync (busy-wait), previously what mode 1 did — block until data is ready / consumed
+- **fpsLimiter == 1**: play whatever is in the buffer right now, never block
+- **fpsLimiter == 0**: silent unless buffer is full (unchanged)
+
+```cpp
+bool Spu::getSamples(uint32_t *dst, int count) {
+    if (count > SPU_BUF_FRAMES)
+        count = SPU_BUF_FRAMES;
+
+    bool wait = false;
+
+    if (Settings::fpsLimiter == 2) {
+        // Strict: block this thread until the emulator has a full buffer ready.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (!isReady)
+            KThrQueueBlock(&waitQueue2, 1);
+        // After unblocking, ready is guaranteed true by pushSample.
+    }
+    else if (Settings::fpsLimiter == 1) {
+        // Relaxed: serve whatever is in the completed buffer right now.
+        // Never block — if nothing is ready we repeat the last sample.
+        PPCIrqState st = PPCIrqLockByMsr();
+        if (!ready) wait = true;
+        PPCIrqUnlockByMsr(st);
+    }
+    else {
+        // No limiter: silent unless a full buffer is ready.
+        PPCIrqState st = PPCIrqLockByMsr();
+        if (!ready) wait = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (wait) {
+        PPCIrqState st   = PPCIrqLockByMsr();
+        int         ri   = writeIdx ^ 1;
+        uint32_t    last = buffers[ri][SPU_BUF_FRAMES - 1];
+        PPCIrqUnlockByMsr(st);
+
+        for (int i = 0; i < count; i++)
+            dst[i] = last;
+
+        return false;
+    }
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        int ri = writeIdx ^ 1;
+        memcpy(dst, buffers[ri], (size_t)count * sizeof(uint32_t));
+        ready = false;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    // Only wake the emulator back-pressure block in strict mode.
+    if (Settings::fpsLimiter == 2)
+        KThrQueueUnblockAllByValue(&waitQueue1, 1);
+
+    return true;
+}
+
+void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
+    buffers[writeIdx][bufferPointer++] =
+        ((uint32_t)(uint16_t)sampleRight << 16) |
+        ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);
+
+    if (bufferPointer < SPU_BUF_FRAMES)
+        return;
+
+    if (Settings::fpsLimiter == 2) {
+        // Strict: block until the audio thread has consumed the previous buffer.
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady   = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (isReady)
+            KThrQueueBlock(&waitQueue1, 1);
+    }
+    // Modes 1 and 0: never block the emulator — just overwrite.
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        writeIdx ^= 1;
+        ready     = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    bufferPointer = 0;
+
+    // Only wake the audio thread in strict mode.
+    if (Settings::fpsLimiter == 2)
+        KThrQueueUnblockAllByValue(&waitQueue2, 1);
+}
+```
+
+The key differences from before:
+
+| Mode | `getSamples` | `pushSample` |
+|------|-------------|--------------|
+| 2 | blocks until emulator is ready | blocks until audio has consumed previous buffer |
+| 1 | serves last buffer immediately, never blocks | overwrites freely, never blocks |
+| 0 | serves silence if not ready, never blocks | overwrites freely, never blocks |
+
+Mode 1 and 0 now share the same `pushSample` path which means the emulator thread is never stalled by audio in either of those modes. The only difference between them is that mode 1 will repeat the last completed frame when the emulator is ahead, while mode 0 serves silence in the same situation.
