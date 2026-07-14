@@ -29,7 +29,7 @@
 #define _ &Interpreter::   // brevity macro, undefined at end of file
 
 __attribute__((section(".rodata"), aligned(32)))
-int (Interpreter::* const Interpreter::armInstrs[])(uint32_t) =
+int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
 {
     // ── 0x000–0x00F  AND reg / multiply / halfword store-load ────────────────
     _andLli,    _andLlr,    _andLri,    _andLrr,
@@ -1030,7 +1030,7 @@ int (Interpreter::* const Interpreter::armInstrs[])(uint32_t) =
 #define _T &Interpreter::
 
 __attribute__((section(".rodata"), aligned(32)))
-int (Interpreter::* const Interpreter::thumbInstrs[])(uint16_t) =
+int (Interpreter::* Interpreter::thumbInstrs[])(uint16_t) =
 {
     // ── 0x000–0x01F  LSL imm5 (32 entries) ───────────────────────────────────
     // bits 15-11 = 00000; 5-bit shift amount in bits 10-6
