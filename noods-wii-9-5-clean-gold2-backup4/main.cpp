@@ -1,22 +1,4 @@
-/*
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+// main.cpp
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -154,8 +136,126 @@ static std::string romToLoadPath = "";
 static volatile bool triggerRomLoad = false;
 
 static int scrollHoldTimer = 0;
-static const int SCROLL_DELAY_INITIAL = 18; // Frames before scrolling starts
-static const int SCROLL_DELAY_REPEATED = 3;  // Frames between scrolling steps
+static const int SCROLL_DELAY_INITIAL  = 18;
+static const int SCROLL_DELAY_REPEATED = 3;
+
+// ---------------------------------------------------------------------------
+// Settings menu state
+// ---------------------------------------------------------------------------
+static bool showSettingsMenu = false;
+static int  settingsMenuIndex   = 0;     // which row is highlighted
+static int  settingsDisplayOffset = 0;   // first visible row
+
+// ---------------------------------------------------------------------------
+// Each entry the settings menu can display.
+// We keep it as a flat list; header rows have value == nullptr.
+// ---------------------------------------------------------------------------
+struct SettingsEntry {
+    const char* label;      // displayed on the left
+    int*        value;      // nullptr → section header
+    int         maxValue;   // cycles 0..maxValue-1 on A press
+    // Human-readable value names.  If nullptr, we print the integer directly.
+    const char* const* names;
+    int         nameCount;
+};
+
+static const char* const s_toggleNames[]      = { "Off", "On" };
+static const char* const s_frameskipNames[]   = { "None", "1", "2", "3", "4", "5" };
+static const char* const s_filterNames[]      = { "Nearest", "Upscaled", "Linear" };
+static const char* const s_threaded3DNames[]  = { "Off", "1 Thread", "2 Threads" };
+
+// The table — built once, used every frame the menu is open.
+// Section headers have value == nullptr.
+static const SettingsEntry s_settingsTable[] = {
+    // ---- General ----
+    { "-- General --",          nullptr,                    0, nullptr,           0 },
+    { "Direct Boot",            &Settings::directBoot,      2, s_toggleNames,     2 },
+    { "FPS Limiter",            &Settings::fpsLimiter,      2, s_toggleNames,     2 },
+    // ---- Graphics ----
+    { "-- Graphics --",         nullptr,                    0, nullptr,           0 },
+    { "Skip Frames",            &Settings::frameskip,       6, s_frameskipNames,  6 },
+    { "Threaded 2D",            &Settings::threaded2D,      2, s_toggleNames,     2 },
+    { "Threaded 3D",            &Settings::threaded3D,      3, s_threaded3DNames, 3 },
+    { "High-Res 3D",            &Settings::highRes3D,       2, s_toggleNames,     2 },
+    { "Simulate Ghosting",      &Settings::screenGhost,     2, s_toggleNames,     2 },
+    { "Screen Filter",          &Settings::screenFilter,    3, s_filterNames,     3 },
+    // ---- Audio ----
+    { "-- Audio --",            nullptr,                    0, nullptr,           0 },
+    { "Audio Emulation",        &Settings::emulateAudio,    2, s_toggleNames,     2 },
+    { "16-bit Output",          &Settings::audio16Bit,      2, s_toggleNames,     2 },
+    { "Mono Audio",             &Settings::monoAudio,       2, s_toggleNames,     2 },
+    // ---- Experimental ----
+    { "-- Experimental --",     nullptr,                    0, nullptr,           0 },
+    { "HLE ARM7",               &Settings::arm7Hle,         2, s_toggleNames,     2 },
+    { "DSi Mode",               &Settings::dsiMode,         2, s_toggleNames,     2 },
+};
+
+static const int s_settingsCount =
+    (int)(sizeof(s_settingsTable) / sizeof(s_settingsTable[0]));
+
+// How many non-header rows are visible at once in the overlay.
+// Overlay has 8 lines: line 0 = title, lines 1-5 = items (5 visible),
+// line 6 = hint, line 7 = blank.
+static const int SETTINGS_VISIBLE = 5;
+
+// ---------------------------------------------------------------------------
+// Return the display string for a settings entry.
+// ---------------------------------------------------------------------------
+static std::string SettingsEntryValue(const SettingsEntry& e) {
+    if (!e.value) return "";
+    int v = *e.value;
+    if (e.names && v >= 0 && v < e.nameCount)
+        return e.names[v];
+    return std::to_string(v);
+}
+
+// ---------------------------------------------------------------------------
+// Advance to the next non-header index >= start in direction dir (+1/-1).
+// Returns start unchanged if no non-header row exists.
+// ---------------------------------------------------------------------------
+static int NextSelectableSettings(int start, int dir) {
+    int idx = start;
+    for (int attempts = 0; attempts < s_settingsCount; attempts++) {
+        idx += dir;
+        if (idx < 0)                idx = s_settingsCount - 1;
+        if (idx >= s_settingsCount) idx = 0;
+        if (s_settingsTable[idx].value != nullptr)
+            return idx;
+    }
+    return start; // no selectable row (shouldn't happen)
+}
+
+// ---------------------------------------------------------------------------
+// Make sure settingsDisplayOffset keeps the highlighted row visible.
+// ---------------------------------------------------------------------------
+static void ClampSettingsScroll() {
+    if (settingsMenuIndex < settingsDisplayOffset)
+        settingsDisplayOffset = settingsMenuIndex;
+    if (settingsMenuIndex >= settingsDisplayOffset + SETTINGS_VISIBLE)
+        settingsDisplayOffset = settingsMenuIndex - SETTINGS_VISIBLE + 1;
+}
+
+// ---------------------------------------------------------------------------
+// Open / reset the settings menu.
+// ---------------------------------------------------------------------------
+static void OpenSettingsMenu() {
+    showSettingsMenu    = true;
+    // Find the first selectable row.
+    settingsMenuIndex   = 0;
+    if (s_settingsTable[0].value == nullptr)
+        settingsMenuIndex = NextSelectableSettings(0, +1);
+    settingsDisplayOffset = 0;
+    ClampSettingsScroll();
+}
+
+// ---------------------------------------------------------------------------
+// Activate (toggle) the currently highlighted settings entry.
+// ---------------------------------------------------------------------------
+static void ActivateSettingsEntry(int idx) {
+    const SettingsEntry& e = s_settingsTable[idx];
+    if (!e.value) return;
+    *e.value = (*e.value + 1) % e.maxValue;
+}
 
 #define NDS_KEY_A      0
 #define NDS_KEY_B      1
@@ -183,15 +283,11 @@ struct PerformanceState {
 static PerformanceState perf = {};
 
 // ---------------------------------------------------------------------------
-// Caller-owned staging buffers — one per double-buffer slot, no heap alloc.
-// Size = max(NDS_FRAMES, GBA_FRAMES).  Since they are now equal this is just
-// SPU_BUF_FRAMES == 548 uint32_t words per slot.
+// Caller-owned staging buffers
 // ---------------------------------------------------------------------------
-#define AUDIO_SPU_FRAMES  WIIAUD_NDS_FRAMES   // 548, same for GBA
+#define AUDIO_SPU_FRAMES  WIIAUD_NDS_FRAMES
 
 alignas(32) static uint32_t s_spuStaging[AUDIO_SPU_FRAMES];
-
-// s_audioDbl / s_audioSilence are unchanged from before:
 alignas(32) static int16_t s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
 alignas(32) static int16_t s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2];
 
@@ -199,9 +295,6 @@ static volatile int  s_writeBuf = 0;
 static volatile int  s_readBuf  = 1;
 static volatile bool s_bufReady = false;
 
-// ---------------------------------------------------------------------------
-// ResampleLinear — unchanged from before
-// ---------------------------------------------------------------------------
 static void ResampleLinear(const uint32_t* src, int nSrc,
                             int16_t*        dst, int nDst,
                             bool            mono)
@@ -234,9 +327,6 @@ static void ResampleLinear(const uint32_t* src, int nSrc,
     }
 }
 
-// ---------------------------------------------------------------------------
-// AudioCallback — unchanged
-// ---------------------------------------------------------------------------
 static void AudioCallback(s32 voice)
 {
     if (s_bufReady) {
@@ -250,13 +340,9 @@ static void AudioCallback(s32 voice)
     }
 }
 
-// ---------------------------------------------------------------------------
-// AudioThreadMain — no heap allocation, no delete[]
-// ---------------------------------------------------------------------------
 static sptr AudioThreadMain(void* /*arg*/)
 {
     while (runAudioThread) {
-        // Wait until the ASND callback has consumed the previous buffer.
         while (s_bufReady && runAudioThread)
             KThreadYield();
         if (!runAudioThread) break;
@@ -266,12 +352,8 @@ static sptr AudioThreadMain(void* /*arg*/)
         const bool mono = (Settings::monoAudio != 0);
 
         if (romLoaded && ndsCore) {
-            // Both modes use AUDIO_SPU_FRAMES (== 548) — no branch needed
-            // for the frame count, only for which SPU mode is active.
             bool got = ndsCore->spu.getSamples(s_spuStaging, AUDIO_SPU_FRAMES);
             if (got || true) {
-                // Even on silence (got==false) getSamples fills s_spuStaging,
-                // so we can always resample it.
                 ResampleLinear(s_spuStaging, AUDIO_SPU_FRAMES,
                                dst, WIIAUD_FRAMES_PER_BUF, mono);
                 ok = true;
@@ -339,7 +421,7 @@ static void InitializeSettings() {
     Settings::screenGhost  = 0;
     Settings::emulateAudio = 1;
     Settings::audio16Bit   = 1;
-    Settings::monoAudio    = 0; 
+    Settings::monoAudio    = 0;
     Settings::savesFolder  = 1;
     Settings::statesFolder = 1;
     Settings::cheatsFolder = 1;
@@ -538,7 +620,6 @@ static void InitializeNDS() {
 static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool hasClassic) {
     uint16_t nds = 0;
 
-    // Standard Wii Remote mappings (Horizontal or plus Nunchuk)
     if (held & WPAD_BUTTON_RIGHT)  nds |= (1 << NDS_KEY_RIGHT);
     if (held & WPAD_BUTTON_LEFT)   nds |= (1 << NDS_KEY_LEFT);
     if (held & WPAD_BUTTON_UP)     nds |= (1 << NDS_KEY_UP);
@@ -555,7 +636,6 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool has
         if (heldExt & WPAD_NUNCHUK_BUTTON_C) nds |= (1 << NDS_KEY_R);
     }
 
-    // Classic Controller physical mapping
     if (hasClassic) {
         if (held & WPAD_CLASSIC_BUTTON_RIGHT) nds |= (1 << NDS_KEY_RIGHT);
         if (held & WPAD_CLASSIC_BUTTON_LEFT)  nds |= (1 << NDS_KEY_LEFT);
@@ -574,6 +654,111 @@ static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool has
     return nds;
 }
 
+// ---------------------------------------------------------------------------
+// HandleSettingsInput — called from ScanWiiInputs when showSettingsMenu is
+// true.  Uses the same hold-scroll pattern as the file browser.
+// ---------------------------------------------------------------------------
+static int settingsScrollHoldTimer = 0;
+
+static void HandleSettingsInput(u32 pressed, u32 held,
+                                u32 gcPressed, u32 gcHeld,
+                                WPADData* wdata, bool hasClassic)
+{
+    // --- Classic left-stick for scrolling ---
+    bool classicUp   = false;
+    bool classicDown = false;
+    if (hasClassic && wdata) {
+        float ly = wdata->exp.classic.ljs.mag *
+                   cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+        if (wdata->exp.classic.ljs.mag > 0.5f) {
+            if (ly >  0.5f) classicUp   = true;
+            if (ly < -0.5f) classicDown = true;
+        }
+    }
+
+    bool upPressed   = (pressed & WPAD_BUTTON_UP)
+                     || (pressed & WPAD_CLASSIC_BUTTON_UP)
+                     || (gcPressed & PAD_BUTTON_UP);
+    bool downPressed = (pressed & WPAD_BUTTON_DOWN)
+                     || (pressed & WPAD_CLASSIC_BUTTON_DOWN)
+                     || (gcPressed & PAD_BUTTON_DOWN);
+    bool upHeld      = (held & WPAD_BUTTON_UP)
+                     || (held & WPAD_CLASSIC_BUTTON_UP)
+                     || (gcHeld & PAD_BUTTON_UP)
+                     || classicUp;
+    bool downHeld    = (held & WPAD_BUTTON_DOWN)
+                     || (held & WPAD_CLASSIC_BUTTON_DOWN)
+                     || (gcHeld & PAD_BUTTON_DOWN)
+                     || classicDown;
+
+    // --- Determine whether to scroll this frame ---
+    bool doUp   = false;
+    bool doDown = false;
+
+    if (upPressed || downPressed) {
+        settingsScrollHoldTimer = 0;
+        if (upPressed)   doUp   = true;
+        if (downPressed) doDown = true;
+    } else if (upHeld || downHeld) {
+        settingsScrollHoldTimer++;
+        int elapsed = settingsScrollHoldTimer - SCROLL_DELAY_INITIAL;
+        if (elapsed >= 0 && elapsed % SCROLL_DELAY_REPEATED == 0) {
+            if (upHeld)   doUp   = true;
+            if (downHeld) doDown = true;
+        }
+    } else {
+        settingsScrollHoldTimer = 0;
+    }
+
+    // --- Move selection, skipping header rows ---
+    if (doUp)
+        settingsMenuIndex = NextSelectableSettings(settingsMenuIndex, -1);
+    if (doDown)
+        settingsMenuIndex = NextSelectableSettings(settingsMenuIndex, +1);
+
+    ClampSettingsScroll();
+
+    // --- Page up / down with Left / Right ---
+    bool pageUp   = (pressed & WPAD_BUTTON_LEFT)
+                  || (pressed & WPAD_CLASSIC_BUTTON_LEFT)
+                  || (gcPressed & PAD_BUTTON_LEFT);
+    bool pageDown = (pressed & WPAD_BUTTON_RIGHT)
+                  || (pressed & WPAD_CLASSIC_BUTTON_RIGHT)
+                  || (gcPressed & PAD_BUTTON_RIGHT);
+
+    if (pageUp) {
+        for (int i = 0; i < SETTINGS_VISIBLE; i++)
+            settingsMenuIndex = NextSelectableSettings(settingsMenuIndex, -1);
+        ClampSettingsScroll();
+    }
+    if (pageDown) {
+        for (int i = 0; i < SETTINGS_VISIBLE; i++)
+            settingsMenuIndex = NextSelectableSettings(settingsMenuIndex, +1);
+        ClampSettingsScroll();
+    }
+
+    // --- Activate (toggle) with A ---
+    bool activate = (pressed & WPAD_BUTTON_A)
+                  || (pressed & WPAD_CLASSIC_BUTTON_A)
+                  || (gcPressed & PAD_BUTTON_A)
+                  || (pressed & WPAD_BUTTON_2);   // Wiimote-horizontal A
+    if (activate)
+        ActivateSettingsEntry(settingsMenuIndex);
+
+    // --- Close with B / MINUS --- save settings on exit ---
+    bool close = (pressed & WPAD_BUTTON_B)
+               || (pressed & WPAD_CLASSIC_BUTTON_B)
+               || (gcPressed & PAD_BUTTON_B)
+               || (pressed & WPAD_BUTTON_MINUS);
+    if (close) {
+        Settings::save();
+        showSettingsMenu = false;
+        // Re-populate the file browser so it reflects any path changes.
+        if (showFileBrowser)
+            UpdateFileBrowser(currentDir);
+    }
+}
+
 static void ScanWiiInputs() {
     WPAD_ScanPads();
     PAD_ScanPads();
@@ -588,6 +773,7 @@ static void ScanWiiInputs() {
     bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
     u32       heldExt    = hasNunchuk ? held : 0;
 
+    // HOME always quits regardless of menu state.
     if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
         runEmulatorThread = false;
         PPCCompilerBarrier();
@@ -601,41 +787,65 @@ static void ScanWiiInputs() {
         exit(0);
     }
 
+    // -----------------------------------------------------------------------
+    // Settings menu — takes priority over the file browser.
+    // -----------------------------------------------------------------------
+    if (showSettingsMenu) {
+        HandleSettingsInput(pressed, held, gcPressed, gcHeld, wdata, hasClassic);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // File browser
+    // -----------------------------------------------------------------------
     if (showFileBrowser) {
         if (!dirContents.empty()) {
-            static bool classicLStickUpLast = false;
+            static bool classicLStickUpLast   = false;
             static bool classicLStickDownLast = false;
-            bool classicLStickUp = false;
+            bool classicLStickUp   = false;
             bool classicLStickDown = false;
 
-            // Classic Controller stick parsing for menus
             if (hasClassic && wdata) {
-                float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+                float ly = wdata->exp.classic.ljs.mag *
+                           cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
                 if (wdata->exp.classic.ljs.mag > 0.5f) {
-                    if (ly > 0.5f)  classicLStickUp = true;
+                    if (ly >  0.5f) classicLStickUp   = true;
                     if (ly < -0.5f) classicLStickDown = true;
                 }
             }
 
-            bool upHeld   = (held & WPAD_BUTTON_UP)     || (held & WPAD_CLASSIC_BUTTON_UP)     || (gcHeld & PAD_BUTTON_UP)   || classicLStickUp;
-            bool downHeld = (held & WPAD_BUTTON_DOWN)   || (held & WPAD_CLASSIC_BUTTON_DOWN)   || (gcHeld & PAD_BUTTON_DOWN) || classicLStickDown;
-            bool upDown   = (pressed & WPAD_BUTTON_UP)  || (pressed & WPAD_CLASSIC_BUTTON_UP)  || (gcPressed & PAD_BUTTON_UP)  || (classicLStickUp && !classicLStickUpLast);
-            bool downDown = (pressed & WPAD_BUTTON_DOWN)|| (pressed & WPAD_CLASSIC_BUTTON_DOWN)|| (gcPressed & PAD_BUTTON_DOWN)|| (classicLStickDown && !classicLStickDownLast);
+            bool upHeld   = (held & WPAD_BUTTON_UP)
+                          || (held & WPAD_CLASSIC_BUTTON_UP)
+                          || (gcHeld & PAD_BUTTON_UP)
+                          || classicLStickUp;
+            bool downHeld = (held & WPAD_BUTTON_DOWN)
+                          || (held & WPAD_CLASSIC_BUTTON_DOWN)
+                          || (gcHeld & PAD_BUTTON_DOWN)
+                          || classicLStickDown;
+            bool upDown   = (pressed & WPAD_BUTTON_UP)
+                          || (pressed & WPAD_CLASSIC_BUTTON_UP)
+                          || (gcPressed & PAD_BUTTON_UP)
+                          || (classicLStickUp && !classicLStickUpLast);
+            bool downDown = (pressed & WPAD_BUTTON_DOWN)
+                          || (pressed & WPAD_CLASSIC_BUTTON_DOWN)
+                          || (gcPressed & PAD_BUTTON_DOWN)
+                          || (classicLStickDown && !classicLStickDownLast);
 
-            classicLStickUpLast = classicLStickUp;
+            classicLStickUpLast   = classicLStickUp;
             classicLStickDownLast = classicLStickDown;
 
-            bool performUp    = false;
-            bool performDown  = false;
+            bool performUp   = false;
+            bool performDown = false;
 
             if (upDown || downDown) {
-                scrollHoldTimer = 0; // Reset timer on raw press
+                scrollHoldTimer = 0;
                 if (upDown)   performUp   = true;
                 if (downDown) performDown = true;
             } else if (upHeld || downHeld) {
                 scrollHoldTimer++;
                 if (scrollHoldTimer >= SCROLL_DELAY_INITIAL) {
-                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) % SCROLL_DELAY_REPEATED == 0) {
+                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) %
+                        SCROLL_DELAY_REPEATED == 0) {
                         if (upHeld)   performUp   = true;
                         if (downHeld) performDown = true;
                     }
@@ -663,27 +873,32 @@ static void ScanWiiInputs() {
                     displayOffset = selectedItemIndex;
             }
 
-            if ((pressed & WPAD_BUTTON_LEFT) || (pressed & WPAD_CLASSIC_BUTTON_LEFT) || (gcPressed & PAD_BUTTON_LEFT)) {
+            if ((pressed & WPAD_BUTTON_LEFT)
+             || (pressed & WPAD_CLASSIC_BUTTON_LEFT)
+             || (gcPressed & PAD_BUTTON_LEFT)) {
                 selectedItemIndex -= 5;
-                if (selectedItemIndex < 0) {
-                    selectedItemIndex = 0;
-                }
+                if (selectedItemIndex < 0) selectedItemIndex = 0;
                 displayOffset = std::max(0, selectedItemIndex - 2);
             }
-            if ((pressed & WPAD_BUTTON_RIGHT) || (pressed & WPAD_CLASSIC_BUTTON_RIGHT) || (gcPressed & PAD_BUTTON_RIGHT)) {
+            if ((pressed & WPAD_BUTTON_RIGHT)
+             || (pressed & WPAD_CLASSIC_BUTTON_RIGHT)
+             || (gcPressed & PAD_BUTTON_RIGHT)) {
                 selectedItemIndex += 5;
-                if (selectedItemIndex >= (int)dirContents.size()) {
+                if (selectedItemIndex >= (int)dirContents.size())
                     selectedItemIndex = (int)dirContents.size() - 1;
-                }
-                displayOffset = std::max(0, std::min((int)dirContents.size() - 5, selectedItemIndex - 2));
+                displayOffset = std::max(0,
+                    std::min((int)dirContents.size() - 5,
+                             selectedItemIndex - 2));
             }
 
-            if ((pressed & WPAD_BUTTON_A) || (pressed & WPAD_CLASSIC_BUTTON_A) || (gcPressed & PAD_BUTTON_A)) {
+            if ((pressed & WPAD_BUTTON_A)
+             || (pressed & WPAD_CLASSIC_BUTTON_A)
+             || (gcPressed & PAD_BUTTON_A)) {
                 BrowserItem selected = dirContents[selectedItemIndex];
                 if (selected.isDirectory) {
                     if (selected.name == "..") {
                         size_t slash = currentDir.find_last_of('/',
-                                           currentDir.length() - 2);
+                            currentDir.length() - 2);
                         if (slash != std::string::npos)
                             currentDir = currentDir.substr(0, slash + 1);
                     } else {
@@ -698,17 +913,21 @@ static void ScanWiiInputs() {
                     PPCIrqUnlockByMsr(st);
 
                     showFileBrowser = false;
-                    
+
                     dirContents.clear();
                     dirContents.shrink_to_fit();
                 }
             }
         }
 
-        // Handle B button press in file browser: go up directory, or close browser if at root
-        if ((pressed & WPAD_BUTTON_B) || (pressed & WPAD_CLASSIC_BUTTON_B) || (gcPressed & PAD_BUTTON_B)) {
-            if (currentDir != "sd:/" && currentDir != "sd://" && currentDir != "sd:") {
-                size_t slash = currentDir.find_last_of('/', currentDir.length() - 2);
+        // B: go up a directory, or close browser if ROM is running.
+        if ((pressed & WPAD_BUTTON_B)
+         || (pressed & WPAD_CLASSIC_BUTTON_B)
+         || (gcPressed & PAD_BUTTON_B)) {
+            if (currentDir != "sd:/" && currentDir != "sd://"
+             && currentDir != "sd:") {
+                size_t slash = currentDir.find_last_of('/',
+                    currentDir.length() - 2);
                 if (slash != std::string::npos) {
                     currentDir = currentDir.substr(0, slash + 1);
                     UpdateFileBrowser(currentDir);
@@ -717,7 +936,17 @@ static void ScanWiiInputs() {
                 showFileBrowser = false;
             }
         }
+
+        // PLUS / START: open settings menu from the file browser.
+        if ((pressed & WPAD_BUTTON_PLUS)
+         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)
+         || (gcPressed & PAD_BUTTON_START)) {
+            OpenSettingsMenu();
+        }
     }
+    // -----------------------------------------------------------------------
+    // In-game (emulation running)
+    // -----------------------------------------------------------------------
     else {
         uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk, hasClassic);
 
@@ -733,14 +962,15 @@ static void ScanWiiInputs() {
         if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
         if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
 
-        // Map Classic Left Stick to NDS D-Pad
         if (hasClassic && wdata) {
-            float lx = wdata->exp.classic.ljs.mag * sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
-            float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            float lx = wdata->exp.classic.ljs.mag *
+                       sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            float ly = wdata->exp.classic.ljs.mag *
+                       cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
             if (wdata->exp.classic.ljs.mag > 0.5f) {
-                if (lx > 0.5f)  ndsButtons |= (1 << NDS_KEY_RIGHT);
+                if (lx >  0.5f) ndsButtons |= (1 << NDS_KEY_RIGHT);
                 if (lx < -0.5f) ndsButtons |= (1 << NDS_KEY_LEFT);
-                if (ly > 0.5f)  ndsButtons |= (1 << NDS_KEY_UP);
+                if (ly >  0.5f) ndsButtons |= (1 << NDS_KEY_UP);
                 if (ly < -0.5f) ndsButtons |= (1 << NDS_KEY_DOWN);
             }
         }
@@ -748,7 +978,6 @@ static void ScanWiiInputs() {
         bool isTouching = false;
         g_cursorShow = false;
 
-        // IR pointer styling
         if (wdata && wdata->ir.valid) {
             g_cursorX    = wdata->ir.x;
             g_cursorY    = wdata->ir.y;
@@ -757,7 +986,6 @@ static void ScanWiiInputs() {
                 isTouching = true;
         }
 
-        // GC C-Stick Stylus Emulator
         s8 cstickX = PAD_SubStickX(0);
         s8 cstickY = PAD_SubStickY(0);
         if (abs(cstickX) > 15 || abs(cstickY) > 15) {
@@ -771,10 +999,11 @@ static void ScanWiiInputs() {
             if (g_cursorY > 480.0f) g_cursorY = 480.0f;
         }
 
-        // Classic Controller Right Stick Stylus Emulator
         if (hasClassic && wdata) {
-            float rx = wdata->exp.classic.rjs.mag * sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
-            float ry = wdata->exp.classic.rjs.mag * cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            float rx = wdata->exp.classic.rjs.mag *
+                       sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            float ry = wdata->exp.classic.rjs.mag *
+                       cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
             if (wdata->exp.classic.rjs.mag > 0.15f) {
                 g_cursorX   += rx * 4.0f;
                 g_cursorY   -= ry * 4.0f;
@@ -787,7 +1016,6 @@ static void ScanWiiInputs() {
             }
         }
 
-        // Stylus activation
         if (gcHeld & PAD_TRIGGER_Z) {
             isTouching   = true;
             g_cursorShow = true;
@@ -802,16 +1030,16 @@ static void ScanWiiInputs() {
         int16_t touchY = 0;
 
         if (g_cursorShow) {
-            const int gap     = 2;
-            const int scrW    = NDS_SCREEN_WIDTH;
-            const int scrH    = NDS_SCREEN_HEIGHT;
-            const int totalW  = scrW;
-            const int totalH  = scrH * 2 + gap;
+            const int gap    = 2;
+            const int scrW   = NDS_SCREEN_WIDTH;
+            const int scrH   = NDS_SCREEN_HEIGHT;
+            const int totalW = scrW;
+            const int totalH = scrH * 2 + gap;
 
             const float fbWidth   = 640.0f;
             const float efbHeight = 480.0f;
 
-            const float originX = (fbWidth  - totalW) / 2.0f;
+            const float originX = (fbWidth   - totalW) / 2.0f;
             const float originY = (efbHeight - totalH) / 2.0f;
 
             const float dsLeft   = originX;
@@ -821,8 +1049,10 @@ static void ScanWiiInputs() {
 
             if (g_cursorX >= dsLeft  && g_cursorX <= dsRight &&
                 g_cursorY >= dsTop   && g_cursorY <= dsBottom) {
-                touchX = (int16_t)(((g_cursorX - dsLeft)  / (dsRight  - dsLeft))  * 256.0f);
-                touchY = (int16_t)(((g_cursorY - dsTop)   / (dsBottom - dsTop))   * 192.0f);
+                touchX = (int16_t)(((g_cursorX - dsLeft) /
+                                    (dsRight  - dsLeft)) * 256.0f);
+                touchY = (int16_t)(((g_cursorY - dsTop)  /
+                                    (dsBottom - dsTop))  * 192.0f);
             } else {
                 isTouching = false;
             }
@@ -834,7 +1064,74 @@ static void ScanWiiInputs() {
         g_ndsTouchX   = touchX;
         g_ndsTouchY   = touchY;
         PPCIrqUnlockByMsr(st);
+
+        // MINUS while in-game: open file browser (existing behaviour kept).
+        if (pressed & WPAD_BUTTON_MINUS) {
+            if (!showFileBrowser) {
+                showFileBrowser = true;
+                UpdateFileBrowser(currentDir);
+            }
+        }
+
+        // PLUS while in-game: open settings menu directly.
+        if ((pressed & WPAD_BUTTON_PLUS)
+         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)) {
+            OpenSettingsMenu();
+        }
     }
+}
+
+// ---------------------------------------------------------------------------
+// DrawSettingsOverlay — renders the settings menu into the debug-overlay
+// texture each frame that showSettingsMenu is true.
+// Layout (8 overlay lines, each 32 chars wide):
+//   Line 0  : "Settings  [A]=Toggle [B]=Back"  (title + hint)
+//   Lines 1-5 : up to 5 entries, the selected one prefixed with "->"
+//   Line 6  : scroll indicator  e.g. "  ^^ row 4/17 vv"
+//   Line 7  : blank
+// ---------------------------------------------------------------------------
+static void DrawSettingsOverlay() {
+    // Line 0 — title
+    Wii_DebugOverlayPrint(0, "Settings  [A]=Toggle [B]=Save");
+
+    // Lines 1-5 — visible entries
+    int lineIdx = 1;
+    for (int row = settingsDisplayOffset;
+         row < s_settingsCount && lineIdx <= SETTINGS_VISIBLE;
+         row++, lineIdx++)
+    {
+        const SettingsEntry& e = s_settingsTable[row];
+
+        if (!e.value) {
+            // Section header — centred, no arrow
+            Wii_DebugOverlayPrint(lineIdx, "%-32s", e.label);
+        } else {
+            std::string val = SettingsEntryValue(e);
+            bool selected   = (row == settingsMenuIndex);
+            // Label is truncated to leave room for the value (max 10 chars).
+            // Total width = 32.  Arrow = 2, label up to 18, value up to 10,
+            // separator = 1 space → 2+18+1+10 = 31, leave 1 spare.
+            Wii_DebugOverlayPrint(lineIdx, "%s%-18s %-10s",
+                selected ? "->" : "  ",
+                e.label,
+                val.c_str());
+        }
+    }
+
+    // Fill remaining lines with blanks if the list is shorter than 5 entries.
+    while (lineIdx <= SETTINGS_VISIBLE)
+        Wii_DebugOverlayPrint(lineIdx++, " ");
+
+    // Line 6 — scroll indicator
+    Wii_DebugOverlayPrint(6,
+        "%s row %d/%d %s",
+        (settingsDisplayOffset > 0) ? "^^" : "  ",
+        settingsMenuIndex + 1,
+        s_settingsCount,
+        (settingsDisplayOffset + SETTINGS_VISIBLE < s_settingsCount) ? "vv" : "  ");
+
+    // Line 7 — blank
+    Wii_DebugOverlayPrint(7, " ");
 }
 
 int main(int /*argc*/, char** /*argv*/) {
@@ -853,7 +1150,7 @@ int main(int /*argc*/, char** /*argv*/) {
         const uint32_t* renderTop    = nullptr;
         const uint32_t* renderBottom = nullptr;
 
-        if (romLoaded && !showFileBrowser) {
+        if (romLoaded && !showFileBrowser && !showSettingsMenu) {
             PPCIrqState st  = PPCIrqLockByMsr();
             bool haveFrame  = newFrameReady;
             if (haveFrame) {
@@ -875,17 +1172,23 @@ int main(int /*argc*/, char** /*argv*/) {
             renderTop    = topScreenBuffer;
             renderBottom = bottomScreenBuffer;
         }
-        
+
         static uint32_t lastSecFrames = 0;
-        static time_t   lastSec = 0;
+        static time_t   lastSec       = 0;
         time_t now = time(nullptr);
         if (now != lastSec) {
-                perf.fps = (float)(perf.renderFrameCount - lastSecFrames);
-                lastSecFrames = perf.renderFrameCount;
-                lastSec = now;
+            perf.fps          = (float)(perf.renderFrameCount - lastSecFrames);
+            lastSecFrames     = perf.renderFrameCount;
+            lastSec           = now;
         }
 
-        if (showFileBrowser) {
+        // -------------------------------------------------------------------
+        // Overlay rendering — settings menu takes over all 8 lines when open.
+        // -------------------------------------------------------------------
+        if (showSettingsMenu) {
+            DrawSettingsOverlay();
+        }
+        else if (showFileBrowser) {
             Wii_DebugOverlayPrint(0, "Dir: %s", currentDir.c_str());
 
             int lineIndex = 1;
@@ -898,13 +1201,14 @@ int main(int /*argc*/, char** /*argv*/) {
             }
             while (lineIndex < 6)
                 Wii_DebugOverlayPrint(lineIndex++, " ");
-            Wii_DebugOverlayPrint(6, "D-Pad=Select  L/R=Page Skip  A=Load  B=Back");
+            Wii_DebugOverlayPrint(6,
+                "A=Load  B=Back  +=Settings");
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
             Wii_DebugOverlayPrint(0, " ");
             Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
-            Wii_DebugOverlayPrint(2, "HOME=Quit");
+            Wii_DebugOverlayPrint(2, "HOME=Quit  -=Browser  +=Settings");
             Wii_DebugOverlayPrint(3, " ");
             Wii_DebugOverlayPrint(4, " ");
             Wii_DebugOverlayPrint(5, " ");
@@ -912,7 +1216,8 @@ int main(int /*argc*/, char** /*argv*/) {
             Wii_DebugOverlayPrint(7, " ");
         }
 
-        bool isGba = (ndsCore && romLoaded && !showFileBrowser) ? ndsCore->gbaMode : false;
+        bool isGba = (ndsCore && romLoaded && !showFileBrowser
+                      && !showSettingsMenu) ? ndsCore->gbaMode : false;
         Wii_VideoRender(renderTop, renderBottom, isGba);
         Wii_VideoFlushAsync();
         VIDEO_WaitVSync();
