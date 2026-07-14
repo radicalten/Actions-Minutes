@@ -1,0 +1,17 @@
+gold2-backup3 is simply gold2-backup2. gold2-backup2 is v1.2 with classic control addition + the new sound from v1.3 + the speedups from unreleased v1.5 in the interpreter_lookup.cpp and core.h/cpp.
+the interpreter_lookup was speed up using .rodata align32 for cache alignment, and core.h/cpp switched the std::function and std::bind for a scheduler that uses a struct with function pointers. 
+(there was almost no speed difference in truth, perhaps a small one)
+
+Something to consider is the current sound driver in here is not the clean7-am speed optimized one. It is the one that plays only nds not gba sound.
+And as I have discovered, enabling this sound makes invalid reads causing controller input to drop in NSMB and ACWW. Disabling sound fixes the issue.
+
+However, I will need to rewrite the sound driver so it makes no invalid reads, and also can play gba sounds. 
+
+I reverted back to 1.2 because 1.3 changed the gpu2d files to change to RGB5A3 instead of RGBA8 which did not speed up, and also broke emerald gameplay, freezes on game start before birch appears.
+And 1.4 3d renderer with RGB5A3 as that broke another game's compatibility (I forget which at the moment).
+==
+
+With this one (gold2-backup3) I would like to conform other files to the core.h/cpp standard as it seems like a good way to speed things up if possible.
+Would like to fix the sound driver to play gba sounds and not make invalid reads.
+Would like toggleable settings from a config file where main calls that file instead of having it embedded in main.cpp
+Would like a total fps count toggle in settings as well.
