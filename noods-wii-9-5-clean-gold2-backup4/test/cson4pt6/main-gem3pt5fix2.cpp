@@ -1,8 +1,3 @@
-Here is the updated `main.cpp` with the `-- General --` and `-- Audio --` section headers completely removed from the settings table. 
-
-This makes the settings overlay even cleaner, and because all remaining entries are selectable settings, navigation is now direct and immediate.
-
-```cpp
 // main.cpp
 #include <stdio.h>
 #include <stdlib.h>
@@ -1217,4 +1212,3 @@ int main(int /*argc*/, char** /*argv*/) {
 
     return 0;
 }
-```
