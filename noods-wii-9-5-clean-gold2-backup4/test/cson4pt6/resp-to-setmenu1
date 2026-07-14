@@ -1267,3 +1267,429 @@ int main(int /*argc*/, char** /*argv*/) {
 | `isGba` guard updated to include `!showSettingsMenu` | Same reason — don't render GBA layout while the settings overlay owns the screen |
 | Browser hint line updated to show `+=Settings` | Informs the user of the new shortcut |
 | In-game overlay line 2 updated to show `+=Settings` | Same |
+
+==
+This works perfectly except when selecting a new game from the browser after one is selected. The original game stays frozen at 0fps on screen and does not change games.
+
+The bug is clear: when a new ROM is selected from the browser, `showFileBrowser` becomes `false` and `triggerRomLoad` becomes `true`, but the main loop's frame-swap guard now requires `!showFileBrowser && !showSettingsMenu` to show the emulator framebuffer. The emulator thread does reload the core correctly, but the front/back buffers are never swapped again because `newFrameReady` gets set while the old `frontBuffer` is still being displayed — and more importantly, the `renderTop`/`renderBottom` pointers fall through to `topScreenBuffer`/`bottomScreenBuffer` (the solid-color placeholders) any time `showFileBrowser` is true or the rom isn't loaded yet, so you see the frozen placeholder instead of the new game.
+
+The root cause is that there is no transitional state between "browser visible" and "rom running". We need a third condition: ROM load is pending/in-progress. During that window we should show the placeholder screens (which is fine) but as soon as `romLoaded` goes true and `showFileBrowser` is false, the frame swap must be allowed to proceed.
+
+The fix is small and surgical — just correct the condition that gates the frame-swap and the `renderTop` assignment in `main()`:
+
+```cpp
+// In main() game loop — replace the existing frame-swap block:
+
+        const uint32_t* renderTop    = nullptr;
+        const uint32_t* renderBottom = nullptr;
+
+        // Show the emulator framebuffer whenever a ROM is loaded and neither
+        // the file browser nor the settings menu is covering the screen.
+        // We deliberately do NOT require !triggerRomLoad here: the emulator
+        // thread clears triggerRomLoad before it sets romLoaded, so by the
+        // time romLoaded becomes true the new core is already running.
+        if (romLoaded && !showFileBrowser && !showSettingsMenu) {
+            PPCIrqState st  = PPCIrqLockByMsr();
+            bool haveFrame  = newFrameReady;
+            if (haveFrame) {
+                uint32_t* tmp = frontBuffer;
+                frontBuffer   = backBuffer;
+                backBuffer    = tmp;
+                newFrameReady = false;
+                perf.renderFrameCount++;
+            }
+            PPCIrqUnlockByMsr(st);
+
+            renderTop = frontBuffer;
+            if (ndsCore && ndsCore->gbaMode)
+                renderBottom = bottomScreenBuffer;
+            else
+                renderBottom = frontBuffer + (NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT);
+        }
+        else {
+            renderTop    = topScreenBuffer;
+            renderBottom = bottomScreenBuffer;
+        }
+```
+
+That part was already correct. The actual problem is in `ScanWiiInputs()`. When the user presses A on a file:
+
+```cpp
+showFileBrowser = false;          // ← browser closes immediately
+dirContents.clear();              // ← fine
+dirContents.shrink_to_fit();
+// triggerRomLoad = true already set
+```
+
+`showFileBrowser` becomes `false` and `romLoaded` is still `true` (from the previous game), so the main loop immediately enters the frame-swap branch and keeps showing — and swapping — the **old** game's buffers. The emulator thread hasn't had a chance to clear `romLoaded` yet. So for several frames (sometimes many, on a slow SD card) you see the old game running at full speed, then it cuts to the new one. What you're describing — "frozen at 0fps" — means the old core's `running` flag is being left in a bad state during the teardown.
+
+The real fix is to clear `romLoaded` on the main thread at the same time we set `triggerRomLoad`, so the placeholder screens show during the load instead of the stale framebuffer:
+
+```cpp
+// In ScanWiiInputs(), inside the file browser A-press handler,
+// replace the existing block:
+
+                } else {
+                    std::string romPath = currentDir + selected.name;
+
+                    PPCIrqState st = PPCIrqLockByMsr();
+                    romToLoadPath  = romPath;
+                    romLoaded      = false;   // ← ADD THIS: show placeholder
+                                              //   immediately, not the old game
+                    triggerRomLoad = true;
+                    PPCIrqUnlockByMsr(st);
+
+                    showFileBrowser = false;
+
+                    dirContents.clear();
+                    dirContents.shrink_to_fit();
+                }
+```
+
+Setting `romLoaded = false` inside the same IRQ-locked section as `triggerRomLoad = true` ensures the main thread sees both atomically. From that point:
+
+1. Main loop: `romLoaded` is `false` → shows placeholder screens, no frame swap attempted.
+2. Emulator thread: sees `triggerRomLoad`, tears down old core, constructs new one, sets `romLoaded = true`.
+3. Main loop: `romLoaded` becomes `true`, `showFileBrowser` is already `false` → frame swap resumes with the new game's buffers.
+
+The "0fps frozen" symptom was caused by the old core being deleted out from under the still-running frame-swap, which could leave `frontBuffer` pointing at memory the new core hadn't written yet, or in a torn state mid-swap. This one-line addition closes that window entirely.
+
+
+
+Here is the complete corrected `ScanWiiInputs()` function with the fix applied:
+
+```cpp
+static void ScanWiiInputs() {
+    WPAD_ScanPads();
+    PAD_ScanPads();
+
+    u32 held      = WPAD_ButtonsHeld(0);
+    u32 pressed   = WPAD_ButtonsDown(0);
+    u32 gcHeld    = PAD_ButtonsHeld(0);
+    u32 gcPressed = PAD_ButtonsDown(0);
+
+    WPADData* wdata      = WPAD_Data(0);
+    bool      hasNunchuk = wdata && (wdata->exp.type == WPAD_EXP_NUNCHUK);
+    bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
+    u32       heldExt    = hasNunchuk ? held : 0;
+
+    // HOME always quits regardless of menu state.
+    if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
+        runEmulatorThread = false;
+        PPCCompilerBarrier();
+        KThreadJoin(&emulatorThread);
+
+        ShutdownAudio();
+
+        delete ndsCore;
+        ndsCore = nullptr;
+
+        exit(0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings menu — takes priority over the file browser.
+    // -----------------------------------------------------------------------
+    if (showSettingsMenu) {
+        HandleSettingsInput(pressed, held, gcPressed, gcHeld, wdata, hasClassic);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // File browser
+    // -----------------------------------------------------------------------
+    if (showFileBrowser) {
+        if (!dirContents.empty()) {
+            static bool classicLStickUpLast   = false;
+            static bool classicLStickDownLast = false;
+            bool classicLStickUp   = false;
+            bool classicLStickDown = false;
+
+            if (hasClassic && wdata) {
+                float ly = wdata->exp.classic.ljs.mag *
+                           cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+                if (wdata->exp.classic.ljs.mag > 0.5f) {
+                    if (ly >  0.5f) classicLStickUp   = true;
+                    if (ly < -0.5f) classicLStickDown = true;
+                }
+            }
+
+            bool upHeld   = (held & WPAD_BUTTON_UP)
+                          || (held & WPAD_CLASSIC_BUTTON_UP)
+                          || (gcHeld & PAD_BUTTON_UP)
+                          || classicLStickUp;
+            bool downHeld = (held & WPAD_BUTTON_DOWN)
+                          || (held & WPAD_CLASSIC_BUTTON_DOWN)
+                          || (gcHeld & PAD_BUTTON_DOWN)
+                          || classicLStickDown;
+            bool upDown   = (pressed & WPAD_BUTTON_UP)
+                          || (pressed & WPAD_CLASSIC_BUTTON_UP)
+                          || (gcPressed & PAD_BUTTON_UP)
+                          || (classicLStickUp && !classicLStickUpLast);
+            bool downDown = (pressed & WPAD_BUTTON_DOWN)
+                          || (pressed & WPAD_CLASSIC_BUTTON_DOWN)
+                          || (gcPressed & PAD_BUTTON_DOWN)
+                          || (classicLStickDown && !classicLStickDownLast);
+
+            classicLStickUpLast   = classicLStickUp;
+            classicLStickDownLast = classicLStickDown;
+
+            bool performUp   = false;
+            bool performDown = false;
+
+            if (upDown || downDown) {
+                scrollHoldTimer = 0;
+                if (upDown)   performUp   = true;
+                if (downDown) performDown = true;
+            } else if (upHeld || downHeld) {
+                scrollHoldTimer++;
+                if (scrollHoldTimer >= SCROLL_DELAY_INITIAL) {
+                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) %
+                        SCROLL_DELAY_REPEATED == 0) {
+                        if (upHeld)   performUp   = true;
+                        if (downHeld) performDown = true;
+                    }
+                }
+            } else {
+                scrollHoldTimer = 0;
+            }
+
+            if (performDown) {
+                selectedItemIndex++;
+                if (selectedItemIndex >= (int)dirContents.size()) {
+                    selectedItemIndex = 0;
+                    displayOffset     = 0;
+                }
+                if (selectedItemIndex >= displayOffset + 5)
+                    displayOffset = selectedItemIndex - 4;
+            }
+            if (performUp) {
+                selectedItemIndex--;
+                if (selectedItemIndex < 0) {
+                    selectedItemIndex = (int)dirContents.size() - 1;
+                    displayOffset     = std::max(0, selectedItemIndex - 4);
+                }
+                if (selectedItemIndex < displayOffset)
+                    displayOffset = selectedItemIndex;
+            }
+
+            if ((pressed & WPAD_BUTTON_LEFT)
+             || (pressed & WPAD_CLASSIC_BUTTON_LEFT)
+             || (gcPressed & PAD_BUTTON_LEFT)) {
+                selectedItemIndex -= 5;
+                if (selectedItemIndex < 0) selectedItemIndex = 0;
+                displayOffset = std::max(0, selectedItemIndex - 2);
+            }
+            if ((pressed & WPAD_BUTTON_RIGHT)
+             || (pressed & WPAD_CLASSIC_BUTTON_RIGHT)
+             || (gcPressed & PAD_BUTTON_RIGHT)) {
+                selectedItemIndex += 5;
+                if (selectedItemIndex >= (int)dirContents.size())
+                    selectedItemIndex = (int)dirContents.size() - 1;
+                displayOffset = std::max(0,
+                    std::min((int)dirContents.size() - 5,
+                             selectedItemIndex - 2));
+            }
+
+            if ((pressed & WPAD_BUTTON_A)
+             || (pressed & WPAD_CLASSIC_BUTTON_A)
+             || (gcPressed & PAD_BUTTON_A)) {
+                BrowserItem selected = dirContents[selectedItemIndex];
+                if (selected.isDirectory) {
+                    if (selected.name == "..") {
+                        size_t slash = currentDir.find_last_of('/',
+                            currentDir.length() - 2);
+                        if (slash != std::string::npos)
+                            currentDir = currentDir.substr(0, slash + 1);
+                    } else {
+                        currentDir += selected.name + "/";
+                    }
+                    UpdateFileBrowser(currentDir);
+                } else {
+                    std::string romPath = currentDir + selected.name;
+
+                    PPCIrqState st = PPCIrqLockByMsr();
+                    romToLoadPath  = romPath;
+                    romLoaded      = false;  // show placeholder immediately,
+                                             // not the stale old-game buffer
+                    triggerRomLoad = true;
+                    PPCIrqUnlockByMsr(st);
+
+                    showFileBrowser = false;
+
+                    dirContents.clear();
+                    dirContents.shrink_to_fit();
+                }
+            }
+        }
+
+        // B: go up a directory, or close browser if ROM is running.
+        if ((pressed & WPAD_BUTTON_B)
+         || (pressed & WPAD_CLASSIC_BUTTON_B)
+         || (gcPressed & PAD_BUTTON_B)) {
+            if (currentDir != "sd:/" && currentDir != "sd://"
+             && currentDir != "sd:") {
+                size_t slash = currentDir.find_last_of('/',
+                    currentDir.length() - 2);
+                if (slash != std::string::npos) {
+                    currentDir = currentDir.substr(0, slash + 1);
+                    UpdateFileBrowser(currentDir);
+                }
+            } else if (romLoaded) {
+                showFileBrowser = false;
+            }
+        }
+
+        // PLUS / START: open settings menu from the file browser.
+        if ((pressed & WPAD_BUTTON_PLUS)
+         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)
+         || (gcPressed & PAD_BUTTON_START)) {
+            OpenSettingsMenu();
+        }
+    }
+    // -----------------------------------------------------------------------
+    // In-game (emulation running)
+    // -----------------------------------------------------------------------
+    else {
+        uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk, hasClassic);
+
+        if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
+        if (gcHeld & PAD_BUTTON_B)     ndsButtons |= (1 << NDS_KEY_B);
+        if (gcHeld & PAD_BUTTON_X)     ndsButtons |= (1 << NDS_KEY_X);
+        if (gcHeld & PAD_BUTTON_Y)     ndsButtons |= (1 << NDS_KEY_Y);
+        if (gcHeld & PAD_BUTTON_LEFT)  ndsButtons |= (1 << NDS_KEY_LEFT);
+        if (gcHeld & PAD_BUTTON_RIGHT) ndsButtons |= (1 << NDS_KEY_RIGHT);
+        if (gcHeld & PAD_BUTTON_UP)    ndsButtons |= (1 << NDS_KEY_UP);
+        if (gcHeld & PAD_BUTTON_DOWN)  ndsButtons |= (1 << NDS_KEY_DOWN);
+        if (gcHeld & PAD_TRIGGER_R)    ndsButtons |= (1 << NDS_KEY_R);
+        if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
+        if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
+
+        if (hasClassic && wdata) {
+            float lx = wdata->exp.classic.ljs.mag *
+                       sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            float ly = wdata->exp.classic.ljs.mag *
+                       cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.ljs.mag > 0.5f) {
+                if (lx >  0.5f) ndsButtons |= (1 << NDS_KEY_RIGHT);
+                if (lx < -0.5f) ndsButtons |= (1 << NDS_KEY_LEFT);
+                if (ly >  0.5f) ndsButtons |= (1 << NDS_KEY_UP);
+                if (ly < -0.5f) ndsButtons |= (1 << NDS_KEY_DOWN);
+            }
+        }
+
+        bool isTouching = false;
+        g_cursorShow = false;
+
+        if (wdata && wdata->ir.valid) {
+            g_cursorX    = wdata->ir.x;
+            g_cursorY    = wdata->ir.y;
+            g_cursorShow = true;
+            if (held & WPAD_BUTTON_A)
+                isTouching = true;
+        }
+
+        s8 cstickX = PAD_SubStickX(0);
+        s8 cstickY = PAD_SubStickY(0);
+        if (abs(cstickX) > 15 || abs(cstickY) > 15) {
+            g_cursorX   += (cstickX / 15.0f) * 2.5f;
+            g_cursorY   -= (cstickY / 15.0f) * 2.5f;
+            g_cursorShow = true;
+
+            if (g_cursorX < 0.0f)   g_cursorX = 0.0f;
+            if (g_cursorX > 640.0f) g_cursorX = 640.0f;
+            if (g_cursorY < 0.0f)   g_cursorY = 0.0f;
+            if (g_cursorY > 480.0f) g_cursorY = 480.0f;
+        }
+
+        if (hasClassic && wdata) {
+            float rx = wdata->exp.classic.rjs.mag *
+                       sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            float ry = wdata->exp.classic.rjs.mag *
+                       cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.rjs.mag > 0.15f) {
+                g_cursorX   += rx * 4.0f;
+                g_cursorY   -= ry * 4.0f;
+                g_cursorShow = true;
+
+                if (g_cursorX < 0.0f)   g_cursorX = 0.0f;
+                if (g_cursorX > 640.0f) g_cursorX = 640.0f;
+                if (g_cursorY < 0.0f)   g_cursorY = 0.0f;
+                if (g_cursorY > 480.0f) g_cursorY = 480.0f;
+            }
+        }
+
+        if (gcHeld & PAD_TRIGGER_Z) {
+            isTouching   = true;
+            g_cursorShow = true;
+        }
+
+        if (hasClassic && (held & (WPAD_CLASSIC_BUTTON_ZL | WPAD_CLASSIC_BUTTON_ZR))) {
+            isTouching   = true;
+            g_cursorShow = true;
+        }
+
+        int16_t touchX = 0;
+        int16_t touchY = 0;
+
+        if (g_cursorShow) {
+            const int gap    = 2;
+            const int scrW   = NDS_SCREEN_WIDTH;
+            const int scrH   = NDS_SCREEN_HEIGHT;
+            const int totalW = scrW;
+            const int totalH = scrH * 2 + gap;
+
+            const float fbWidth   = 640.0f;
+            const float efbHeight = 480.0f;
+
+            const float originX = (fbWidth   - totalW) / 2.0f;
+            const float originY = (efbHeight - totalH) / 2.0f;
+
+            const float dsLeft   = originX;
+            const float dsRight  = originX + scrW;
+            const float dsTop    = originY + scrH + gap;
+            const float dsBottom = originY + scrH + gap + scrH;
+
+            if (g_cursorX >= dsLeft  && g_cursorX <= dsRight &&
+                g_cursorY >= dsTop   && g_cursorY <= dsBottom) {
+                touchX = (int16_t)(((g_cursorX - dsLeft) /
+                                    (dsRight  - dsLeft)) * 256.0f);
+                touchY = (int16_t)(((g_cursorY - dsTop)  /
+                                    (dsBottom - dsTop))  * 192.0f);
+            } else {
+                isTouching = false;
+            }
+        }
+
+        PPCIrqState st = PPCIrqLockByMsr();
+        g_ndsButtons  = ndsButtons;
+        g_ndsTouching = isTouching;
+        g_ndsTouchX   = touchX;
+        g_ndsTouchY   = touchY;
+        PPCIrqUnlockByMsr(st);
+
+        // MINUS while in-game: open file browser.
+        if (pressed & WPAD_BUTTON_MINUS) {
+            if (!showFileBrowser) {
+                showFileBrowser = true;
+                UpdateFileBrowser(currentDir);
+            }
+        }
+
+        // PLUS while in-game: open settings menu directly.
+        if ((pressed & WPAD_BUTTON_PLUS)
+         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)) {
+            OpenSettingsMenu();
+        }
+    }
+}
+```
+
+The only line added relative to the previous version is:
+
+```cpp
+romLoaded = false;  // show placeholder immediately,
+                    // not the stale old-game buffer
+```
+
+inside the IRQ-locked section alongside `triggerRomLoad = true`. Everything else is identical to what was already working.
