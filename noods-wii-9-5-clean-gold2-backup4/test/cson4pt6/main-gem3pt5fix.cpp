@@ -773,6 +773,11 @@ static void ScanWiiInputs() {
     bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
     u32       heldExt    = hasNunchuk ? held : 0;
 
+    // Check if the physical "L" button is held across any of the controllers
+    bool lHeld = (gcHeld & PAD_TRIGGER_L)
+              || (hasClassic && (held & (WPAD_CLASSIC_BUTTON_FULL_L | WPAD_CLASSIC_BUTTON_ZL)))
+              || (hasNunchuk && (heldExt & WPAD_NUNCHUK_BUTTON_Z));
+
     // HOME always quits regardless of menu state.
     if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
         runEmulatorThread = false;
@@ -937,10 +942,10 @@ static void ScanWiiInputs() {
             }
         }
 
-        // PLUS / START: open settings menu from the file browser.
-        if ((pressed & WPAD_BUTTON_PLUS)
-         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)
-         || (gcPressed & PAD_BUTTON_START)) {
+        // PLUS / START with L held: open settings menu from the file browser.
+        if (lHeld && ((pressed & WPAD_BUTTON_PLUS)
+                   || (pressed & WPAD_CLASSIC_BUTTON_PLUS)
+                   || (gcPressed & PAD_BUTTON_START))) {
             OpenSettingsMenu();
         }
     }
@@ -1065,17 +1070,10 @@ static void ScanWiiInputs() {
         g_ndsTouchY   = touchY;
         PPCIrqUnlockByMsr(st);
 
-        // MINUS while in-game: open file browser (existing behaviour kept).
-        if (pressed & WPAD_BUTTON_MINUS) {
-            if (!showFileBrowser) {
-                showFileBrowser = true;
-                UpdateFileBrowser(currentDir);
-            }
-        }
-
-        // PLUS while in-game: open settings menu directly.
-        if ((pressed & WPAD_BUTTON_PLUS)
-         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)) {
+        // PLUS / START with L held while in-game: open settings menu directly.
+        if (lHeld && ((pressed & WPAD_BUTTON_PLUS)
+                   || (pressed & WPAD_CLASSIC_BUTTON_PLUS)
+                   || (gcPressed & PAD_BUTTON_START))) {
             OpenSettingsMenu();
         }
     }
@@ -1202,13 +1200,13 @@ int main(int /*argc*/, char** /*argv*/) {
             while (lineIndex < 6)
                 Wii_DebugOverlayPrint(lineIndex++, " ");
             Wii_DebugOverlayPrint(6,
-                "A=Load  B=Back  +=Settings");
+                "A=Load  B=Back  L++=Settings");
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
             Wii_DebugOverlayPrint(0, " ");
             Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
-            Wii_DebugOverlayPrint(2, "HOME=Quit  -=Browser  +=Settings");
+            Wii_DebugOverlayPrint(2, "HOME=Quit  L++=Settings");
             Wii_DebugOverlayPrint(3, " ");
             Wii_DebugOverlayPrint(4, " ");
             Wii_DebugOverlayPrint(5, " ");
