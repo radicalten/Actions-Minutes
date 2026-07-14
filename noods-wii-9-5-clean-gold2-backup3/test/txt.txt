@@ -26,3 +26,14 @@ core.h/cpp
 main.cpp
 wii_video.h
 spu.h/cpp
+
+===
+gba-sound-fix1 worked perfectly when set to fpslimit=1 it waits and locks cpu until the sound is ready then it plays. works for both gba and nds!.
+On fpslimit=0 it plays silence if nothing is ready, then plays partial sounds if something is, (like what it used to be when i had occasional sounds such as in mkds)
+Still get the invalid read error in nsmb for whatever reason. 
+fpslimit2 locks up the game for 1ms in a busy wait to give more spu time.
+
+Overall a good change, but I want fpslimit=1 behavior moved up to 2, and fpslimit=1 to just play whatever is available instead of silence. 
+
+will ask:
+Can you modify fpslimit=2 to have the function on sound that fpslimit=1 has right now? everything is working perfectly so far. However, I would like fpslimit1 to simply play whatever sound is in the buffer at the time. fpslimit=0 can remain the same where it stays silent unless it is full.
