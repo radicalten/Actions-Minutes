@@ -1,0 +1,2 @@
+Goals:
+Implement settings configuration file in main.cpp
