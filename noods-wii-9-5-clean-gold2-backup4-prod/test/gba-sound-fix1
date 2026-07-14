@@ -1,0 +1,2546 @@
+I have .cpp files for a DS emulator to run on Wii. Currently the core emulator has updated its scheduling mechanism, but not every file is adapted to it yet. 
+Currently my main.cpp and wii_audio.h files are making invalid reads with the sound code. And sound only works for nds games, but it should work for gba as well. 
+I have attached the spu.h/cpp files as well.
+
+//core.h
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/tick.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#include "action_replay.h"
+#include "cartridge.h"
+#include "cp15.h"
+#include "defines.h"
+#include "div_sqrt.h"
+#include "dldi.h"
+#include "dma.h"
+#include "gpu.h"
+#include "gpu_2d.h"
+#include "gpu_3d.h"
+#include "gpu_3d_renderer.h"
+#include "hle_arm7.h"
+#include "hle_bios.h"
+#include "input.h"
+#include "interpreter.h"
+#include "ipc.h"
+#include "memory.h"
+#include "rtc.h"
+#include "save_states.h"
+#include "settings.h"
+#include "spi.h"
+#include "spu.h"
+#include "timers.h"
+#include "wifi.h"
+
+enum CoreError {
+    ERROR_BIOS,
+    ERROR_FIRM,
+    ERROR_ROM
+};
+
+enum SchedTask {
+    UPDATE_RUN,
+    RESET_CYCLES,
+    CART9_WORD_READY,
+    CART7_WORD_READY,
+    DMA9_TRANSFER0,
+    DMA9_TRANSFER1,
+    DMA9_TRANSFER2,
+    DMA9_TRANSFER3,
+    DMA7_TRANSFER0,
+    DMA7_TRANSFER1,
+    DMA7_TRANSFER2,
+    DMA7_TRANSFER3,
+    NDS_SCANLINE256,
+    NDS_SCANLINE355,
+    GBA_SCANLINE240,
+    GBA_SCANLINE308,
+    GPU3D_COMMANDS,
+    ARM9_INTERRUPT,
+    ARM7_INTERRUPT,
+    NDS_SPU_SAMPLE,
+    GBA_SPU_SAMPLE,
+    TIMER9_OVERFLOW0,
+    TIMER9_OVERFLOW1,
+    TIMER9_OVERFLOW2,
+    TIMER9_OVERFLOW3,
+    TIMER7_OVERFLOW0,
+    TIMER7_OVERFLOW1,
+    TIMER7_OVERFLOW2,
+    TIMER7_OVERFLOW3,
+    WIFI_COUNT_MS,
+    WIFI_TRANS_REPLY,
+    WIFI_TRANS_ACK,
+    MAX_TASKS
+};
+
+// ---------------------------------------------------------------------------
+// SchedCallback — a zero-overhead two-word closure.
+//
+//   fn  : plain function pointer, signature void(void*, int)
+//   obj : opaque pointer forwarded as the first argument (the "this")
+//   arg : small integer second argument (channel/index, 0 when unused)
+//
+// For tasks that carry no integer argument (arg == 0 always) the compiler
+// will constant-fold the second parameter away after inlining the trampoline,
+// leaving a single indirect branch — identical cost to a raw method pointer
+// on PowerPC where member-function pointers are two words anyway.
+// ---------------------------------------------------------------------------
+struct SchedCallback {
+    void (*fn)(void* obj, int arg);  // trampoline function
+    void*  obj;                      // receiver object
+    int    arg;                      // channel / index (0 if unused)
+
+    // Default-construct to a safe no-op so the array is always callable.
+    SchedCallback() : fn(nullptr), obj(nullptr), arg(0) {}
+
+    SchedCallback(void (*f)(void*, int), void* o, int a = 0)
+        : fn(f), obj(o), arg(a) {}
+
+    // Invoke — inlined at every call site, single indirect branch on PPC.
+    inline void operator()() const {
+        fn(obj, arg);
+    }
+};
+
+struct SchedEvent {
+    SchedTask task;
+    uint32_t  cycles;
+
+    SchedEvent(SchedTask task, uint32_t cycles): task(task), cycles(cycles) {}
+    bool operator<(const SchedEvent& e) const { return cycles < e.cycles; }
+};
+
+class Core {
+public:
+    void* operator new  (size_t size);
+    void  operator delete  (void* p) noexcept;
+    void* operator new[](size_t size);
+    void  operator delete[](void* p) noexcept;
+
+    int  id      = 0;
+    int  fps     = 0;
+    bool arm7Hle = false;
+    bool dsiMode = false;
+    bool gbaMode = false;
+
+    ActionReplay    actionReplay;
+    CartridgeGba    cartridgeGba;
+    CartridgeNds    cartridgeNds;
+    Cp15            cp15;
+    DivSqrt         divSqrt;
+    Dldi            dldi;
+    Dma             dma[2];
+    Gpu             gpu;
+    Gpu2D           gpu2D[2];
+    Gpu3D           gpu3D;
+    Gpu3DRenderer   gpu3DRenderer;
+    HleArm7         hleArm7;
+    HleBios         hleBios[3];
+    Input           input;
+    Interpreter     interpreter[2];
+    Ipc             ipc;
+    Memory          memory;
+    Rtc             rtc;
+    SaveStates      saveStates;
+    Spi             spi;
+    Spu             spu;
+    Timers          timers[2];
+    Wifi            wifi;
+
+    volatile uint8_t running;
+
+    std::vector<SchedEvent> events;
+
+    // Flat array of two-word callbacks — fits in two cache lines (32 tasks).
+    // Each entry is 12 bytes on 32-bit PPC: fn(4) + obj(4) + arg(4).
+    SchedCallback tasks[MAX_TASKS];
+
+    uint32_t globalCycles = 0;
+
+    Core(std::string ndsRom = "", std::string gbaRom = "", int id = 0,
+         int ndsRomFd  = -1, int gbaRomFd  = -1,
+         int ndsSaveFd = -1, int gbaSaveFd = -1,
+         int ndsStateFd = -1, int gbaStateFd = -1,
+         int ndsCheatFd = -1);
+
+    void saveState(FILE* file);
+    void loadState(FILE* file);
+
+    // Hot path: single load + indirect branch, no virtual dispatch.
+    inline void runCore() { (*runFunc)(*this); }
+
+    void schedule(SchedTask task, uint32_t cycles);
+    void enterGbaMode();
+    void endFrame();
+
+private:
+    bool realGbaBios;
+    void (*runFunc)(Core&) = &Interpreter::runCoreNds;
+
+    uint64_t lastFpsTimeTicks = 0;
+    int      fpsCount         = 0;
+
+    void updateRun();
+    void resetCycles();
+
+    // -----------------------------------------------------------------------
+    // Static trampoline shims.
+    //
+    // Each shim is a plain function that recovers the typed pointer from the
+    // opaque void* and calls the real member function.  Because they are
+    // static and their bodies are trivial the compiler inlines them at the
+    // SchedCallback::operator() call site, so the generated code is:
+    //
+    //   lwz   r3, obj(callback)      ; load receiver
+    //   lwz   r4, arg(callback)      ; load channel (often optimised away)
+    //   lwz   r12, fn(callback)      ; load trampoline address
+    //   mtctr r12
+    //   bctrl                        ; single indirect branch
+    //
+    // That is the minimum possible cost for a runtime-dispatched call on PPC.
+    // -----------------------------------------------------------------------
+
+    // Core self-tasks (arg ignored)
+    static void shim_updateRun   (void* o, int) { static_cast<Core*>(o)->updateRun();    }
+    static void shim_resetCycles (void* o, int) { static_cast<Core*>(o)->resetCycles();  }
+
+    // CartridgeNds::wordReady(int cpu)  — arg = cpu index
+    static void shim_cartWordReady(void* o, int a) {
+        static_cast<CartridgeNds*>(o)->wordReady(a);
+    }
+
+    // Dma::transfer(int channel)  — arg = channel
+    static void shim_dmaTransfer(void* o, int a) {
+        static_cast<Dma*>(o)->transfer(a);
+    }
+
+    // Gpu scanlines (arg ignored)
+    static void shim_gpuScanline256  (void* o, int) { static_cast<Gpu*>(o)->scanline256();     }
+    static void shim_gpuScanline355  (void* o, int) { static_cast<Gpu*>(o)->scanline355();     }
+    static void shim_gpuGbaScanline240(void* o, int) { static_cast<Gpu*>(o)->gbaScanline240(); }
+    static void shim_gpuGbaScanline308(void* o, int) { static_cast<Gpu*>(o)->gbaScanline308(); }
+
+    // Gpu3D (arg ignored)
+    static void shim_gpu3dCommands(void* o, int) { static_cast<Gpu3D*>(o)->runCommands(); }
+
+    // Interpreter::interrupt (arg ignored)
+    static void shim_interpreterInterrupt(void* o, int) {
+        static_cast<Interpreter*>(o)->interrupt();
+    }
+
+    // Spu (arg ignored)
+    static void shim_spuSample   (void* o, int) { static_cast<Spu*>(o)->runSample();    }
+    static void shim_spuGbaSample(void* o, int) { static_cast<Spu*>(o)->runGbaSample(); }
+
+    // Timers::overflow(int timer)  — arg = timer index
+    static void shim_timersOverflow(void* o, int a) {
+        static_cast<Timers*>(o)->overflow(a);
+    }
+
+    // Wifi (arg ignored / arg = cmd)
+    static void shim_wifiCountMs    (void* o, int)  { static_cast<Wifi*>(o)->countMs();          }
+    static void shim_wifiTransmit(void* o, int a) {
+    static_cast<Wifi*>(o)->transmitPacket(static_cast<PacketType>(a));
+}
+};
+
+//core.cpp
+#include <algorithm>
+#include <cstring>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#include "core.h"
+
+extern void* Noods_MEM2_Alloc(size_t size);
+extern void  Noods_MEM2_Free(void* ptr);
+
+// ---------------------------------------------------------------------------
+// Custom allocators — route to MEM2
+// ---------------------------------------------------------------------------
+void* Core::operator new(size_t size) {
+    void* p = Noods_MEM2_Alloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void Core::operator delete(void* p) noexcept { Noods_MEM2_Free(p); }
+
+void* Core::operator new[](size_t size) {
+    void* p = Noods_MEM2_Alloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+Core::Core(std::string ndsRom, std::string gbaRom, int id,
+           int ndsRomFd,  int gbaRomFd,
+           int ndsSaveFd, int gbaSaveFd,
+           int ndsStateFd, int gbaStateFd, int ndsCheatFd)
+    : id(id),
+      actionReplay(this), cartridgeGba(this), cartridgeNds(this),
+      cp15(this), divSqrt(this), dldi(this),
+      dma { Dma(this, 0), Dma(this, 1) },
+      gpu(this),
+      gpu2D { Gpu2D(this, 0), Gpu2D(this, 1) },
+      gpu3D(this), gpu3DRenderer(this),
+      hleArm7(this),
+      hleBios { HleBios(this, 0, HleBios::swiTable9),
+                HleBios(this, 1, HleBios::swiTable7),
+                HleBios(this, 1, HleBios::swiTableGba) },
+      input(this),
+      interpreter { Interpreter(this, 0), Interpreter(this, 1) },
+      ipc(this), memory(this), rtc(this), saveStates(this),
+      spi(this), spu(this),
+      timers { Timers(this, 0), Timers(this, 1) },
+      wifi(this),
+      running(0),
+      lastFpsTimeTicks(0),
+      fpsCount(0)
+{
+    // ------------------------------------------------------------------
+    // Bind task table.
+    //
+    // Layout: SchedCallback(trampoline, receiver_ptr, int_arg)
+    // Tasks that take no integer argument pass 0; the compiler will
+    // constant-fold the unused parameter in release builds.
+    // ------------------------------------------------------------------
+
+    // Core self-tasks
+    tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
+    tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
+
+    // Cartridge — arg selects ARM9 (0) or ARM7 (1)
+    tasks[CART9_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 0);
+    tasks[CART7_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 1);
+
+    // DMA — ARM9 channels 0-3
+    tasks[DMA9_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[0], 0);
+    tasks[DMA9_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[0], 1);
+    tasks[DMA9_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[0], 2);
+    tasks[DMA9_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[0], 3);
+
+    // DMA — ARM7 channels 0-3
+    tasks[DMA7_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[1], 0);
+    tasks[DMA7_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[1], 1);
+    tasks[DMA7_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[1], 2);
+    tasks[DMA7_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[1], 3);
+
+    // GPU scanlines
+    tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,   &gpu);
+    tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,   &gpu);
+    tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
+    tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
+
+    // GPU 3D command FIFO
+    tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
+
+    // CPU interrupts
+    tasks[ARM9_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[0]);
+    tasks[ARM7_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[1]);
+
+    // SPU
+    tasks[NDS_SPU_SAMPLE]   = SchedCallback(shim_spuSample,    &spu);
+    tasks[GBA_SPU_SAMPLE]   = SchedCallback(shim_spuGbaSample, &spu);
+
+    // Timers — ARM9 channels 0-3
+    tasks[TIMER9_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[0], 0);
+    tasks[TIMER9_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[0], 1);
+    tasks[TIMER9_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[0], 2);
+    tasks[TIMER9_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[0], 3);
+
+    // Timers — ARM7 channels 0-3
+    tasks[TIMER7_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[1], 0);
+    tasks[TIMER7_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[1], 1);
+    tasks[TIMER7_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[1], 2);
+    tasks[TIMER7_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[1], 3);
+
+    // WiFi — CMD_REPLY / CMD_ACK are integer constants from wifi.h
+    tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs, &wifi);
+    tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
+    tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
+
+    // ------------------------------------------------------------------
+    // BIOS / firmware loading
+    // ------------------------------------------------------------------
+    bool required = !Settings::directBoot ||
+                    (ndsRom == "" && gbaRom == "" &&
+                     ndsRomFd == -1 && gbaRomFd == -1);
+
+    if (!memory.loadBios9() && required) throw ERROR_BIOS;
+    if (!memory.loadBios7() && required) throw ERROR_BIOS;
+    if (!spi.loadFirmware()  && required) throw ERROR_FIRM;
+    realGbaBios = memory.loadGbaBios();
+
+    // ------------------------------------------------------------------
+    // Initial scheduling
+    // ------------------------------------------------------------------
+    schedule(RESET_CYCLES,    0x7FFFFFFF);
+    schedule(NDS_SCANLINE256, 256 * 6);
+    schedule(NDS_SCANLINE355, 355 * 6);
+    schedule(NDS_SPU_SAMPLE,  512 * 2);
+
+    dsiMode = Settings::dsiMode;
+    updateRun();
+
+    memory.updateMap9(0x00000000, 0xFFFFFFFF);
+    memory.updateMap7(0x00000000, 0xFFFFFFFF);
+    interpreter[0].init();
+    interpreter[1].init();
+
+    // ------------------------------------------------------------------
+    // GBA ROM
+    // ------------------------------------------------------------------
+    if (gbaRom != "" || gbaRomFd != -1) {
+        if (!cartridgeGba.setRom(gbaRom, gbaRomFd, gbaSaveFd, gbaStateFd, -1))
+            throw ERROR_ROM;
+
+        if (Settings::directBoot && ndsRom == "" && ndsRomFd == -1) {
+            memory.write<uint16_t>(0, 0x4000304, 0x8003);
+            enterGbaMode();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // NDS ROM
+    // ------------------------------------------------------------------
+    if (ndsRom != "" || ndsRomFd != -1) {
+        if (!cartridgeNds.setRom(ndsRom, ndsRomFd, ndsSaveFd, ndsStateFd, ndsCheatFd))
+            throw ERROR_ROM;
+
+        actionReplay.loadCheats();
+
+        if (Settings::directBoot) {
+            cp15.write(1, 0, 0, 0x0005707D);
+            cp15.write(9, 1, 0, 0x0300000A);
+            cp15.write(9, 1, 1, 0x00000020);
+            memory.write<uint8_t> (0,  0x4000247, 0x03);
+            memory.write<uint8_t> (0,  0x4000300, 0x01);
+            memory.write<uint8_t> (1,  0x4000300, 0x01);
+            memory.write<uint16_t>(0,  0x4000304, 0x0001);
+            memory.write<uint16_t>(1,  0x4000504, 0x0200);
+            memory.write<uint32_t>(0,  0x27FF800, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FF804, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FF850, 0x5835);
+            memory.write<uint16_t>(0,  0x27FF880, 0x0007);
+            memory.write<uint16_t>(0,  0x27FF884, 0x0006);
+            memory.write<uint32_t>(0,  0x27FFC00, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FFC04, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FFC10, 0x5835);
+            memory.write<uint16_t>(0,  0x27FFC40, 0x0001);
+            cartridgeNds.directBoot();
+            interpreter[0].directBoot();
+            interpreter[1].directBoot();
+            spi.directBoot();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // HLE ARM7
+    // ------------------------------------------------------------------
+    if (!gbaMode && Settings::arm7Hle) {
+        arm7Hle = true;
+        hleArm7.init();
+    }
+
+    lastFpsTimeTicks = PPCGetTickCount();
+
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 1;
+    PPCIrqUnlockByMsr(st);
+}
+
+// ---------------------------------------------------------------------------
+// State save / load
+// ---------------------------------------------------------------------------
+void Core::saveState(FILE* file) {
+    fwrite(&arm7Hle,      sizeof(arm7Hle),      1, file);
+    fwrite(&dsiMode,      sizeof(dsiMode),      1, file);
+    fwrite(&gbaMode,      sizeof(gbaMode),      1, file);
+    fwrite(&globalCycles, sizeof(globalCycles), 1, file);
+
+    uint32_t count = static_cast<uint32_t>(events.size());
+    fwrite(&count, sizeof(count), 1, file);
+    for (uint32_t i = 0; i < count; i++)
+        fwrite(&events[i], sizeof(events[i]), 1, file);
+}
+
+void Core::loadState(FILE* file) {
+    fread(&arm7Hle,      sizeof(arm7Hle),      1, file);
+    fread(&dsiMode,      sizeof(dsiMode),      1, file);
+    fread(&gbaMode,      sizeof(gbaMode),      1, file);
+    fread(&globalCycles, sizeof(globalCycles), 1, file);
+
+    events.clear();
+    uint32_t count = 0;
+    fread(&count, sizeof(count), 1, file);
+    SchedEvent event(MAX_TASKS, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        fread(&event, sizeof(event), 1, file);
+        events.push_back(event);
+    }
+
+    updateRun();
+}
+
+// ---------------------------------------------------------------------------
+// updateRun — select the tightest interpreter loop for the current state
+// ---------------------------------------------------------------------------
+void Core::updateRun() {
+    if (interpreter[0].halted && interpreter[1].halted)
+        runFunc = &Interpreter::runCoreNone;
+    else if (gbaMode)
+        runFunc = &Interpreter::runCoreSingle<true, 0>;
+    else if (dsiMode)
+        runFunc = &Interpreter::runCoreDsi;
+    else if (!interpreter[0].halted && !interpreter[1].halted)
+        runFunc = &Interpreter::runCoreNds;
+    else if (interpreter[0].halted)
+        runFunc = &Interpreter::runCoreSingle<true, 1>;
+    else
+        runFunc = &Interpreter::runCoreSingle<false, 0>;
+
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 0;
+    PPCIrqUnlockByMsr(st);
+}
+
+// ---------------------------------------------------------------------------
+// resetCycles — prevent globalCycles overflow every ~2 billion ticks
+// ---------------------------------------------------------------------------
+void Core::resetCycles() {
+    const size_t n = events.size();
+    for (size_t i = 0; i < n; i++)
+        events[i].cycles -= globalCycles;
+
+    for (int i = 0; i < 2; i++) {
+        interpreter[i].resetCycles();
+        timers[i].resetCycles();
+    }
+
+    globalCycles = 0;
+    schedule(RESET_CYCLES, 0x7FFFFFFF);
+}
+
+// ---------------------------------------------------------------------------
+// schedule — insert a new event in sorted order (binary search insertion)
+// ---------------------------------------------------------------------------
+void Core::schedule(SchedTask task, uint32_t cycles) {
+    SchedEvent event(task, globalCycles + cycles);
+    auto it = std::upper_bound(events.cbegin(), events.cend(), event);
+    events.insert(it, event);
+}
+
+// ---------------------------------------------------------------------------
+// enterGbaMode
+// ---------------------------------------------------------------------------
+void Core::enterGbaMode() {
+    gbaMode = true;
+
+    interpreter[0].halt(2);
+    interpreter[1].unhalt(2);
+    updateRun();
+
+    events.clear();
+    schedule(RESET_CYCLES,    0x7FFFFFFF);
+    schedule(GBA_SCANLINE240, 240 * 4);
+    schedule(GBA_SCANLINE308, 308 * 4);
+    schedule(GBA_SPU_SAMPLE,  512);
+
+    memory.updateMap7(0x00000000, 0xFFFFFFFF);
+    interpreter[1].init();
+    rtc.reset();
+
+    memory.write<uint8_t>(0, 0x4000240, 0x80);
+    memory.write<uint8_t>(0, 0x4000241, 0x80);
+
+    if (realGbaBios) {
+        interpreter[1].bios = nullptr;
+        return;
+    }
+
+    interpreter[1].bios = &hleBios[2];
+    interpreter[1].directBoot();
+    memory.write<uint16_t>(1, 0x4000088, 0x200);
+}
+
+// ---------------------------------------------------------------------------
+// endFrame
+// ---------------------------------------------------------------------------
+void Core::endFrame() {
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 0;
+    PPCIrqUnlockByMsr(st);
+
+    fpsCount++;
+
+    if (arm7Hle)
+        hleArm7.runFrame();
+
+    uint64_t now     = PPCGetTickCount();
+    uint64_t elapsed = now - lastFpsTimeTicks;
+    if (elapsed >= PPCMsToTicks(1000)) {
+        fps              = fpsCount;
+        fpsCount         = 0;
+        lastFpsTimeTicks = now;
+    }
+
+    if (wifi.shouldSchedule())
+        wifi.scheduleInit();
+}
+
+//main.cpp
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <gccore.h>
+#include <wiiuse/wpad.h>
+#include <fat.h>
+#include <malloc.h>
+#include <time.h>
+#include <stdarg.h>
+#include <new>
+#include <asndlib.h>
+#include <dirent.h>
+#include <sys/types.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+
+#include "wii_video.h"
+#include "wii_audio.h"
+#include "core.h"
+#include "settings.h"
+#include "console_ui.h"
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#define EMULATION_STACK_SIZE (256 * 1024)
+#define AUDIO_STACK_SIZE     (64  * 1024)
+
+static u8* mem2_free_ptr  = nullptr;
+static u8* mem2_max_limit = nullptr;
+
+static KThread  emulatorThread;
+static KThread  audioThread;
+static u8*      emulatorThreadStack = nullptr;
+static u8*      audioThreadStack    = nullptr;
+
+static KThread* g_emulatorThreadHandle = nullptr;
+
+void InitializeMem2Arena() {
+    u8* lo = (u8*)SYS_GetArena2Lo();
+    u8* hi = (u8*)SYS_GetArena2Hi();
+    mem2_free_ptr  = (u8*)(((uptr)lo + 31) & ~31u);
+    mem2_max_limit = (u8*)((uptr)hi  & ~31u);
+}
+
+void* Noods_MEM2_Alloc(size_t size) {
+    if (size == 0) return nullptr;
+    size = (size + 31) & ~31u;
+    if (!mem2_free_ptr || (mem2_free_ptr + size > mem2_max_limit))
+        return nullptr;
+    void* p       = (void*)mem2_free_ptr;
+    mem2_free_ptr += size;
+    return p;
+}
+
+void Noods_MEM2_Free(void* /*ptr*/) {}
+
+static inline bool IsMem2Ptr(void* p) {
+    return (u8*)p >= (u8*)0x90000000 &&
+           (u8*)p <  (u8*)0x93400000;
+}
+
+static void* GlobalAlloc(size_t size) {
+    void* p = nullptr;
+    if (g_emulatorThreadHandle &&
+        KThreadGetSelf() == g_emulatorThreadHandle && size >= 4096) {
+        PPCIrqState st = PPCIrqLockByMsr();
+        p = Noods_MEM2_Alloc(size);
+        PPCIrqUnlockByMsr(st);
+    }
+    if (!p) p = malloc(size);
+    return p;
+}
+
+void* operator new(size_t size) {
+    void* p = GlobalAlloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void* operator new[](size_t size) {
+    void* p = GlobalAlloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void operator delete(void* p) noexcept {
+    if (!p) return;
+    if (!IsMem2Ptr(p)) free(p);
+}
+void operator delete[](void* p) noexcept {
+    if (!p) return;
+    if (!IsMem2Ptr(p)) free(p);
+}
+void operator delete(void* p, size_t) noexcept {
+    if (!p) return;
+    if (!IsMem2Ptr(p)) free(p);
+}
+void operator delete[](void* p, size_t) noexcept {
+    if (!p) return;
+    if (!IsMem2Ptr(p)) free(p);
+}
+
+static Core*     ndsCore   = nullptr;
+static bool      romLoaded = false;
+
+static uint32_t* frontBuffer = nullptr;
+static uint32_t* backBuffer  = nullptr;
+
+static volatile bool newFrameReady     = false;
+static volatile bool runEmulatorThread = true;
+static volatile bool runAudioThread    = true;
+
+static uint32_t* topScreenBuffer    = nullptr;
+static uint32_t* bottomScreenBuffer = nullptr;
+
+float g_cursorX    = 320.0f;
+float g_cursorY    = 240.0f;
+bool  g_cursorShow = false;
+
+struct BrowserItem {
+    std::string name;
+    bool isDirectory;
+};
+
+static std::string currentDir = "sd:/noods/";
+static std::vector<BrowserItem> dirContents;
+static int selectedItemIndex = 0;
+static int displayOffset     = 0;
+static bool showFileBrowser  = true;
+static std::string romToLoadPath = "";
+static volatile bool triggerRomLoad = false;
+
+static int scrollHoldTimer = 0;
+static const int SCROLL_DELAY_INITIAL = 18; // Frames before scrolling starts
+static const int SCROLL_DELAY_REPEATED = 3;  // Frames between scrolling steps
+
+#define NDS_KEY_A      0
+#define NDS_KEY_B      1
+#define NDS_KEY_SELECT 2
+#define NDS_KEY_START  3
+#define NDS_KEY_RIGHT  4
+#define NDS_KEY_LEFT   5
+#define NDS_KEY_UP     6
+#define NDS_KEY_DOWN   7
+#define NDS_KEY_R      8
+#define NDS_KEY_L      9
+#define NDS_KEY_X      10
+#define NDS_KEY_Y      11
+
+static volatile uint16_t g_ndsButtons  = 0;
+static volatile bool     g_ndsTouching = false;
+static volatile int16_t  g_ndsTouchX   = 0;
+static volatile int16_t  g_ndsTouchY   = 0;
+
+struct PerformanceState {
+    uint32_t renderFrameCount;
+    float    fps;
+    time_t   startTime;
+};
+static PerformanceState perf = {};
+
+// Always stereo layout (L,R pairs) even in mono mode.
+alignas(32) static int16_t s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
+alignas(32) static int16_t s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2];
+
+static volatile int  s_writeBuf = 0;    
+static volatile int  s_readBuf  = 1;    
+static volatile bool s_bufReady = false;
+
+static void ResampleLinear(const uint32_t* src, int nSrc,
+                            int16_t*        dst, int nDst,
+                            bool            mono)
+{
+    const int32_t step = (int32_t)(((int64_t)nSrc << 16) / nDst);
+    int32_t       pos  = 0;
+
+    for (int i = 0; i < nDst; i++) {
+        const int idx0 = pos >> 16;
+        const int idx1 = (idx0 + 1 < nSrc) ? idx0 + 1 : nSrc - 1;
+
+        // Fractional part in [0, 65535].
+        const int32_t frac = pos & 0xFFFF;
+
+        // Unpack source samples.
+        const int16_t l0 = (int16_t)( src[idx0]        & 0xFFFF);
+        const int16_t r0 = (int16_t)((src[idx0] >> 16) & 0xFFFF);
+        const int16_t l1 = (int16_t)( src[idx1]        & 0xFFFF);
+        const int16_t r1 = (int16_t)((src[idx1] >> 16) & 0xFFFF);
+
+        // Linear interpolation.
+        const int16_t outL = (int16_t)(l0 + (int32_t)(l1 - l0) * frac / 65536);
+        const int16_t outR = (int16_t)(r0 + (int32_t)(r1 - r0) * frac / 65536);
+
+        if (mono) {
+            // Average both channels; write to both lanes.
+            const int16_t m = (int16_t)(((int32_t)outL + (int32_t)outR) >> 1);
+            dst[i * 2 + 0] = m;
+            dst[i * 2 + 1] = m;
+        } else {
+            dst[i * 2 + 0] = outL;
+            dst[i * 2 + 1] = outR;
+        }
+
+        pos += step;
+    }
+}
+
+static uint32_t* PullSpuSamples(int nFrames)
+{
+#if WIIAUD_GBA_FRAMES > WIIAUD_NDS_FRAMES
+    static uint32_t staging[WIIAUD_GBA_FRAMES];
+#else
+    static uint32_t staging[WIIAUD_NDS_FRAMES];
+#endif
+
+    uint32_t* p = ndsCore->spu.getSamples(nFrames);
+    if (!p) return nullptr;
+
+    memcpy(staging, p, (size_t)nFrames * sizeof(uint32_t));
+    delete[] p;        // getSamples() always heap-allocates; free it here.
+    return staging;
+}
+
+static void AudioCallback(s32 voice)
+{
+    if (s_bufReady) {
+        const int justFilled = s_writeBuf;
+        s_readBuf            = justFilled;
+        s_writeBuf           = justFilled ^ 1;
+        s_bufReady           = false;
+
+        ASND_AddVoice(voice,
+                      s_audioDbl[justFilled],
+                      WIIAUD_BUF_BYTES_STEREO);
+    } else {
+        ASND_AddVoice(voice, s_audioSilence, WIIAUD_BUF_BYTES_STEREO);
+    }
+}
+
+static sptr AudioThreadMain(void* /*arg*/)
+{
+    while (runAudioThread) {
+        while (s_bufReady && runAudioThread) {
+            KThreadYield();
+        }
+        if (!runAudioThread) break;
+
+        int16_t* dst  = s_audioDbl[s_writeBuf];
+        bool     ok   = false;
+        const bool mono = (Settings::monoAudio != 0);
+
+        if (romLoaded && ndsCore) {
+            if (ndsCore->gbaMode) {
+                uint32_t* src = PullSpuSamples(WIIAUD_GBA_FRAMES);
+                if (src) {
+                    ResampleLinear(src, WIIAUD_GBA_FRAMES,
+                                   dst, WIIAUD_FRAMES_PER_BUF, mono);
+                    ok = true;
+                }
+            } else {
+                uint32_t* src = PullSpuSamples(WIIAUD_NDS_FRAMES);
+                if (src) {
+                    ResampleLinear(src, WIIAUD_NDS_FRAMES,
+                                   dst, WIIAUD_FRAMES_PER_BUF, mono);
+                    ok = true;
+                }
+            }
+        }
+        if (!ok) {
+            memset(dst, 0, WIIAUD_BUF_BYTES_STEREO);
+        }
+        DCFlushRange(dst, WIIAUD_BUF_BYTES_STEREO);
+        s_bufReady = true;
+    }
+    KThreadExit(0);
+    return 0;
+}
+
+static void InitializeAudio()
+{
+    memset(s_audioDbl,     0, sizeof(s_audioDbl));
+    memset(s_audioSilence, 0, sizeof(s_audioSilence));
+    DCFlushRange(s_audioDbl,     sizeof(s_audioDbl));
+    DCFlushRange(s_audioSilence, sizeof(s_audioSilence));
+
+    s_writeBuf = 0;
+    s_readBuf  = 1;
+    s_bufReady = false;
+
+    ASND_Init();
+    ASND_Pause(0);
+
+    ASND_SetVoice(0,
+                  VOICE_STEREO_16BIT_BE,
+                  WIIAUD_OUT_RATE,
+                  0,
+                  s_audioSilence,
+                  WIIAUD_BUF_BYTES_STEREO,
+                  MAX_VOLUME,
+                  MAX_VOLUME,
+                  AudioCallback);
+}
+
+static void ShutdownAudio()
+{
+    runAudioThread = false;
+    s_bufReady = false;       
+    ASND_StopVoice(0);
+    ASND_End();
+    KThreadJoin(&audioThread);
+}
+
+static void InitializeSettings() {
+    Settings::directBoot   = 1;
+    Settings::bios9Path    = "sd:/noods/bios/bios9.bin";
+    Settings::bios7Path    = "sd:/noods/bios/bios7.bin";
+    Settings::firmwarePath = "sd:/noods/bios/firmware.bin";
+    Settings::gbaBiosPath  = "sd:/noods/bios/gba_bios.bin";
+    Settings::sdImagePath  = "";
+    Settings::basePath     = "sd:/";
+    Settings::fpsLimiter   = 1;
+    Settings::frameskip    = 2;
+    Settings::threaded2D   = 0;
+    Settings::threaded3D   = 0;
+    Settings::highRes3D    = 0;
+    Settings::screenGhost  = 0;
+    Settings::emulateAudio = 1;
+    Settings::audio16Bit   = 1;
+    Settings::monoAudio    = 0; 
+    Settings::savesFolder  = 1;
+    Settings::statesFolder = 1;
+    Settings::cheatsFolder = 1;
+    Settings::screenFilter = 0;
+    Settings::arm7Hle      = 0;
+    Settings::dsiMode      = 0;
+}
+
+static bool CompareBrowserItems(const BrowserItem& a, const BrowserItem& b) {
+    if (a.isDirectory && !b.isDirectory) return true;
+    if (!a.isDirectory && b.isDirectory) return false;
+    return strcasecmp(a.name.c_str(), b.name.c_str()) < 0;
+}
+
+static void UpdateFileBrowser(const std::string& path) {
+    dirContents.clear();
+    selectedItemIndex = 0;
+    displayOffset     = 0;
+
+    DIR* dir = opendir(path.c_str());
+    if (!dir) return;
+
+    if (path != "sd:/" && path != "sd:") {
+        BrowserItem parent;
+        parent.name        = "..";
+        parent.isDirectory = true;
+        dirContents.push_back(parent);
+    }
+
+    struct dirent* entry;
+    while ((entry = readdir(dir)) != nullptr) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+            continue;
+
+        BrowserItem item;
+        item.name        = entry->d_name;
+        item.isDirectory = (entry->d_type == DT_DIR);
+
+        if (!item.isDirectory) {
+            size_t extPos = item.name.find_last_of('.');
+            if (extPos == std::string::npos) continue;
+            std::string ext = item.name.substr(extPos);
+            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            if (ext != ".nds" && ext != ".gba") continue;
+        }
+
+        dirContents.push_back(item);
+    }
+    closedir(dir);
+
+    size_t sortStart = (path != "sd:/" && path != "sd:") ? 1 : 0;
+    std::sort(dirContents.begin() + sortStart, dirContents.end(),
+              CompareBrowserItems);
+}
+
+alignas(32) static uint32_t tempBuffer[NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2];
+
+static sptr EmulatorThreadMain(void* /*arg*/) {
+    const size_t pixelCount = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * 2;
+
+    while (runEmulatorThread) {
+        if (triggerRomLoad) {
+            std::string loadPath;
+            {
+                PPCIrqState st = PPCIrqLockByMsr();
+                loadPath       = romToLoadPath;
+                triggerRomLoad = false;
+                romLoaded      = false;
+                PPCIrqUnlockByMsr(st);
+            }
+
+            delete ndsCore;
+            ndsCore = nullptr;
+
+            std::string ndsRom, gbaRom;
+            size_t extPos = loadPath.find_last_of('.');
+            if (extPos != std::string::npos) {
+                std::string ext = loadPath.substr(extPos);
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".gba") gbaRom = loadPath;
+                else               ndsRom = loadPath;
+            }
+
+            try {
+                ndsCore   = new Core(ndsRom, gbaRom);
+                romLoaded = true;
+            }
+            catch (...) {
+                ndsCore = nullptr;
+            }
+        }
+
+        if (romLoaded && ndsCore) {
+            {
+                PPCIrqState st  = PPCIrqLockByMsr();
+                uint16_t buttons  = g_ndsButtons;
+                bool     touching = g_ndsTouching;
+                int16_t  touchX   = g_ndsTouchX;
+                int16_t  touchY   = g_ndsTouchY;
+                PPCIrqUnlockByMsr(st);
+
+                for (int bit = 0; bit < 12; bit++) {
+                    if (buttons & (1 << bit)) ndsCore->input.pressKey(bit);
+                    else                      ndsCore->input.releaseKey(bit);
+                }
+                if (touching) {
+                    ndsCore->spi.setTouch((int)touchX, (int)touchY);
+                    ndsCore->input.pressScreen();
+                } else {
+                    ndsCore->spi.clearTouch();
+                    ndsCore->input.releaseScreen();
+                }
+            }
+
+            ndsCore->runCore();
+
+            if (ndsCore->gpu.getFrame(tempBuffer, ndsCore->gbaMode)) {
+                PPCIrqState st = PPCIrqLockByMsr();
+                memcpy(backBuffer, tempBuffer, pixelCount * sizeof(uint32_t));
+                newFrameReady = true;
+                PPCIrqUnlockByMsr(st);
+            }
+        }
+        else {
+            KThreadSleepMs(16);
+        }
+    }
+
+    KThreadExit(0);
+    return 0;
+}
+
+static void InitializeNDS() {
+    const size_t bufSize =
+        NDS_SCREEN_WIDTH * (NDS_SCREEN_HEIGHT * 2) * sizeof(uint32_t);
+
+    frontBuffer = (uint32_t*)Noods_MEM2_Alloc(bufSize);
+    if (!frontBuffer) frontBuffer = (uint32_t*)malloc(bufSize);
+
+    backBuffer  = (uint32_t*)Noods_MEM2_Alloc(bufSize);
+    if (!backBuffer) backBuffer = (uint32_t*)malloc(bufSize);
+
+    if (!frontBuffer || !backBuffer) {
+        while (true) KThreadSleepMs(16);
+    }
+    memset(frontBuffer, 0, bufSize);
+    memset(backBuffer,  0, bufSize);
+
+    InitializeSettings();
+
+    if (fatInitDefault()) {
+        UpdateFileBrowser(currentDir);
+    }
+
+    const size_t sz = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * sizeof(uint32_t);
+    topScreenBuffer    = (uint32_t*)Noods_MEM2_Alloc(sz);
+    if (!topScreenBuffer) topScreenBuffer = (uint32_t*)malloc(sz);
+
+    bottomScreenBuffer = (uint32_t*)Noods_MEM2_Alloc(sz);
+    if (!bottomScreenBuffer) bottomScreenBuffer = (uint32_t*)malloc(sz);
+
+    if (topScreenBuffer && bottomScreenBuffer) {
+        for (int i = 0; i < NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT; i++) {
+            topScreenBuffer[i]    = 0xFF0000FF;
+            bottomScreenBuffer[i] = 0x0000FFFF;
+        }
+    }
+
+    emulatorThreadStack = (u8*)Noods_MEM2_Alloc(EMULATION_STACK_SIZE);
+    if (!emulatorThreadStack) emulatorThreadStack = (u8*)malloc(EMULATION_STACK_SIZE);
+
+    if (Settings::emulateAudio) {
+        audioThreadStack = (u8*)Noods_MEM2_Alloc(AUDIO_STACK_SIZE);
+        if (!audioThreadStack) audioThreadStack = (u8*)malloc(AUDIO_STACK_SIZE);
+    }
+
+    if (!emulatorThreadStack || (Settings::emulateAudio && !audioThreadStack)) {
+        while (true) KThreadSleepMs(16);
+    }
+
+    KThreadPrepare(&emulatorThread, EmulatorThreadMain, nullptr,
+                   emulatorThreadStack + EMULATION_STACK_SIZE, 0x50);
+    g_emulatorThreadHandle = &emulatorThread;
+    KThreadResume(&emulatorThread);
+
+    if (Settings::emulateAudio) {
+        KThreadPrepare(&audioThread, AudioThreadMain, nullptr,
+                       audioThreadStack + AUDIO_STACK_SIZE, 0x51);
+        KThreadResume(&audioThread);
+        InitializeAudio();
+    }
+
+    perf.startTime = time(nullptr);
+}
+
+static uint16_t WiiButtonsToNDS(u32 held, u32 heldExt, bool hasNunchuk, bool hasClassic) {
+    uint16_t nds = 0;
+
+    // Standard Wii Remote mappings (Horizontal or plus Nunchuk)
+    if (held & WPAD_BUTTON_RIGHT)  nds |= (1 << NDS_KEY_RIGHT);
+    if (held & WPAD_BUTTON_LEFT)   nds |= (1 << NDS_KEY_LEFT);
+    if (held & WPAD_BUTTON_UP)     nds |= (1 << NDS_KEY_UP);
+    if (held & WPAD_BUTTON_DOWN)   nds |= (1 << NDS_KEY_DOWN);
+    if (held & WPAD_BUTTON_2)      nds |= (1 << NDS_KEY_A);
+    if (held & WPAD_BUTTON_1)      nds |= (1 << NDS_KEY_B);
+    if (held & WPAD_BUTTON_A)      nds |= (1 << NDS_KEY_X);
+    if (held & WPAD_BUTTON_B)      nds |= (1 << NDS_KEY_Y);
+    if (held & WPAD_BUTTON_PLUS)   nds |= (1 << NDS_KEY_START);
+    if (held & WPAD_BUTTON_MINUS)  nds |= (1 << NDS_KEY_SELECT);
+
+    if (hasNunchuk) {
+        if (heldExt & WPAD_NUNCHUK_BUTTON_Z) nds |= (1 << NDS_KEY_L);
+        if (heldExt & WPAD_NUNCHUK_BUTTON_C) nds |= (1 << NDS_KEY_R);
+    }
+
+    // Classic Controller physical mapping
+    if (hasClassic) {
+        if (held & WPAD_CLASSIC_BUTTON_RIGHT) nds |= (1 << NDS_KEY_RIGHT);
+        if (held & WPAD_CLASSIC_BUTTON_LEFT)  nds |= (1 << NDS_KEY_LEFT);
+        if (held & WPAD_CLASSIC_BUTTON_UP)    nds |= (1 << NDS_KEY_UP);
+        if (held & WPAD_CLASSIC_BUTTON_DOWN)  nds |= (1 << NDS_KEY_DOWN);
+        if (held & WPAD_CLASSIC_BUTTON_A)     nds |= (1 << NDS_KEY_A);
+        if (held & WPAD_CLASSIC_BUTTON_B)     nds |= (1 << NDS_KEY_B);
+        if (held & WPAD_CLASSIC_BUTTON_X)     nds |= (1 << NDS_KEY_X);
+        if (held & WPAD_CLASSIC_BUTTON_Y)     nds |= (1 << NDS_KEY_Y);
+        if (held & WPAD_CLASSIC_BUTTON_PLUS)  nds |= (1 << NDS_KEY_START);
+        if (held & WPAD_CLASSIC_BUTTON_MINUS) nds |= (1 << NDS_KEY_SELECT);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_L | WPAD_CLASSIC_BUTTON_ZL)) nds |= (1 << NDS_KEY_L);
+        if (held & (WPAD_CLASSIC_BUTTON_FULL_R | WPAD_CLASSIC_BUTTON_ZR)) nds |= (1 << NDS_KEY_R);
+    }
+
+    return nds;
+}
+
+static void ScanWiiInputs() {
+    WPAD_ScanPads();
+    PAD_ScanPads();
+
+    u32 held      = WPAD_ButtonsHeld(0);
+    u32 pressed   = WPAD_ButtonsDown(0);
+    u32 gcHeld    = PAD_ButtonsHeld(0);
+    u32 gcPressed = PAD_ButtonsDown(0);
+
+    WPADData* wdata      = WPAD_Data(0);
+    bool      hasNunchuk = wdata && (wdata->exp.type == WPAD_EXP_NUNCHUK);
+    bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
+    u32       heldExt    = hasNunchuk ? held : 0;
+
+    if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
+        runEmulatorThread = false;
+        PPCCompilerBarrier();
+        KThreadJoin(&emulatorThread);
+
+        ShutdownAudio();
+
+        delete ndsCore;
+        ndsCore = nullptr;
+
+        exit(0);
+    }
+
+    if (showFileBrowser) {
+        if (!dirContents.empty()) {
+            static bool classicLStickUpLast = false;
+            static bool classicLStickDownLast = false;
+            bool classicLStickUp = false;
+            bool classicLStickDown = false;
+
+            // Classic Controller stick parsing for menus
+            if (hasClassic && wdata) {
+                float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+                if (wdata->exp.classic.ljs.mag > 0.5f) {
+                    if (ly > 0.5f)  classicLStickUp = true;
+                    if (ly < -0.5f) classicLStickDown = true;
+                }
+            }
+
+            bool upHeld   = (held & WPAD_BUTTON_UP)     || (held & WPAD_CLASSIC_BUTTON_UP)     || (gcHeld & PAD_BUTTON_UP)   || classicLStickUp;
+            bool downHeld = (held & WPAD_BUTTON_DOWN)   || (held & WPAD_CLASSIC_BUTTON_DOWN)   || (gcHeld & PAD_BUTTON_DOWN) || classicLStickDown;
+            bool upDown   = (pressed & WPAD_BUTTON_UP)  || (pressed & WPAD_CLASSIC_BUTTON_UP)  || (gcPressed & PAD_BUTTON_UP)  || (classicLStickUp && !classicLStickUpLast);
+            bool downDown = (pressed & WPAD_BUTTON_DOWN)|| (pressed & WPAD_CLASSIC_BUTTON_DOWN)|| (gcPressed & PAD_BUTTON_DOWN)|| (classicLStickDown && !classicLStickDownLast);
+
+            classicLStickUpLast = classicLStickUp;
+            classicLStickDownLast = classicLStickDown;
+
+            bool performUp    = false;
+            bool performDown  = false;
+
+            if (upDown || downDown) {
+                scrollHoldTimer = 0; // Reset timer on raw press
+                if (upDown)   performUp   = true;
+                if (downDown) performDown = true;
+            } else if (upHeld || downHeld) {
+                scrollHoldTimer++;
+                if (scrollHoldTimer >= SCROLL_DELAY_INITIAL) {
+                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) % SCROLL_DELAY_REPEATED == 0) {
+                        if (upHeld)   performUp   = true;
+                        if (downHeld) performDown = true;
+                    }
+                }
+            } else {
+                scrollHoldTimer = 0;
+            }
+
+            if (performDown) {
+                selectedItemIndex++;
+                if (selectedItemIndex >= (int)dirContents.size()) {
+                    selectedItemIndex = 0;
+                    displayOffset     = 0;
+                }
+                if (selectedItemIndex >= displayOffset + 5)
+                    displayOffset = selectedItemIndex - 4;
+            }
+            if (performUp) {
+                selectedItemIndex--;
+                if (selectedItemIndex < 0) {
+                    selectedItemIndex = (int)dirContents.size() - 1;
+                    displayOffset     = std::max(0, selectedItemIndex - 4);
+                }
+                if (selectedItemIndex < displayOffset)
+                    displayOffset = selectedItemIndex;
+            }
+
+            if ((pressed & WPAD_BUTTON_LEFT) || (pressed & WPAD_CLASSIC_BUTTON_LEFT) || (gcPressed & PAD_BUTTON_LEFT)) {
+                selectedItemIndex -= 5;
+                if (selectedItemIndex < 0) {
+                    selectedItemIndex = 0;
+                }
+                displayOffset = std::max(0, selectedItemIndex - 2);
+            }
+            if ((pressed & WPAD_BUTTON_RIGHT) || (pressed & WPAD_CLASSIC_BUTTON_RIGHT) || (gcPressed & PAD_BUTTON_RIGHT)) {
+                selectedItemIndex += 5;
+                if (selectedItemIndex >= (int)dirContents.size()) {
+                    selectedItemIndex = (int)dirContents.size() - 1;
+                }
+                displayOffset = std::max(0, std::min((int)dirContents.size() - 5, selectedItemIndex - 2));
+            }
+
+            if ((pressed & WPAD_BUTTON_A) || (pressed & WPAD_CLASSIC_BUTTON_A) || (gcPressed & PAD_BUTTON_A)) {
+                BrowserItem selected = dirContents[selectedItemIndex];
+                if (selected.isDirectory) {
+                    if (selected.name == "..") {
+                        size_t slash = currentDir.find_last_of('/',
+                                           currentDir.length() - 2);
+                        if (slash != std::string::npos)
+                            currentDir = currentDir.substr(0, slash + 1);
+                    } else {
+                        currentDir += selected.name + "/";
+                    }
+                    UpdateFileBrowser(currentDir);
+                } else {
+                    std::string romPath = currentDir + selected.name;
+                    PPCIrqState st = PPCIrqLockByMsr();
+                    romToLoadPath  = romPath;
+                    triggerRomLoad = true;
+                    PPCIrqUnlockByMsr(st);
+
+                    showFileBrowser = false;
+                    
+                    dirContents.clear();
+                    dirContents.shrink_to_fit();
+                }
+            }
+        }
+
+        // Handle B button press in file browser: go up directory, or close browser if at root
+        if ((pressed & WPAD_BUTTON_B) || (pressed & WPAD_CLASSIC_BUTTON_B) || (gcPressed & PAD_BUTTON_B)) {
+            if (currentDir != "sd:/" && currentDir != "sd://" && currentDir != "sd:") {
+                size_t slash = currentDir.find_last_of('/', currentDir.length() - 2);
+                if (slash != std::string::npos) {
+                    currentDir = currentDir.substr(0, slash + 1);
+                    UpdateFileBrowser(currentDir);
+                }
+            } else if (romLoaded) {
+                showFileBrowser = false;
+            }
+        }
+    }
+    else {
+        uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk, hasClassic);
+
+        if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
+        if (gcHeld & PAD_BUTTON_B)     ndsButtons |= (1 << NDS_KEY_B);
+        if (gcHeld & PAD_BUTTON_X)     ndsButtons |= (1 << NDS_KEY_X);
+        if (gcHeld & PAD_BUTTON_Y)     ndsButtons |= (1 << NDS_KEY_Y);
+        if (gcHeld & PAD_BUTTON_LEFT)  ndsButtons |= (1 << NDS_KEY_LEFT);
+        if (gcHeld & PAD_BUTTON_RIGHT) ndsButtons |= (1 << NDS_KEY_RIGHT);
+        if (gcHeld & PAD_BUTTON_UP)    ndsButtons |= (1 << NDS_KEY_UP);
+        if (gcHeld & PAD_BUTTON_DOWN)  ndsButtons |= (1 << NDS_KEY_DOWN);
+        if (gcHeld & PAD_TRIGGER_R)    ndsButtons |= (1 << NDS_KEY_R);
+        if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
+        if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
+
+        // Map Classic Left Stick to NDS D-Pad
+        if (hasClassic && wdata) {
+            float lx = wdata->exp.classic.ljs.mag * sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            float ly = wdata->exp.classic.ljs.mag * cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.ljs.mag > 0.5f) {
+                if (lx > 0.5f)  ndsButtons |= (1 << NDS_KEY_RIGHT);
+                if (lx < -0.5f) ndsButtons |= (1 << NDS_KEY_LEFT);
+                if (ly > 0.5f)  ndsButtons |= (1 << NDS_KEY_UP);
+                if (ly < -0.5f) ndsButtons |= (1 << NDS_KEY_DOWN);
+            }
+        }
+
+        bool isTouching = false;
+        g_cursorShow = false;
+
+        // IR pointer styling
+        if (wdata && wdata->ir.valid) {
+            g_cursorX    = wdata->ir.x;
+            g_cursorY    = wdata->ir.y;
+            g_cursorShow = true;
+            if (held & WPAD_BUTTON_A)
+                isTouching = true;
+        }
+
+        // GC C-Stick Stylus Emulator
+        s8 cstickX = PAD_SubStickX(0);
+        s8 cstickY = PAD_SubStickY(0);
+        if (abs(cstickX) > 15 || abs(cstickY) > 15) {
+            g_cursorX   += (cstickX / 15.0f) * 2.5f;
+            g_cursorY   -= (cstickY / 15.0f) * 2.5f;
+            g_cursorShow = true;
+
+            if (g_cursorX < 0.0f)   g_cursorX = 0.0f;
+            if (g_cursorX > 640.0f) g_cursorX = 640.0f;
+            if (g_cursorY < 0.0f)   g_cursorY = 0.0f;
+            if (g_cursorY > 480.0f) g_cursorY = 480.0f;
+        }
+
+        // Classic Controller Right Stick Stylus Emulator
+        if (hasClassic && wdata) {
+            float rx = wdata->exp.classic.rjs.mag * sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            float ry = wdata->exp.classic.rjs.mag * cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.rjs.mag > 0.15f) {
+                g_cursorX   += rx * 4.0f;
+                g_cursorY   -= ry * 4.0f;
+                g_cursorShow = true;
+
+                if (g_cursorX < 0.0f)   g_cursorX = 0.0f;
+                if (g_cursorX > 640.0f) g_cursorX = 640.0f;
+                if (g_cursorY < 0.0f)   g_cursorY = 0.0f;
+                if (g_cursorY > 480.0f) g_cursorY = 480.0f;
+            }
+        }
+
+        // Stylus activation
+        if (gcHeld & PAD_TRIGGER_Z) {
+            isTouching   = true;
+            g_cursorShow = true;
+        }
+
+        if (hasClassic && (held & (WPAD_CLASSIC_BUTTON_ZL | WPAD_CLASSIC_BUTTON_ZR))) {
+            isTouching   = true;
+            g_cursorShow = true;
+        }
+
+        int16_t touchX = 0;
+        int16_t touchY = 0;
+
+        if (g_cursorShow) {
+            const int gap     = 2;
+            const int scrW    = NDS_SCREEN_WIDTH;
+            const int scrH    = NDS_SCREEN_HEIGHT;
+            const int totalW  = scrW;
+            const int totalH  = scrH * 2 + gap;
+
+            const float fbWidth   = 640.0f;
+            const float efbHeight = 480.0f;
+
+            const float originX = (fbWidth  - totalW) / 2.0f;
+            const float originY = (efbHeight - totalH) / 2.0f;
+
+            const float dsLeft   = originX;
+            const float dsRight  = originX + scrW;
+            const float dsTop    = originY + scrH + gap;
+            const float dsBottom = originY + scrH + gap + scrH;
+
+            if (g_cursorX >= dsLeft  && g_cursorX <= dsRight &&
+                g_cursorY >= dsTop   && g_cursorY <= dsBottom) {
+                touchX = (int16_t)(((g_cursorX - dsLeft)  / (dsRight  - dsLeft))  * 256.0f);
+                touchY = (int16_t)(((g_cursorY - dsTop)   / (dsBottom - dsTop))   * 192.0f);
+            } else {
+                isTouching = false;
+            }
+        }
+
+        PPCIrqState st = PPCIrqLockByMsr();
+        g_ndsButtons  = ndsButtons;
+        g_ndsTouching = isTouching;
+        g_ndsTouchX   = touchX;
+        g_ndsTouchY   = touchY;
+        PPCIrqUnlockByMsr(st);
+    }
+}
+
+int main(int /*argc*/, char** /*argv*/) {
+    Wii_VideoInit();
+    InitializeMem2Arena();
+
+    WPAD_Init();
+    WPAD_SetDataFormat(WPAD_CHAN_0, WPAD_FMT_BTNS_ACC_IR);
+    WPAD_SetVRes(WPAD_CHAN_0, 640, 480);
+
+    InitializeNDS();
+
+    while (true) {
+        ScanWiiInputs();
+
+        const uint32_t* renderTop    = nullptr;
+        const uint32_t* renderBottom = nullptr;
+
+        if (romLoaded && !showFileBrowser) {
+            PPCIrqState st  = PPCIrqLockByMsr();
+            bool haveFrame  = newFrameReady;
+            if (haveFrame) {
+                uint32_t* tmp = frontBuffer;
+                frontBuffer   = backBuffer;
+                backBuffer    = tmp;
+                newFrameReady = false;
+                perf.renderFrameCount++;
+            }
+            PPCIrqUnlockByMsr(st);
+
+            renderTop = frontBuffer;
+            if (ndsCore && ndsCore->gbaMode)
+                renderBottom = bottomScreenBuffer;
+            else
+                renderBottom = frontBuffer + (NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT);
+        }
+        else {
+            renderTop    = topScreenBuffer;
+            renderBottom = bottomScreenBuffer;
+        }
+        
+        static uint32_t lastSecFrames = 0;
+        static time_t   lastSec = 0;
+        time_t now = time(nullptr);
+        if (now != lastSec) {
+                perf.fps = (float)(perf.renderFrameCount - lastSecFrames);
+                lastSecFrames = perf.renderFrameCount;
+                lastSec = now;
+        }
+
+        if (showFileBrowser) {
+            Wii_DebugOverlayPrint(0, "Dir: %s", currentDir.c_str());
+
+            int lineIndex = 1;
+            for (int i = displayOffset;
+                 i < std::min((int)dirContents.size(), displayOffset + 5); i++) {
+                const char* prefix = (i == selectedItemIndex) ? "-> " : "   ";
+                const char* suffix = dirContents[i].isDirectory ? "/" : "";
+                Wii_DebugOverlayPrint(lineIndex++, "%s%s%s",
+                    prefix, dirContents[i].name.c_str(), suffix);
+            }
+            while (lineIndex < 6)
+                Wii_DebugOverlayPrint(lineIndex++, " ");
+            Wii_DebugOverlayPrint(6, "D-Pad=Select  L/R=Page Skip  A=Load  B=Back");
+            Wii_DebugOverlayPrint(7, " ");
+        }
+        else {
+            Wii_DebugOverlayPrint(0, " ");
+            Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
+            Wii_DebugOverlayPrint(2, "HOME=Quit");
+            Wii_DebugOverlayPrint(3, " ");
+            Wii_DebugOverlayPrint(4, " ");
+            Wii_DebugOverlayPrint(5, " ");
+            Wii_DebugOverlayPrint(6, " ");
+            Wii_DebugOverlayPrint(7, " ");
+        }
+
+        bool isGba = (ndsCore && romLoaded && !showFileBrowser) ? ndsCore->gbaMode : false;
+        Wii_VideoRender(renderTop, renderBottom, isGba);
+        Wii_VideoFlushAsync();
+        VIDEO_WaitVSync();
+    }
+
+    return 0;
+}
+
+//wii_audio.h
+#pragma once
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#define WIIAUD_OUT_RATE         48000
+#define WIIAUD_FRAMES_PER_BUF   1024
+#define WIIAUD_BUF_BYTES_STEREO (WIIAUD_FRAMES_PER_BUF * 4)
+#define WIIAUD_BUF_BYTES_MONO   (WIIAUD_FRAMES_PER_BUF * 2)
+
+#define WIIAUD_NDS_RATE              32768
+#define WIIAUD_NDS_FRAMES_PER_VFRAME 548
+#define WIIAUD_NDS_FRAMES            WIIAUD_NDS_FRAMES_PER_VFRAME
+
+#define WIIAUD_GBA_RATE              32768
+#define WIIAUD_GBA_FRAMES_PER_VFRAME 549
+#define WIIAUD_GBA_FRAMES            WIIAUD_GBA_FRAMES_PER_VFRAME
+
+#ifdef __cplusplus
+}
+#endif
+
+//spu.h
+#pragma once
+
+#include <cstdint>
+#include <cstdio>
+#include <deque>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+}
+
+class Core;
+
+class Spu {
+public:
+    Spu(Core *core);
+    ~Spu();
+
+    void saveState(FILE *file);
+    void loadState(FILE *file);
+
+    uint32_t *getSamples(int count);
+    void runGbaSample();
+    void runSample();
+    void gbaFifoTimer(int timer);
+
+    uint8_t readGbaSoundCntL(int channel);
+    uint16_t readGbaSoundCntH(int channel);
+    uint16_t readGbaSoundCntX(int channel);
+    uint16_t readGbaMainSoundCntL() { return gbaMainSoundCntL; }
+    uint16_t readGbaMainSoundCntH() { return gbaMainSoundCntH; }
+    uint8_t readGbaMainSoundCntX() { return gbaMainSoundCntX; }
+    uint16_t readGbaSoundBias() { return gbaSoundBias; }
+    uint8_t readGbaWaveRam(int index);
+
+    uint32_t readSoundCnt(int channel) { return soundCnt[channel]; }
+    uint16_t readMainSoundCnt() { return mainSoundCnt; }
+    uint16_t readSoundBias() { return soundBias; }
+    uint8_t readSndCapCnt(int channel) { return sndCapCnt[channel]; }
+    uint32_t readSndCapDad(int channel) { return sndCapDad[channel]; }
+
+    void writeGbaSoundCntL(int channel, uint8_t value);
+    void writeGbaSoundCntH(int channel, uint16_t mask, uint16_t value);
+    void writeGbaSoundCntX(int channel, uint16_t mask, uint16_t value);
+    void writeGbaMainSoundCntL(uint16_t mask, uint16_t value);
+    void writeGbaMainSoundCntH(uint16_t mask, uint16_t value);
+    void writeGbaMainSoundCntX(uint8_t value);
+    void writeGbaSoundBias(uint16_t mask, uint16_t value);
+    void writeGbaWaveRam(int index, uint8_t value);
+    void writeGbaFifoA(uint32_t mask, uint32_t value);
+    void writeGbaFifoB(uint32_t mask, uint32_t value);
+
+    void writeSoundCnt(int channel, uint32_t mask, uint32_t value);
+    void writeSoundSad(int channel, uint32_t mask, uint32_t value);
+    void writeSoundTmr(int channel, uint16_t mask, uint16_t value);
+    void writeSoundPnt(int channel, uint16_t mask, uint16_t value);
+    void writeSoundLen(int channel, uint32_t mask, uint32_t value);
+    void writeMainSoundCnt(uint16_t mask, uint16_t value);
+    void writeSoundBias(uint16_t mask, uint16_t value);
+    void writeSndCapCnt(int channel, uint8_t value);
+    void writeSndCapDad(int channel, uint32_t mask, uint32_t value);
+    void writeSndCapLen(int channel, uint16_t mask, uint16_t value);
+
+private:
+    Core *core;
+
+    uint32_t *bufferIn = nullptr;
+    uint32_t *bufferOut = nullptr;
+    uint32_t bufferSize = 0;
+    uint32_t bufferPointer = 0;
+
+    KThrQueue waitQueue1;
+    KThrQueue waitQueue2;
+    volatile bool ready;
+
+    int16_t gbaFrameSequencer = 0;
+    int32_t gbaSoundTimers[4] = {};
+    int8_t gbaEnvelopes[3] = {};
+    int8_t gbaEnvTimers[3] = {};
+    int8_t gbaSweepTimer = 0;
+    int8_t gbaWaveDigit = 0;
+    uint16_t gbaNoiseValue = 0;
+
+    uint8_t gbaWaveRam[2][16] = {};
+    std::deque<int8_t> gbaFifos[2];
+    int8_t gbaSampleA = 0, gbaSampleB = 0;
+
+    uint16_t enabled = 0;
+
+    static const int indexTable[8];
+    static const int16_t adpcmTable[89];
+
+    int32_t adpcmValue[16] = {};
+    int32_t adpcmLoopValue[16] = {};
+    int8_t adpcmIndex[16] = {};
+    int8_t adpcmLoopIndex[16] = {};
+    bool adpcmToggle[16] = {};
+
+    uint8_t dutyCycles[6] = {};
+    uint16_t noiseValues[2] = {};
+    uint32_t soundCurrent[16] = {};
+    uint16_t soundTimers[16] = {};
+    uint32_t sndCapCurrent[2] = {};
+    uint16_t sndCapTimers[2] = {};
+
+    uint8_t gbaSoundCntL[2] = {};
+    uint16_t gbaSoundCntH[4] = {};
+    uint16_t gbaSoundCntX[4] = {};
+    uint16_t gbaMainSoundCntL = 0;
+    uint16_t gbaMainSoundCntH = 0;
+    uint8_t gbaMainSoundCntX = 0;
+    uint16_t gbaSoundBias = 0;
+
+    uint32_t soundCnt[16] = {};
+    uint32_t soundSad[16] = {};
+    uint16_t soundTmr[16] = {};
+    uint16_t soundPnt[16] = {};
+    uint32_t soundLen[16] = {};
+    uint16_t mainSoundCnt = 0;
+    uint16_t soundBias = 0;
+    uint8_t sndCapCnt[2] = {};
+    uint32_t sndCapDad[2] = {};
+    uint16_t sndCapLen[2] = {};
+
+    void pushSample(int16_t sampleLeft, int16_t sampleRight);
+    void startChannel(int channel);
+};
+
+//spu.cpp
+#include <cstring>
+#include <algorithm>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#include "core.h"
+
+const int Spu::indexTable[] = {
+    -1, -1, -1, -1, 2, 4, 6, 8
+};
+
+const int16_t Spu::adpcmTable[] = {
+    0x0007, 0x0008, 0x0009, 0x000A, 0x000B, 0x000C, 0x000D, 0x000E, 0x0010, 0x0011, 0x0013, 0x0015,
+    0x0017, 0x0019, 0x001C, 0x001F, 0x0022, 0x0025, 0x0029, 0x002D, 0x0032, 0x0037, 0x003C, 0x0042,
+    0x0049, 0x0050, 0x0058, 0x0061, 0x006B, 0x0076, 0x0082, 0x008F, 0x009D, 0x00AD, 0x00BE, 0x00D1,
+    0x00E6, 0x00FD, 0x0117, 0x0133, 0x0151, 0x0173, 0x0198, 0x01C1, 0x01EE, 0x0220, 0x0256, 0x0292,
+    0x02D4, 0x031C, 0x036C, 0x03C3, 0x0424, 0x048E, 0x0502, 0x0583, 0x0610, 0x06AB, 0x0756, 0x0812,
+    0x08E0, 0x09C3, 0x0ABD, 0x0BD0, 0x0CFF, 0x0E4C, 0x0FBA, 0x114C, 0x1307, 0x14EE, 0x1706, 0x1954,
+    0x1BDC, 0x1EA5, 0x21B6, 0x2515, 0x28CA, 0x2CDF, 0x315B, 0x364B, 0x3BB9, 0x41B2, 0x4844, 0x4F7E,
+    0x5771, 0x602F, 0x69CE, 0x7462, 0x7FFF
+};
+
+Spu::Spu(Core *core): core(core) {
+    ready = false;
+    memset(&waitQueue1, 0, sizeof(waitQueue1));
+    memset(&waitQueue2, 0, sizeof(waitQueue2));
+}
+
+Spu::~Spu() {
+    delete[] bufferIn;
+    delete[] bufferOut;
+}
+
+void Spu::saveState(FILE *file) {
+    fwrite(&gbaFrameSequencer, sizeof(gbaFrameSequencer), 1, file);
+    fwrite(gbaSoundTimers, 4, sizeof(gbaSoundTimers) / 4, file);
+    fwrite(gbaEnvelopes, 1, sizeof(gbaEnvelopes), file);
+    fwrite(gbaEnvTimers, 1, sizeof(gbaEnvTimers), file);
+    fwrite(&gbaSweepTimer, sizeof(gbaSweepTimer), 1, file);
+    fwrite(&gbaWaveDigit, sizeof(gbaWaveDigit), 1, file);
+    fwrite(&gbaNoiseValue, sizeof(gbaNoiseValue), 1, file);
+    fwrite(gbaWaveRam, 1, sizeof(gbaWaveRam), file);
+    fwrite(&gbaSampleA, sizeof(gbaSampleA), 1, file);
+    fwrite(&gbaSampleB, sizeof(gbaSampleB), 1, file);
+    fwrite(&enabled, sizeof(enabled), 1, file);
+    fwrite(adpcmValue, 4, sizeof(adpcmValue) / 4, file);
+    fwrite(adpcmLoopValue, 4, sizeof(adpcmLoopValue) / 4, file);
+    fwrite(adpcmIndex, 1, sizeof(adpcmIndex), file);
+    fwrite(adpcmLoopIndex, 1, sizeof(adpcmLoopIndex), file);
+    fwrite(adpcmToggle, sizeof(bool), sizeof(adpcmToggle) / sizeof(bool), file);
+    fwrite(dutyCycles, 1, sizeof(dutyCycles), file);
+    fwrite(noiseValues, 2, sizeof(noiseValues) / 2, file);
+    fwrite(soundCurrent, 4, sizeof(soundCurrent) / 4, file);
+    fwrite(soundTimers, 2, sizeof(soundTimers) / 2, file);
+    fwrite(sndCapCurrent, 4, sizeof(sndCapCurrent) / 4, file);
+    fwrite(sndCapTimers, 2, sizeof(sndCapTimers) / 2, file);
+    fwrite(gbaSoundCntL, 1, sizeof(gbaSoundCntL), file);
+    fwrite(gbaSoundCntH, 2, sizeof(gbaSoundCntH) / 2, file);
+    fwrite(gbaSoundCntX, 2, sizeof(gbaSoundCntX) / 2, file);
+    fwrite(&gbaMainSoundCntL, sizeof(gbaMainSoundCntL), 1, file);
+    fwrite(&gbaMainSoundCntH, sizeof(gbaMainSoundCntH), 1, file);
+    fwrite(&gbaMainSoundCntX, sizeof(gbaMainSoundCntX), 1, file);
+    fwrite(&gbaSoundBias, sizeof(gbaSoundBias), 1, file);
+    fwrite(soundCnt, 4, sizeof(soundCnt) / 4, file);
+    fwrite(soundSad, 4, sizeof(soundSad) / 4, file);
+    fwrite(soundTmr, 2, sizeof(soundTmr) / 2, file);
+    fwrite(soundPnt, 2, sizeof(soundPnt) / 2, file);
+    fwrite(soundLen, 4, sizeof(soundLen) / 4, file);
+    fwrite(&mainSoundCnt, sizeof(mainSoundCnt), 1, file);
+    fwrite(&soundBias, sizeof(soundBias), 1, file);
+    fwrite(sndCapCnt, 1, sizeof(sndCapCnt), file);
+    fwrite(sndCapDad, 4, sizeof(sndCapDad) / 4, file);
+    fwrite(sndCapLen, 2, sizeof(sndCapLen) / 2, file);
+
+    for (int i = 0; i < 2; i++) {
+        uint32_t count = gbaFifos[i].size();
+        fwrite(&count, sizeof(count), 1, file);
+        for (uint32_t j = 0; j < count; j++)
+            fwrite(&gbaFifos[i][j], sizeof(gbaFifos[i][j]), 1, file);
+    }
+}
+
+void Spu::loadState(FILE *file) {
+    fread(&gbaFrameSequencer, sizeof(gbaFrameSequencer), 1, file);
+    fread(gbaSoundTimers, 4, sizeof(gbaSoundTimers) / 4, file);
+    fread(gbaEnvelopes, 1, sizeof(gbaEnvelopes), file);
+    fread(gbaEnvTimers, 1, sizeof(gbaEnvTimers), file);
+    fread(&gbaSweepTimer, sizeof(gbaSweepTimer), 1, file);
+    fread(&gbaWaveDigit, sizeof(gbaWaveDigit), 1, file);
+    fread(&gbaNoiseValue, sizeof(gbaNoiseValue), 1, file);
+    fread(gbaWaveRam, 1, sizeof(gbaWaveRam), file);
+    fread(&gbaSampleA, sizeof(gbaSampleA), 1, file);
+    fread(&gbaSampleB, sizeof(gbaSampleB), 1, file);
+    fread(&enabled, sizeof(enabled), 1, file);
+    fread(adpcmValue, 4, sizeof(adpcmValue) / 4, file);
+    fread(adpcmLoopValue, 4, sizeof(adpcmLoopValue) / 4, file);
+    fread(adpcmIndex, 1, sizeof(adpcmIndex), file);
+    fread(adpcmLoopIndex, 1, sizeof(adpcmLoopIndex), file);
+    fread(adpcmToggle, sizeof(bool), sizeof(adpcmToggle) / sizeof(bool), file);
+    fread(dutyCycles, 1, sizeof(dutyCycles), file);
+    fread(noiseValues, 2, sizeof(noiseValues) / 2, file);
+    fread(soundCurrent, 4, sizeof(soundCurrent) / 4, file);
+    fread(soundTimers, 2, sizeof(soundTimers) / 2, file);
+    fread(sndCapCurrent, 4, sizeof(sndCapCurrent) / 4, file);
+    fread(sndCapTimers, 2, sizeof(sndCapTimers) / 2, file);
+    fread(gbaSoundCntL, 1, sizeof(gbaSoundCntL), file);
+    fread(gbaSoundCntH, 2, sizeof(gbaSoundCntH) / 2, file);
+    fread(gbaSoundCntX, 2, sizeof(gbaSoundCntX) / 2, file);
+    fread(&gbaMainSoundCntL, sizeof(gbaMainSoundCntL), 1, file);
+    fread(&gbaMainSoundCntH, sizeof(gbaMainSoundCntH), 1, file);
+    fread(&gbaMainSoundCntX, sizeof(gbaMainSoundCntX), 1, file);
+    fread(&gbaSoundBias, sizeof(gbaSoundBias), 1, file);
+    fread(soundCnt, 4, sizeof(soundCnt) / 4, file);
+    fread(soundSad, 4, sizeof(soundSad) / 4, file);
+    fread(soundTmr, 2, sizeof(soundTmr) / 2, file);
+    fread(soundPnt, 2, sizeof(soundPnt) / 2, file);
+    fread(soundLen, 4, sizeof(soundLen) / 4, file);
+    fread(&mainSoundCnt, sizeof(mainSoundCnt), 1, file);
+    fread(&soundBias, sizeof(soundBias), 1, file);
+    fread(sndCapCnt, 1, sizeof(sndCapCnt), file);
+    fread(sndCapDad, 4, sizeof(sndCapDad) / 4, file);
+    fread(sndCapLen, 2, sizeof(sndCapLen) / 2, file);
+
+    for (int i = 0; i < 2; i++) {
+        gbaFifos[i].clear();
+        uint32_t count;
+        int8_t value;
+        fread(&count, sizeof(count), 1, file);
+        for (uint32_t j = 0; j < count; j++) {
+            fread(&value, sizeof(value), 1, file);
+            gbaFifos[i].push_back(value);
+        }
+    }
+}
+
+uint32_t *Spu::getSamples(int count) {
+    if (bufferSize != count) {
+        delete[] bufferIn;
+        delete[] bufferOut;
+        bufferIn  = new uint32_t[count];
+        bufferOut = new uint32_t[count];
+        bufferSize    = count;
+        bufferPointer = 0;
+        ready         = false;
+    }
+
+    uint32_t *out = new uint32_t[count];
+    bool wait = false;
+
+    if (Settings::fpsLimiter == 2) {
+        u64 startTime = PPCGetTickCount();
+        u64 timeout   = PPCUsToTicks(1000000 / 60);
+        while (true) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            bool isReady = ready;
+            PPCIrqUnlockByMsr(st);
+
+            if (isReady) break;
+
+            if (PPCGetTickCount() - startTime > timeout) {
+                wait = true;
+                break;
+            }
+            KThreadYield();
+        }
+    }
+    else if (Settings::fpsLimiter == 1) {
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (!isReady) {
+            KThrQueueBlock(&waitQueue2, 1);
+        }
+    }
+    else {
+        PPCIrqState st = PPCIrqLockByMsr();
+        if (!ready) wait = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (wait) {
+        uint32_t lastSample = (bufferOut && bufferSize > 0) ? bufferOut[bufferSize - 1] : 0;
+        for (int i = 0; i < count; i++)
+            out[i] = lastSample;
+    }
+    else {
+        memcpy(out, bufferOut, count * sizeof(uint32_t));
+    }
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        ready = false;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (Settings::fpsLimiter == 1) {
+        KThrQueueUnblockAllByValue(&waitQueue1, 1);
+    }
+
+    return out;
+}
+
+void Spu::runGbaSample() {
+    core->schedule(GBA_SPU_SAMPLE, 512);
+    if (!Settings::emulateAudio) return pushSample(0, 0);
+
+    int32_t sampleLeft = 0, sampleRight = 0;
+    if (gbaMainSoundCntX & BIT(7)) {
+        int32_t data[4] = {};
+        for (int i = 0; i < 2; i++) {
+            if (!(gbaMainSoundCntX & BIT(i)))
+                continue;
+
+            if (i == 0 && gbaFrameSequencer % 256 == 128 && (gbaSoundCntL[i] & 0x70) && --gbaSweepTimer <= 0) {
+                uint16_t frequency = (gbaSoundCntX[i] & 0x07FF);
+                int sweep = frequency >> (gbaSoundCntL[i] & 0x07);
+                if (gbaSoundCntL[i] & BIT(3)) sweep = -sweep;
+
+                frequency += sweep;
+
+                if (frequency < 0x800) {
+                    gbaSoundCntX[i] = (gbaSoundCntX[i] & ~0x07FF) | frequency;
+                    gbaSweepTimer = (gbaSoundCntL[i] & 0x70) >> 4;
+                }
+                else {
+                    gbaMainSoundCntX &= ~BIT(i);
+                    continue;
+                }
+            }
+
+            gbaSoundTimers[i] -= 4;
+            while ((gbaSoundTimers[i]) <= 0)
+                gbaSoundTimers[i] += 2048 - (gbaSoundCntX[i] & 0x07FF);
+
+            int duty;
+            switch ((gbaSoundCntH[i] & 0x00C0) >> 6) {
+                case 0: duty = (2048 - (gbaSoundCntX[i] & 0x07FF)) * 7 / 8; break;
+                case 1: duty = (2048 - (gbaSoundCntX[i] & 0x07FF)) * 6 / 8; break;
+                case 2: duty = (2048 - (gbaSoundCntX[i] & 0x07FF)) * 4 / 8; break;
+                case 3: duty = (2048 - (gbaSoundCntX[i] & 0x07FF)) * 2 / 8; break;
+                default: duty = 0; break;
+            }
+
+            data[i] = (gbaSoundTimers[i] < duty) ? -0x80 : 0x80;
+
+            if (gbaFrameSequencer % 128 == 0 && (gbaSoundCntX[i] & BIT(14)) && (gbaSoundCntH[i] & 0x003F)) {
+                gbaSoundCntH[i] = (gbaSoundCntH[i] & ~0x003F) | ((gbaSoundCntH[i] & 0x003F) - 1);
+
+                if ((gbaSoundCntH[i] & 0x003F) == 0)
+                    gbaMainSoundCntX &= ~BIT(i);
+            }
+
+            if (gbaFrameSequencer == 448 && --gbaEnvTimers[i] <= 0) {
+                if (gbaEnvTimers[i] == 0) {
+                    if ((gbaSoundCntH[i] & BIT(11)) && gbaEnvelopes[i] < 15)
+                        gbaEnvelopes[i]++;
+                    else if (!(gbaSoundCntH[i] & BIT(11)) && gbaEnvelopes[i] > 0)
+                        gbaEnvelopes[i]--;
+                }
+                else {
+                    gbaEnvelopes[i] = (gbaSoundCntH[i] & 0xF000) >> 12;
+                }
+
+                gbaEnvTimers[i] = (gbaSoundCntH[i] & 0x0700) >> 8;
+            }
+
+            data[i] = data[i] * gbaEnvelopes[i] / 15;
+        }
+
+        if ((gbaMainSoundCntX & BIT(2)) && (gbaSoundCntL[1] & BIT(7))) {
+            gbaSoundTimers[2] -= 64;
+            while ((gbaSoundTimers[2]) <= 0) {
+                gbaSoundTimers[2] += (2048 - (gbaSoundCntX[2] & 0x07FF));
+                gbaWaveDigit = (gbaWaveDigit + 1) % 64;
+            }
+
+            int bank = (gbaSoundCntL[1] & BIT(6)) >> 6;
+            if ((gbaSoundCntL[1] & BIT(5)) && gbaWaveDigit >= 32)
+                bank = !bank;
+
+            data[2] = gbaWaveRam[bank][(gbaWaveDigit % 32) / 2];
+            if (gbaWaveDigit & 1)
+                data[2] &= 0x0F;
+            else
+                data[2] >>= 4;
+
+            if (gbaFrameSequencer % 128 == 0 && (gbaSoundCntX[2] & BIT(14)) && (gbaSoundCntH[2] & 0x00FF)) {
+                gbaSoundCntH[2] = (gbaSoundCntH[2] & ~0x00FF) | ((gbaSoundCntH[2] & 0x00FF) - 1);
+
+                if ((gbaSoundCntH[2] & 0x00FF) == 0)
+                    gbaMainSoundCntX &= ~BIT(2);
+            }
+
+            switch ((gbaSoundCntH[2] & 0xE000) >> 13) {
+                case 0: data[2] >>= 4; break;
+                case 1: data[2] >>= 0; break;
+                case 2: data[2] >>= 1; break;
+                case 3: data[2] >>= 2; break;
+                default: data[2] = data[2] * 3 / 4; break;
+            }
+
+            data[2] = (data[2] * 0x100 / 0xF);
+        }
+
+        if (gbaMainSoundCntX & BIT(3)) {
+            gbaSoundTimers[3] -= 16;
+            while ((gbaSoundTimers[3]) <= 0) {
+                int divisor = (gbaSoundCntX[3] & 0x0007) * 16;
+                if (divisor == 0) divisor = 8;
+                gbaSoundTimers[3] += (divisor << ((gbaSoundCntX[3] & 0x00F0) >> 4));
+
+                gbaNoiseValue &= ~BIT(15);
+                if (gbaNoiseValue & BIT(0))
+                    gbaNoiseValue = BIT(15) | ((gbaNoiseValue >> 1) ^ ((gbaSoundCntH[3] & BIT(3)) ? 0x60 : 0x6000));
+                else
+                    gbaNoiseValue >>= 1;
+            }
+
+            data[3] = (gbaNoiseValue & BIT(15)) ? 0x80 : -0x80;
+
+            if (gbaFrameSequencer % 128 == 0 && (gbaSoundCntX[3] & BIT(14)) && (gbaSoundCntH[3] & 0x003F)) {
+                gbaSoundCntH[3] = (gbaSoundCntH[3] & ~0x003F) | ((gbaSoundCntH[3] & 0x003F) - 1);
+
+                if ((gbaSoundCntH[3] & 0x003F) == 0)
+                    gbaMainSoundCntX &= ~BIT(3);
+            }
+
+            if (gbaFrameSequencer == 448 && --gbaEnvTimers[2] <= 0) {
+                if (gbaEnvTimers[2] == 0) {
+                    if ((gbaSoundCntH[3] & BIT(11)) && gbaEnvelopes[2] < 15)
+                        gbaEnvelopes[2]++;
+                    else if (!(gbaSoundCntH[3] & BIT(11)) && gbaEnvelopes[2] > 0)
+                        gbaEnvelopes[2]--;
+                }
+                else {
+                    gbaEnvelopes[2] = (gbaSoundCntH[3] & 0xF000) >> 12;
+                }
+
+                gbaEnvTimers[2] = (gbaSoundCntH[3] & 0x0700) >> 8;
+            }
+
+            data[3] = data[3] * gbaEnvelopes[2] / 15;
+        }
+
+        for (int i = 0; i < 4; i++) {
+            switch (gbaMainSoundCntH & 0x0003) {
+                case 0: data[i] >>= 2; break;
+                case 1: data[i] >>= 1; break;
+                case 2: data[i] >>= 0; break;
+            }
+
+            if (gbaMainSoundCntL & BIT(12 + i))
+                sampleLeft += data[i] * ((gbaMainSoundCntL & 0x0070) >> 4) / 7;
+            if (gbaMainSoundCntL & BIT(8 + i))
+                sampleRight += data[i] * (gbaMainSoundCntL & 0x0007) / 7;
+        }
+
+        if (gbaMainSoundCntH & BIT(9))
+            sampleLeft += gbaSampleA << ((gbaMainSoundCntH & BIT(2)) ? 2 : 1);
+        if (gbaMainSoundCntH & BIT(8))
+            sampleRight += gbaSampleA << ((gbaMainSoundCntH & BIT(2)) ? 2 : 1);
+
+        if (gbaMainSoundCntH & BIT(13))
+            sampleLeft += gbaSampleB << ((gbaMainSoundCntH & BIT(3)) ? 2 : 1);
+        if (gbaMainSoundCntH & BIT(12))
+            sampleRight += gbaSampleB << ((gbaMainSoundCntH & BIT(3)) ? 2 : 1);
+
+        gbaFrameSequencer = (gbaFrameSequencer + 1) % 512;
+    }
+
+    sampleLeft  = (std::max(0, std::min<int32_t>(0x3FF, sampleLeft  + (gbaSoundBias & 0x3FF))) - 0x200) << 6;
+    sampleRight = (std::max(0, std::min<int32_t>(0x3FF, sampleRight + (gbaSoundBias & 0x3FF))) - 0x200) << 6;
+    pushSample(sampleLeft, sampleRight);
+}
+
+void Spu::runSample() {
+    core->schedule(NDS_SPU_SAMPLE, 512 * 2);
+    if (!Settings::emulateAudio) return pushSample(0, 0);
+
+    int64_t mixerLeft = 0, mixerRight = 0;
+    int64_t channelsLeft[2] = {}, channelsRight[2] = {};
+    for (int i = 0; enabled >> i; i++) {
+        if (!(enabled & BIT(i))) continue;
+        uint8_t format = (soundCnt[i] >> 29) & 0x3;
+        int64_t data = 0;
+
+        switch (format) {
+        case 0:
+            data = (int8_t)core->memory.read<uint8_t>(1, soundCurrent[i]) << 8;
+            break;
+
+        case 1:
+            data = (int16_t)core->memory.read<uint16_t>(1, soundCurrent[i]);
+            break;
+
+        case 2:
+            data = adpcmValue[i];
+            break;
+
+        case 3:
+            if (i >= 8 && i <= 13) {
+                uint8_t duty = 7 - ((soundCnt[i] & 0x07000000) >> 24);
+                data = (dutyCycles[i - 8] < duty) ? -0x7FFF : 0x7FFF;
+            }
+            else if (i >= 14) {
+                data = (noiseValues[i - 14] & BIT(15)) ? -0x7FFF : 0x7FFF;
+            }
+            break;
+        }
+
+        soundTimers[i] += 512;
+        bool overflow = (soundTimers[i] < 512);
+
+        while (overflow) {
+            soundTimers[i] += soundTmr[i];
+            overflow = (soundTimers[i] < soundTmr[i]);
+
+            switch (format) {
+            case 0: case 1:
+                soundCurrent[i] += 1 + format;
+                break;
+
+            case 2: {
+                if (soundCurrent[i] == soundSad[i] + soundPnt[i] * 4 && !adpcmToggle[i]) {
+                    adpcmLoopValue[i] = adpcmValue[i];
+                    adpcmLoopIndex[i] = adpcmIndex[i];
+                }
+
+                uint8_t adpcmData = core->memory.read<uint8_t>(1, soundCurrent[i]);
+                adpcmData = adpcmToggle[i] ? ((adpcmData & 0xF0) >> 4) : (adpcmData & 0x0F);
+
+                int32_t diff = adpcmTable[adpcmIndex[i]] / 8;
+                if (adpcmData & BIT(0)) diff += adpcmTable[adpcmIndex[i]] / 4;
+                if (adpcmData & BIT(1)) diff += adpcmTable[adpcmIndex[i]] / 2;
+                if (adpcmData & BIT(2)) diff += adpcmTable[adpcmIndex[i]] / 1;
+
+                if (adpcmData & BIT(3)) {
+                    adpcmValue[i] += diff;
+                    if (adpcmValue[i] > 0x7FFF) adpcmValue[i] = 0x7FFF;
+                }
+                else {
+                    adpcmValue[i] -= diff;
+                    if (adpcmValue[i] < -0x7FFF) adpcmValue[i] = -0x7FFF;
+                }
+
+                adpcmIndex[i] += indexTable[adpcmData & 0x7];
+                if (adpcmIndex[i] < 0)  adpcmIndex[i] = 0;
+                if (adpcmIndex[i] > 88) adpcmIndex[i] = 88;
+
+                adpcmToggle[i] = !adpcmToggle[i];
+                if (!adpcmToggle[i]) soundCurrent[i]++;
+
+                break;
+            }
+
+            case 3:
+                if (i >= 8 && i <= 13) {
+                    dutyCycles[i - 8] = (dutyCycles[i - 8] + 1) % 8;
+                }
+                else if (i >= 14) {
+                    noiseValues[i - 14] &= ~BIT(15);
+
+                    if (noiseValues[i - 14] & BIT(0))
+                        noiseValues[i - 14] = BIT(15) | ((noiseValues[i - 14] >> 1) ^ 0x6000);
+                    else
+                        noiseValues[i - 14] >>= 1;
+                }
+                break;
+            }
+
+            if (format != 3 && soundCurrent[i] >= soundSad[i] + (soundPnt[i] + soundLen[i]) * 4) {
+                if ((soundCnt[i] & 0x18000000) >> 27 == 1) {
+                    soundCurrent[i] = soundSad[i] + soundPnt[i] * 4;
+
+                    if (format == 2) {
+                        adpcmValue[i]  = adpcmLoopValue[i];
+                        adpcmIndex[i]  = adpcmLoopIndex[i];
+                        adpcmToggle[i] = false;
+                    }
+                }
+                else {
+                    soundCnt[i] &= ~BIT(31);
+                    enabled     &= ~BIT(i);
+                    break;
+                }
+            }
+        }
+
+        int divShift = (soundCnt[i] & 0x00000300) >> 8;
+        if (divShift == 3) divShift++;
+        data <<= 4 - divShift;
+
+        int mulFactor = (soundCnt[i] & 0x0000007F);
+        if (mulFactor == 127) mulFactor++;
+        data = (data << 7) * mulFactor / 128;
+
+        int panValue = (soundCnt[i] & 0x007F0000) >> 16;
+        if (panValue == 127) panValue++;
+        int64_t dataLeft  = (data * (128 - panValue) / 128) >> 3;
+        int64_t dataRight = (data *          panValue / 128) >> 3;
+
+        if (i == 1 || i == 3) {
+            channelsLeft[i >> 1]  = dataLeft;
+            channelsRight[i >> 1] = dataRight;
+            if (mainSoundCnt & BIT(12 + (i >> 1)))
+                continue;
+        }
+
+        mixerLeft  += dataLeft;
+        mixerRight += dataRight;
+    }
+
+    for (int i = 0; i < 2; i++) {
+        if (!(sndCapCnt[i] & BIT(7)))
+            continue;
+
+        sndCapTimers[i] += 512;
+        bool overflow = (sndCapTimers[i] < 512);
+
+        while (overflow) {
+            sndCapTimers[i] += soundTmr[1 + (i << 1)];
+            overflow = (sndCapTimers[i] < soundTmr[1 + (i << 1)]);
+
+            int64_t sample = ((i == 0) ? mixerLeft : mixerRight);
+            if (sample >  0x7FFFFF) sample =  0x7FFFFF;
+            if (sample < -0x800000) sample = -0x800000;
+
+            if (sndCapCnt[i] & BIT(3)) {
+                core->memory.write<uint8_t>(1, sndCapCurrent[i], sample >> 16);
+                sndCapCurrent[i]++;
+            }
+            else {
+                core->memory.write<uint16_t>(1, sndCapCurrent[i], sample >> 8);
+                sndCapCurrent[i] += 2;
+            }
+
+            if (sndCapCurrent[i] >= sndCapDad[i] + sndCapLen[i] * 4) {
+                if (sndCapCnt[i] & BIT(2)) {
+                    sndCapCnt[i] &= ~BIT(7);
+                    continue;
+                }
+                else {
+                    sndCapCurrent[i] = sndCapDad[i];
+                }
+            }
+        }
+    }
+
+    int64_t sampleLeft;
+    switch ((mainSoundCnt & 0x0300) >> 8) {
+        case 0: sampleLeft = mixerLeft;                              break;
+        case 1: sampleLeft = channelsLeft[0];                       break;
+        case 2: sampleLeft = channelsLeft[1];                       break;
+        case 3: sampleLeft = channelsLeft[0] + channelsLeft[1];     break;
+        default: sampleLeft = mixerLeft; break;
+    }
+
+    int64_t sampleRight;
+    switch ((mainSoundCnt & 0x0C00) >> 10) {
+        case 0: sampleRight = mixerRight;                             break;
+        case 1: sampleRight = channelsRight[0];                      break;
+        case 2: sampleRight = channelsRight[1];                      break;
+        case 3: sampleRight = channelsRight[0] + channelsRight[1];   break;
+        default: sampleRight = mixerRight; break;
+    }
+
+    int masterVol = (mainSoundCnt & 0x007F);
+    if (masterVol == 127) masterVol++;
+    sampleLeft  = (sampleLeft  * masterVol / 128) >> 8;
+    sampleRight = (sampleRight * masterVol / 128) >> 8;
+
+    if (Settings::audio16Bit) {
+        sampleLeft  = (std::max(0, std::min<int32_t>(0xFFFF, (int32_t)sampleLeft  + (soundBias << 6))) - 0x8000);
+        sampleRight = (std::max(0, std::min<int32_t>(0xFFFF, (int32_t)sampleRight + (soundBias << 6))) - 0x8000);
+    }
+    else {
+        sampleLeft  = (std::max(0, std::min<int32_t>(0x3FF, (int32_t)(sampleLeft  >> 6) + soundBias)) - 0x200) << 6;
+        sampleRight = (std::max(0, std::min<int32_t>(0x3FF, (int32_t)(sampleRight >> 6) + soundBias)) - 0x200) << 6;
+    }
+    pushSample((int16_t)sampleLeft, (int16_t)sampleRight);
+}
+
+void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
+    if (!bufferSize) return;
+    bufferIn[bufferPointer++] = ((uint32_t)(uint16_t)sampleRight << 16)
+                              | ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);
+    if (bufferPointer != bufferSize) return;
+
+    if (Settings::fpsLimiter == 2) {
+        u64 startTime = PPCGetTickCount();
+        u64 timeout   = PPCUsToTicks(1000000);
+        while (true) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            bool isReady = ready;
+            PPCIrqUnlockByMsr(st);
+
+            if (!isReady) break;
+
+            if (PPCGetTickCount() - startTime > timeout) break;
+
+            KThreadYield();
+        }
+    }
+    else if (Settings::fpsLimiter == 1) {
+        PPCIrqState st = PPCIrqLockByMsr();
+        bool isReady = ready;
+        PPCIrqUnlockByMsr(st);
+
+        if (isReady) {
+            KThrQueueBlock(&waitQueue1, 1);
+        }
+    }
+
+    std::swap(bufferIn, bufferOut);
+    bufferPointer = 0;
+
+    {
+        PPCIrqState st = PPCIrqLockByMsr();
+        ready = true;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    if (Settings::fpsLimiter == 1) {
+        KThrQueueUnblockAllByValue(&waitQueue2, 1);
+    }
+}
+
+void Spu::startChannel(int channel) {
+    soundCurrent[channel] = soundSad[channel];
+    soundTimers[channel]  = soundTmr[channel];
+
+    switch ((soundCnt[channel] & 0x60000000) >> 29) {
+    case 2: {
+        uint32_t header = core->memory.read<uint32_t>(1, soundSad[channel]);
+        adpcmValue[channel]  = (int16_t)header;
+        adpcmIndex[channel]  = (header & 0x007F0000) >> 16;
+        if (adpcmIndex[channel] > 88) adpcmIndex[channel] = 88;
+        adpcmToggle[channel] = false;
+        soundCurrent[channel] += 4;
+        break;
+    }
+
+    case 3:
+        if (channel >= 8 && channel <= 13)
+            dutyCycles[channel - 8] = 0;
+        else if (channel >= 14)
+            noiseValues[channel - 14] = 0x7FFF;
+        break;
+    }
+
+    enabled |= BIT(channel);
+}
+
+void Spu::gbaFifoTimer(int timer) {
+    if (((gbaMainSoundCntH & BIT(10)) >> 10) == timer) {
+        if (!gbaFifos[0].empty()) {
+            gbaSampleA = gbaFifos[0].front();
+            gbaFifos[0].pop_front();
+        }
+
+        if (gbaFifos[0].size() <= 16)
+            core->dma[1].trigger(3, 0x02);
+    }
+
+    if (((gbaMainSoundCntH & BIT(14)) >> 14) == timer) {
+        if (!gbaFifos[1].empty()) {
+            gbaSampleB = gbaFifos[1].front();
+            gbaFifos[1].pop_front();
+        }
+
+        if (gbaFifos[1].size() <= 16)
+            core->dma[1].trigger(3, 0x04);
+    }
+}
+
+void Spu::writeGbaSoundCntL(int channel, uint8_t value) {
+    if (!(gbaMainSoundCntX & BIT(7))) return;
+    uint8_t mask = (channel == 0) ? 0x7F : 0xE0;
+    gbaSoundCntL[channel / 2] = (gbaSoundCntL[channel / 2] & ~mask) | (value & mask);
+}
+
+void Spu::writeGbaSoundCntH(int channel, uint16_t mask, uint16_t value) {
+    if (!(gbaMainSoundCntX & BIT(7))) return;
+    switch (channel) {
+        case 2: mask &= 0xE0FF; break;
+        case 3: mask &= 0xFF3F; break;
+    }
+    gbaSoundCntH[channel] = (gbaSoundCntH[channel] & ~mask) | (value & mask);
+}
+
+void Spu::writeGbaSoundCntX(int channel, uint16_t mask, uint16_t value) {
+    if (!(gbaMainSoundCntX & BIT(7))) return;
+    mask &= (channel == 3) ? 0x40FF : 0x47FF;
+    gbaSoundCntX[channel] = (gbaSoundCntX[channel] & ~mask) | (value & mask);
+
+    if (!Settings::emulateAudio || !(value & BIT(15))) return;
+    gbaMainSoundCntX |= BIT(channel);
+    if (channel < 2) {
+        if (channel == 0) gbaSweepTimer = (gbaSoundCntL[0] & 0x70) >> 4;
+        gbaEnvelopes[channel] = (gbaSoundCntH[channel] & 0xF000) >> 12;
+        gbaEnvTimers[channel] = (gbaSoundCntH[channel] & 0x0700) >> 8;
+        gbaSoundTimers[channel] = 2048 - (gbaSoundCntX[channel] & 0x07FF);
+    }
+    else if (channel == 2) {
+        gbaWaveDigit = 0;
+        gbaSoundTimers[2] = 2048 - (gbaSoundCntX[2] & 0x07FF);
+    }
+    else {
+        gbaNoiseValue = (gbaSoundCntH[3] & BIT(3)) ? 0x40 : 0x4000;
+        gbaEnvelopes[2] = (gbaSoundCntH[3] & 0xF000) >> 12;
+        gbaEnvTimers[2] = (gbaSoundCntH[3] & 0x0700) >> 8;
+
+        int divisor = (gbaSoundCntX[3] & 0x0007) * 16;
+        if (divisor == 0) divisor = 8;
+        gbaSoundTimers[3] = (divisor << ((gbaSoundCntX[3] & 0x00F0) >> 4));
+    }
+}
+
+void Spu::writeGbaMainSoundCntL(uint16_t mask, uint16_t value) {
+    if (!(gbaMainSoundCntX & BIT(7))) return;
+    mask &= 0xFF77;
+    gbaMainSoundCntL = (gbaMainSoundCntL & ~mask) | (value & mask);
+}
+
+void Spu::writeGbaMainSoundCntH(uint16_t mask, uint16_t value) {
+    mask &= 0x770F;
+    gbaMainSoundCntH = (gbaMainSoundCntH & ~mask) | (value & mask);
+
+    if (value & BIT(11)) gbaFifos[0].clear();
+    if (value & BIT(15)) gbaFifos[1].clear();
+}
+
+void Spu::writeGbaMainSoundCntX(uint8_t value) {
+    gbaMainSoundCntX = (gbaMainSoundCntX & ~0x80) | (value & 0x80);
+
+    if (!(gbaMainSoundCntX & BIT(7))) {
+        for (int i = 0; i < 4; i++) {
+            if (i < 2) gbaSoundCntL[i] = 0;
+            gbaSoundCntH[i] = 0;
+            gbaSoundCntX[i] = 0;
+        }
+        gbaMainSoundCntL  = 0;
+        gbaMainSoundCntX &= ~0x0F;
+        gbaFrameSequencer = 0;
+    }
+}
+
+void Spu::writeGbaSoundBias(uint16_t mask, uint16_t value) {
+    mask &= 0xC3FE;
+    gbaSoundBias = (gbaSoundBias & ~mask) | (value & mask);
+}
+
+void Spu::writeGbaWaveRam(int index, uint8_t value) {
+    gbaWaveRam[!(gbaSoundCntL[1] & BIT(6))][index] = value;
+}
+
+void Spu::writeGbaFifoA(uint32_t mask, uint32_t value) {
+    for (int i = 0; i < 32; i += 8)
+        if (gbaFifos[0].size() < 32 && (mask & (0xFF << i)))
+            gbaFifos[0].push_back(value >> i);
+}
+
+void Spu::writeGbaFifoB(uint32_t mask, uint32_t value) {
+    for (int i = 0; i < 32; i += 8)
+        if (gbaFifos[1].size() < 32 && (mask & (0xFF << i)))
+            gbaFifos[1].push_back(value >> i);
+}
+
+void Spu::writeSoundCnt(int channel, uint32_t mask, uint32_t value) {
+    if (!Settings::emulateAudio) value &= ~BIT(31);
+    bool enable = (!(soundCnt[channel] & BIT(31)) && (value & mask & BIT(31)));
+
+    mask &= 0xFF7F837F;
+    soundCnt[channel] = (soundCnt[channel] & ~mask) | (value & mask);
+
+    if (enable && (mainSoundCnt & BIT(15)) &&
+        (soundSad[channel] != 0 || ((soundCnt[channel] & 0x60000000) >> 29) == 3))
+        startChannel(channel);
+    else if (!(soundCnt[channel] & BIT(31)))
+        enabled &= ~BIT(channel);
+}
+
+void Spu::writeSoundSad(int channel, uint32_t mask, uint32_t value) {
+    mask &= 0x07FFFFFC;
+    soundSad[channel] = (soundSad[channel] & ~mask) | (value & mask);
+
+    if (((soundCnt[channel] & 0x60000000) >> 29) != 3) {
+        if (soundSad[channel] != 0 && (mainSoundCnt & BIT(15)) &&
+            (soundCnt[channel] & BIT(31)))
+            startChannel(channel);
+        else
+            enabled &= ~BIT(channel);
+    }
+}
+
+void Spu::writeSoundTmr(int channel, uint16_t mask, uint16_t value) {
+    soundTmr[channel] = (soundTmr[channel] & ~mask) | (value & mask);
+}
+
+void Spu::writeSoundPnt(int channel, uint16_t mask, uint16_t value) {
+    soundPnt[channel] = (soundPnt[channel] & ~mask) | (value & mask);
+}
+
+void Spu::writeSoundLen(int channel, uint32_t mask, uint32_t value) {
+    mask &= 0x003FFFFF;
+    soundLen[channel] = (soundLen[channel] & ~mask) | (value & mask);
+}
+
+void Spu::writeMainSoundCnt(uint16_t mask, uint16_t value) {
+    bool enable = (!(mainSoundCnt & BIT(15)) && (value & BIT(15)));
+    mask &= 0xBF7F;
+    mainSoundCnt = (mainSoundCnt & ~mask) | (value & mask);
+
+    if (enable) {
+        for (int i = 0; i < 16; i++) {
+            if ((soundCnt[i] & BIT(31)) &&
+                (soundSad[i] != 0 || ((soundCnt[i] & 0x60000000) >> 29) == 3))
+                startChannel(i);
+        }
+    }
+    else if (!(mainSoundCnt & BIT(15))) {
+        enabled = 0;
+    }
+}
+
+void Spu::writeSoundBias(uint16_t mask, uint16_t value) {
+    mask &= 0x03FF;
+    soundBias = (soundBias & ~mask) | (value & mask);
+}
+
+void Spu::writeSndCapCnt(int channel, uint8_t value) {
+    if (!(sndCapCnt[channel] & BIT(7)) && (value & BIT(7))) {
+        sndCapCurrent[channel] = sndCapDad[channel];
+        sndCapTimers[channel]  = soundTmr[1 + (channel << 1)];
+    }
+    sndCapCnt[channel] = (value & 0x8F);
+}
+
+void Spu::writeSndCapDad(int channel, uint32_t mask, uint32_t value) {
+    mask &= 0x07FFFFFC;
+    sndCapDad[channel] = (sndCapDad[channel] & ~mask) | (value & mask);
+
+    sndCapCurrent[channel] = sndCapDad[channel];
+    sndCapTimers[channel]  = soundTmr[1 + (channel << 1)];
+}
+
+void Spu::writeSndCapLen(int channel, uint16_t mask, uint16_t value) {
+    sndCapLen[channel] = (sndCapLen[channel] & ~mask) | (value & mask);
+}
+
+uint8_t Spu::readGbaSoundCntL(int channel) {
+    return gbaSoundCntL[channel / 2];
+}
+
+uint16_t Spu::readGbaSoundCntH(int channel) {
+    return gbaSoundCntH[channel] & ~((channel == 2) ? 0x00FF : 0x003F);
+}
+
+uint16_t Spu::readGbaSoundCntX(int channel) {
+    return gbaSoundCntX[channel] & ~((channel == 3) ? 0x0000 : 0x07FF);
+}
+
+uint8_t Spu::readGbaWaveRam(int index) {
+    return gbaWaveRam[!(gbaSoundCntL[1] & BIT(6))][index];
+}
