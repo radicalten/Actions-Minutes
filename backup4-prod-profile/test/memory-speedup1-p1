@@ -1,4 +1,4 @@
-I would like to share .cpp files for a DS emulator that runs on Wii. Core.h/cpp have already been optimized for speed. I would like you to see core.h/cpp first. Then I will share my next files. 
+Could you help optimize my wii powerpc .cpp files for speed? Core.h/cpp have already been optimized. Here they are for reference:
 
 //core.h
 #pragma once
