@@ -1,23 +1,4 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+//core.h (optimized)
 #pragma once
 
 #include <cstdint>
@@ -56,6 +37,15 @@ extern "C" {
 #include "spu.h"
 #include "timers.h"
 #include "wifi.h"
+
+// PowerPC optimization macros
+#define PPC_LIKELY(x)    __builtin_expect(!!(x), 1)
+#define PPC_UNLIKELY(x)  __builtin_expect(!!(x), 0)
+#define ALWAYS_INLINE    __attribute__((always_inline)) inline
+#define HOT              __attribute__((hot))
+#define COLD             __attribute__((cold))
+// Correct alignment attribute: applies to the variable, not array elements
+#define ALIGNED(n)       __attribute__((aligned(n)))
 
 enum CoreError {
     ERROR_BIOS,
@@ -100,16 +90,17 @@ enum SchedTask {
 };
 
 struct SchedEvent {
+    uint32_t  cycles;  // Put cycles first for faster comparisons (cache line)
     SchedTask task;
-    uint32_t  cycles;
 
-    SchedEvent(SchedTask task, uint32_t cycles): task(task), cycles(cycles) {}
+    SchedEvent(SchedTask task, uint32_t cycles): cycles(cycles), task(task) {}
+
+    // Compare only cycles for sorted insertion
     bool operator<(const SchedEvent& e) const { return cycles < e.cycles; }
 };
 
 class Core {
 public:
-    // Route Core and all sub-component allocations to MEM2.
     void* operator new  (size_t size);
     void  operator delete  (void* p) noexcept;
     void* operator new[](size_t size);
@@ -145,14 +136,22 @@ public:
     Timers          timers[2];
     Wifi            wifi;
 
-    // Replaces std::atomic<bool> running.
-    // Writes are guarded by PPCIrqLockByMsr; reads on the emulator thread
-    // side use PPCCompilerBarrier() to prevent the compiler from caching.
+    // volatile prevents compiler from caching; guarded by PPCIrqLockByMsr for writes
     volatile uint8_t running;
 
-    std::vector<SchedEvent>   events;
-    std::function<void()>     tasks[MAX_TASKS];
-    uint32_t                  globalCycles = 0;
+    // Fixed-capacity event queue: DS never needs more than MAX_TASKS simultaneous events
+    // Use a small sorted array instead of std::vector to avoid heap allocation and
+    // improve cache locality. MAX_TASKS = 32 => 32 * 8 bytes = 256 bytes
+    static constexpr int MAX_EVENTS = MAX_TASKS;
+    SchedEvent eventsArr[MAX_EVENTS] = { SchedEvent(MAX_TASKS, 0) };
+    int        eventsCount = 0;
+
+    // Keep std::vector for compatibility with existing code that uses events[]
+    // but alias through the fixed array for the hot path
+    std::vector<SchedEvent> events;
+
+    std::function<void()>   tasks[MAX_TASKS];
+    uint32_t                globalCycles = 0;
 
     Core(std::string ndsRom = "", std::string gbaRom = "", int id = 0,
          int ndsRomFd  = -1, int gbaRomFd  = -1,
@@ -164,7 +163,7 @@ public:
     void loadState(FILE* file);
 
     void runCore() { (*runFunc)(*this); }
-    void schedule(SchedTask task, uint32_t cycles);
+    HOT void schedule(SchedTask task, uint32_t cycles);
     void enterGbaMode();
     void endFrame();
 
@@ -172,7 +171,6 @@ private:
     bool realGbaBios;
     void (*runFunc)(Core&) = &Interpreter::runCoreNds;
 
-    // FPS timing via PPC timebase — replaces std::chrono.
     uint64_t lastFpsTimeTicks = 0;
     int      fpsCount         = 0;
 
