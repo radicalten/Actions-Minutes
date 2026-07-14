@@ -331,7 +331,7 @@ static void InitializeSettings() {
     Settings::gbaBiosPath  = "sd:/noods/bios/gba_bios.bin";
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
-    Settings::fpsLimiter   = 1;
+    Settings::fpsLimiter   = 0;
     Settings::frameskip    = 2;
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
