@@ -244,5 +244,7 @@ private:
 
     // Wifi (arg ignored / arg = cmd)
     static void shim_wifiCountMs    (void* o, int)  { static_cast<Wifi*>(o)->countMs();          }
-    static void shim_wifiTransmit   (void* o, int a){ static_cast<Wifi*>(o)->transmitPacket(a);  }
+    static void shim_wifiTransmit(void* o, int a) {
+    static_cast<Wifi*>(o)->transmitPacket(static_cast<PacketType>(a));
+}
 };
