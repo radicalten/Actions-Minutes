@@ -1,3 +1,0 @@
-the original main by cson4.6 works perfectly for whatever reason, changes made by gemini3.5 flash to make the menu smaller makes the game crash when fps limiter is toggled on and off whereas in the original implementaiton it is fine.
-
-claude when it selffixed using the new changes I asked gemini to make made them and implemented it perfectly can toggle sound on and off without a hitch. fps limiter too. very impressive. I will only bundle one binary.
