@@ -161,8 +161,6 @@ struct SettingsEntry {
 
 static const char* const s_toggleNames[]      = { "Off", "On" };
 static const char* const s_frameskipNames[]   = { "None", "1", "2", "3", "4", "5" };
-static const char* const s_filterNames[]      = { "Nearest", "Upscaled", "Linear" };
-static const char* const s_threaded3DNames[]  = { "Off", "1 Thread", "2 Threads" };
 
 // The table — built once, used every frame the menu is open.
 // Section headers have value == nullptr.
@@ -170,24 +168,13 @@ static const SettingsEntry s_settingsTable[] = {
     // ---- General ----
     { "-- General --",          nullptr,                    0, nullptr,           0 },
     { "Direct Boot",            &Settings::directBoot,      2, s_toggleNames,     2 },
-    { "FPS Limiter",            &Settings::fpsLimiter,      2, s_toggleNames,     2 },
-    // ---- Graphics ----
-    { "-- Graphics --",         nullptr,                    0, nullptr,           0 },
     { "Skip Frames",            &Settings::frameskip,       6, s_frameskipNames,  6 },
-    { "Threaded 2D",            &Settings::threaded2D,      2, s_toggleNames,     2 },
-    { "Threaded 3D",            &Settings::threaded3D,      3, s_threaded3DNames, 3 },
-    { "High-Res 3D",            &Settings::highRes3D,       2, s_toggleNames,     2 },
-    { "Simulate Ghosting",      &Settings::screenGhost,     2, s_toggleNames,     2 },
-    { "Screen Filter",          &Settings::screenFilter,    3, s_filterNames,     3 },
+    { "FPS Limiter",            &Settings::fpsLimiter,      2, s_toggleNames,     2 },
     // ---- Audio ----
     { "-- Audio --",            nullptr,                    0, nullptr,           0 },
     { "Audio Emulation",        &Settings::emulateAudio,    2, s_toggleNames,     2 },
     { "16-bit Output",          &Settings::audio16Bit,      2, s_toggleNames,     2 },
     { "Mono Audio",             &Settings::monoAudio,       2, s_toggleNames,     2 },
-    // ---- Experimental ----
-    { "-- Experimental --",     nullptr,                    0, nullptr,           0 },
-    { "HLE ARM7",               &Settings::arm7Hle,         2, s_toggleNames,     2 },
-    { "DSi Mode",               &Settings::dsiMode,         2, s_toggleNames,     2 },
 };
 
 static const int s_settingsCount =
