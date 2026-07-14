@@ -1,0 +1,5 @@
+I have .cpp files for a DS emulator to run on Wii. Currently the core.h/cpp portion of the emulator has updated its scheduling mechanism, but not every file is adapted to it yet. 
+I would like you to implement a setings menu in my emulator to work in conjunction with the existing file browser. Please be patient as I upload the required files. Do not make changes yet please.
+
+
+
