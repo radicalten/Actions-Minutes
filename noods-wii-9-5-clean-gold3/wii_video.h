@@ -1,22 +1,4 @@
-/*
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+// wii_video.h (optimized)
 #ifndef WII_VIDEO_H
 #define WII_VIDEO_H
 
@@ -25,13 +7,28 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+extern "C" {
+    #include <tuxedo/ppc/intrinsics.h>
+}
+
 #define NDS_SCREEN_WIDTH  256
 #define NDS_SCREEN_HEIGHT 192
-
 #define GBA_SCREEN_WIDTH  240
 #define GBA_SCREEN_HEIGHT 160
 
-struct WiiVideoSystem {
+#define DEBUG_OVERLAY_WIDTH  256
+#define DEBUG_OVERLAY_HEIGHT  64
+
+// Cache line size on Wii/GameCube Broadway CPU
+#define PPC_CACHE_LINE 32
+
+// Alignment helpers
+#define ALIGNED32 __attribute__((aligned(32)))
+#define HOT_FN    __attribute__((hot))
+#define COLD_FN   __attribute__((cold))
+#define ALWAYS_INLINE __attribute__((always_inline)) inline
+
+struct ALIGNED32 WiiVideoSystem {
     void*    xfbList[2];
     int      currentXfb;
     u8*      texDataTop;
@@ -41,10 +38,7 @@ struct WiiVideoSystem {
     bool     lastGbaMode;
 };
 
-#define DEBUG_OVERLAY_WIDTH  256
-#define DEBUG_OVERLAY_HEIGHT  64
-
-struct WiiDebugOverlay {
+struct ALIGNED32 WiiDebugOverlay {
     u8*      texData;
     GXTexObj texObj;
     bool     enabled;
