@@ -1693,3 +1693,16 @@ romLoaded = false;  // show placeholder immediately,
 ```
 
 inside the IRQ-locked section alongside `triggerRomLoad = true`. Everything else is identical to what was already working.
+
+
+===
+
+can you remove the browser quick menu entirely. make the settings menu open with B and + or B and START. Then reduce the number of settings to these ones: // The table — built once, used every frame the menu is open.
+static const SettingsEntry s_settingsTable[] = {
+{ "Direct Boot", &Settings::directBoot, 2, s_toggleNames, 2 },
+{ "Skip Frames", &Settings::frameskip, 6, s_frameskipNames, 6 },
+{ "FPS Limiter", &Settings::fpsLimiter, 2, s_toggleNames, 2 },
+{ "Audio Emulation", &Settings::emulateAudio, 2, s_toggleNames, 2 },
+{ "16-bit Output", &Settings::audio16Bit, 2, s_toggleNames, 2 },
+{ "Mono Audio", &Settings::monoAudio, 2, s_toggleNames, 2 },
+};
