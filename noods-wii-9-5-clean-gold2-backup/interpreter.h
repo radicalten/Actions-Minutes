@@ -92,11 +92,11 @@ private:
     uint32_t ie = 0, irf = 0;
     uint8_t postFlg = 0;
 
-    static int (Interpreter::*armInstrs[0x1000])(uint32_t);
-    static int (Interpreter::*thumbInstrs[0x400])(uint16_t);
+__attribute__((section(".rodata"), aligned(32))) static int (Interpreter::*armInstrs[0x1000])(uint32_t);
+__attribute__((section(".rodata"), aligned(32))) static int (Interpreter::*thumbInstrs[0x400])(uint16_t);
 
-    static const uint8_t condition[0x100];
-    static const uint8_t bitCount[0x100];
+__attribute__((section(".rodata"), aligned(32))) static const uint8_t condition[0x100];
+__attribute__((section(".rodata"), aligned(32))) static const uint8_t bitCount[0x100];
 
     int runOpcode();
     int exception(uint8_t vector);
