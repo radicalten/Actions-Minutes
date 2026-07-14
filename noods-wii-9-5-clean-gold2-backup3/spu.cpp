@@ -186,11 +186,9 @@ void Spu::loadState(FILE *file) {
 // Returns true  → dst filled with fresh emulator audio.
 // Returns false → dst filled with the last known sample repeated (silence).
 // ---------------------------------------------------------------------------
-bool Spu::getSamples(uint32_t *dst, int count) {
+    bool Spu::getSamples(uint32_t *dst, int count) {
     if (count > SPU_BUF_FRAMES)
         count = SPU_BUF_FRAMES;
-
-    bool wait = false;
 
     if (Settings::fpsLimiter == 2) {
         // Strict: block this thread until the emulator has a full buffer ready.
@@ -200,32 +198,42 @@ bool Spu::getSamples(uint32_t *dst, int count) {
 
         if (!isReady)
             KThrQueueBlock(&waitQueue2, 1);
-        // After unblocking, ready is guaranteed true by pushSample.
     }
     else if (Settings::fpsLimiter == 1) {
-        // Relaxed: serve whatever is in the completed buffer right now.
-        // Never block — if nothing is ready we repeat the last sample.
-        PPCIrqState st = PPCIrqLockByMsr();
-        if (!ready) wait = true;
-        PPCIrqUnlockByMsr(st);
+        // Relaxed: spin-yield until the emulator produces a buffer.
+        // The emulator thread is never blocked by pushSample so it keeps
+        // running and calculating audio; we just wait here until it is done.
+        while (true) {
+            PPCIrqState st = PPCIrqLockByMsr();
+            bool isReady   = ready;
+            PPCIrqUnlockByMsr(st);
+
+            if (isReady) break;
+
+            KThreadYield();
+        }
     }
-    else {
-        // No limiter: silent unless a full buffer is ready.
+    // mode 0: fall through, serve silence if not ready.
+
+    // Check once more whether data arrived (covers mode 0 and the
+    // edge case where the yield loop above somehow exited early).
+    {
         PPCIrqState st = PPCIrqLockByMsr();
-        if (!ready) wait = true;
-        PPCIrqUnlockByMsr(st);
-    }
-
-    if (wait) {
-        PPCIrqState st   = PPCIrqLockByMsr();
-        int         ri   = writeIdx ^ 1;
-        uint32_t    last = buffers[ri][SPU_BUF_FRAMES - 1];
+        bool isReady   = ready;
         PPCIrqUnlockByMsr(st);
 
-        for (int i = 0; i < count; i++)
-            dst[i] = last;
+        if (!isReady) {
+            // Mode 0 only: fill with last known sample and return false.
+            PPCIrqState st2  = PPCIrqLockByMsr();
+            int         ri   = writeIdx ^ 1;
+            uint32_t    last = buffers[ri][SPU_BUF_FRAMES - 1];
+            PPCIrqUnlockByMsr(st2);
 
-        return false;
+            for (int i = 0; i < count; i++)
+                dst[i] = last;
+
+            return false;
+        }
     }
 
     {
@@ -236,44 +244,10 @@ bool Spu::getSamples(uint32_t *dst, int count) {
         PPCIrqUnlockByMsr(st);
     }
 
-    // Only wake the emulator back-pressure block in strict mode.
     if (Settings::fpsLimiter == 2)
         KThrQueueUnblockAllByValue(&waitQueue1, 1);
 
     return true;
-}
-
-void Spu::pushSample(int16_t sampleLeft, int16_t sampleRight) {
-    buffers[writeIdx][bufferPointer++] =
-        ((uint32_t)(uint16_t)sampleRight << 16) |
-        ((uint32_t)(uint16_t)sampleLeft  & 0xFFFF);
-
-    if (bufferPointer < SPU_BUF_FRAMES)
-        return;
-
-    if (Settings::fpsLimiter == 2) {
-        // Strict: block until the audio thread has consumed the previous buffer.
-        PPCIrqState st = PPCIrqLockByMsr();
-        bool isReady   = ready;
-        PPCIrqUnlockByMsr(st);
-
-        if (isReady)
-            KThrQueueBlock(&waitQueue1, 1);
-    }
-    // Modes 1 and 0: never block the emulator — just overwrite.
-
-    {
-        PPCIrqState st = PPCIrqLockByMsr();
-        writeIdx ^= 1;
-        ready     = true;
-        PPCIrqUnlockByMsr(st);
-    }
-
-    bufferPointer = 0;
-
-    // Only wake the audio thread in strict mode.
-    if (Settings::fpsLimiter == 2)
-        KThrQueueUnblockAllByValue(&waitQueue2, 1);
 }
 
 // ---------------------------------------------------------------------------
