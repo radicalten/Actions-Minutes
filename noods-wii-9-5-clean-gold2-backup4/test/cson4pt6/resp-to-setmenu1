@@ -1706,3 +1706,433 @@ static const SettingsEntry s_settingsTable[] = {
 { "16-bit Output", &Settings::audio16Bit, 2, s_toggleNames, 2 },
 { "Mono Audio", &Settings::monoAudio, 2, s_toggleNames, 2 },
 };
+
+
+Here is the updated `ScanWiiInputs()` and the settings table, with all changes applied:
+
+```cpp
+// ---------------------------------------------------------------------------
+// Settings table — reduced to the six runtime-relevant options.
+// No section headers needed at this size so the table has no nullptr rows.
+// ---------------------------------------------------------------------------
+static const SettingsEntry s_settingsTable[] = {
+    { "Direct Boot",     &Settings::directBoot,   2, s_toggleNames,    2 },
+    { "Skip Frames",     &Settings::frameskip,    6, s_frameskipNames, 6 },
+    { "FPS Limiter",     &Settings::fpsLimiter,   2, s_toggleNames,    2 },
+    { "Audio Emulation", &Settings::emulateAudio, 2, s_toggleNames,    2 },
+    { "16-bit Output",   &Settings::audio16Bit,   2, s_toggleNames,    2 },
+    { "Mono Audio",      &Settings::monoAudio,    2, s_toggleNames,    2 },
+};
+
+static const int s_settingsCount =
+    (int)(sizeof(s_settingsTable) / sizeof(s_settingsTable[0]));
+```
+
+Because there are no longer any header rows, `NextSelectableSettings` becomes a simple wrap-around increment/decrement. Update it:
+
+```cpp
+static int NextSelectableSettings(int start, int dir) {
+    int idx = start + dir;
+    if (idx < 0)                idx = s_settingsCount - 1;
+    if (idx >= s_settingsCount) idx = 0;
+    return idx;
+}
+```
+
+And `OpenSettingsMenu` no longer needs to search for the first non-header row:
+
+```cpp
+static void OpenSettingsMenu() {
+    showSettingsMenu      = true;
+    settingsMenuIndex     = 0;
+    settingsDisplayOffset = 0;
+}
+```
+
+Now the full updated `ScanWiiInputs()`:
+
+```cpp
+static void ScanWiiInputs() {
+    WPAD_ScanPads();
+    PAD_ScanPads();
+
+    u32 held      = WPAD_ButtonsHeld(0);
+    u32 pressed   = WPAD_ButtonsDown(0);
+    u32 gcHeld    = PAD_ButtonsHeld(0);
+    u32 gcPressed = PAD_ButtonsDown(0);
+
+    WPADData* wdata      = WPAD_Data(0);
+    bool      hasNunchuk = wdata && (wdata->exp.type == WPAD_EXP_NUNCHUK);
+    bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
+    u32       heldExt    = hasNunchuk ? held : 0;
+
+    // HOME always quits regardless of menu state.
+    if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
+        runEmulatorThread = false;
+        PPCCompilerBarrier();
+        KThreadJoin(&emulatorThread);
+
+        ShutdownAudio();
+
+        delete ndsCore;
+        ndsCore = nullptr;
+
+        exit(0);
+    }
+
+    // -----------------------------------------------------------------------
+    // Settings menu — takes priority over everything else.
+    // -----------------------------------------------------------------------
+    if (showSettingsMenu) {
+        HandleSettingsInput(pressed, held, gcPressed, gcHeld, wdata, hasClassic);
+        return;
+    }
+
+    // -----------------------------------------------------------------------
+    // File browser
+    // -----------------------------------------------------------------------
+    if (showFileBrowser) {
+        if (!dirContents.empty()) {
+            static bool classicLStickUpLast   = false;
+            static bool classicLStickDownLast = false;
+            bool classicLStickUp   = false;
+            bool classicLStickDown = false;
+
+            if (hasClassic && wdata) {
+                float ly = wdata->exp.classic.ljs.mag *
+                           cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+                if (wdata->exp.classic.ljs.mag > 0.5f) {
+                    if (ly >  0.5f) classicLStickUp   = true;
+                    if (ly < -0.5f) classicLStickDown = true;
+                }
+            }
+
+            bool upHeld   = (held & WPAD_BUTTON_UP)
+                          || (held & WPAD_CLASSIC_BUTTON_UP)
+                          || (gcHeld & PAD_BUTTON_UP)
+                          || classicLStickUp;
+            bool downHeld = (held & WPAD_BUTTON_DOWN)
+                          || (held & WPAD_CLASSIC_BUTTON_DOWN)
+                          || (gcHeld & PAD_BUTTON_DOWN)
+                          || classicLStickDown;
+            bool upDown   = (pressed & WPAD_BUTTON_UP)
+                          || (pressed & WPAD_CLASSIC_BUTTON_UP)
+                          || (gcPressed & PAD_BUTTON_UP)
+                          || (classicLStickUp && !classicLStickUpLast);
+            bool downDown = (pressed & WPAD_BUTTON_DOWN)
+                          || (pressed & WPAD_CLASSIC_BUTTON_DOWN)
+                          || (gcPressed & PAD_BUTTON_DOWN)
+                          || (classicLStickDown && !classicLStickDownLast);
+
+            classicLStickUpLast   = classicLStickUp;
+            classicLStickDownLast = classicLStickDown;
+
+            bool performUp   = false;
+            bool performDown = false;
+
+            if (upDown || downDown) {
+                scrollHoldTimer = 0;
+                if (upDown)   performUp   = true;
+                if (downDown) performDown = true;
+            } else if (upHeld || downHeld) {
+                scrollHoldTimer++;
+                if (scrollHoldTimer >= SCROLL_DELAY_INITIAL) {
+                    if ((scrollHoldTimer - SCROLL_DELAY_INITIAL) %
+                        SCROLL_DELAY_REPEATED == 0) {
+                        if (upHeld)   performUp   = true;
+                        if (downHeld) performDown = true;
+                    }
+                }
+            } else {
+                scrollHoldTimer = 0;
+            }
+
+            if (performDown) {
+                selectedItemIndex++;
+                if (selectedItemIndex >= (int)dirContents.size()) {
+                    selectedItemIndex = 0;
+                    displayOffset     = 0;
+                }
+                if (selectedItemIndex >= displayOffset + 5)
+                    displayOffset = selectedItemIndex - 4;
+            }
+            if (performUp) {
+                selectedItemIndex--;
+                if (selectedItemIndex < 0) {
+                    selectedItemIndex = (int)dirContents.size() - 1;
+                    displayOffset     = std::max(0, selectedItemIndex - 4);
+                }
+                if (selectedItemIndex < displayOffset)
+                    displayOffset = selectedItemIndex;
+            }
+
+            if ((pressed & WPAD_BUTTON_LEFT)
+             || (pressed & WPAD_CLASSIC_BUTTON_LEFT)
+             || (gcPressed & PAD_BUTTON_LEFT)) {
+                selectedItemIndex -= 5;
+                if (selectedItemIndex < 0) selectedItemIndex = 0;
+                displayOffset = std::max(0, selectedItemIndex - 2);
+            }
+            if ((pressed & WPAD_BUTTON_RIGHT)
+             || (pressed & WPAD_CLASSIC_BUTTON_RIGHT)
+             || (gcPressed & PAD_BUTTON_RIGHT)) {
+                selectedItemIndex += 5;
+                if (selectedItemIndex >= (int)dirContents.size())
+                    selectedItemIndex = (int)dirContents.size() - 1;
+                displayOffset = std::max(0,
+                    std::min((int)dirContents.size() - 5,
+                             selectedItemIndex - 2));
+            }
+
+            if ((pressed & WPAD_BUTTON_A)
+             || (pressed & WPAD_CLASSIC_BUTTON_A)
+             || (gcPressed & PAD_BUTTON_A)) {
+                BrowserItem selected = dirContents[selectedItemIndex];
+                if (selected.isDirectory) {
+                    if (selected.name == "..") {
+                        size_t slash = currentDir.find_last_of('/',
+                            currentDir.length() - 2);
+                        if (slash != std::string::npos)
+                            currentDir = currentDir.substr(0, slash + 1);
+                    } else {
+                        currentDir += selected.name + "/";
+                    }
+                    UpdateFileBrowser(currentDir);
+                } else {
+                    std::string romPath = currentDir + selected.name;
+
+                    PPCIrqState st = PPCIrqLockByMsr();
+                    romToLoadPath  = romPath;
+                    romLoaded      = false;
+                    triggerRomLoad = true;
+                    PPCIrqUnlockByMsr(st);
+
+                    showFileBrowser = false;
+
+                    dirContents.clear();
+                    dirContents.shrink_to_fit();
+                }
+            }
+
+            // B: go up a directory, or close browser if ROM is running.
+            if ((pressed & WPAD_BUTTON_B)
+             || (pressed & WPAD_CLASSIC_BUTTON_B)
+             || (gcPressed & PAD_BUTTON_B)) {
+                if (currentDir != "sd:/" && currentDir != "sd://"
+                 && currentDir != "sd:") {
+                    size_t slash = currentDir.find_last_of('/',
+                        currentDir.length() - 2);
+                    if (slash != std::string::npos) {
+                        currentDir = currentDir.substr(0, slash + 1);
+                        UpdateFileBrowser(currentDir);
+                    }
+                } else if (romLoaded) {
+                    showFileBrowser = false;
+                }
+            }
+
+            // Settings combo from inside the browser:
+            // Wii Remote:        B + PLUS
+            // Classic Controller: B + PLUS
+            // GameCube:          B + START
+            {
+                bool bHeld       = (held    & WPAD_BUTTON_B)
+                                 || (held    & WPAD_CLASSIC_BUTTON_B);
+                bool bDown       = (pressed & WPAD_BUTTON_B)
+                                 || (pressed & WPAD_CLASSIC_BUTTON_B);
+                bool plusHeld    = (held    & WPAD_BUTTON_PLUS)
+                                 || (held    & WPAD_CLASSIC_BUTTON_PLUS);
+                bool plusDown    = (pressed & WPAD_BUTTON_PLUS)
+                                 || (pressed & WPAD_CLASSIC_BUTTON_PLUS);
+                bool gcBHeld     = (gcHeld    & PAD_BUTTON_B);
+                bool gcBDown     = (gcPressed & PAD_BUTTON_B);
+                bool gcStartHeld = (gcHeld    & PAD_BUTTON_START);
+                bool gcStartDown = (gcPressed & PAD_BUTTON_START);
+
+                bool openSettings =
+                    (bDown && plusHeld) || (plusDown && bHeld) ||
+                    (gcBDown && gcStartHeld) || (gcStartDown && gcBHeld);
+
+                if (openSettings)
+                    OpenSettingsMenu();
+            }
+        }
+    }
+    // -----------------------------------------------------------------------
+    // In-game (emulation running)
+    // -----------------------------------------------------------------------
+    else {
+        uint16_t ndsButtons = WiiButtonsToNDS(held, heldExt, hasNunchuk, hasClassic);
+
+        if (gcHeld & PAD_BUTTON_A)     ndsButtons |= (1 << NDS_KEY_A);
+        if (gcHeld & PAD_BUTTON_B)     ndsButtons |= (1 << NDS_KEY_B);
+        if (gcHeld & PAD_BUTTON_X)     ndsButtons |= (1 << NDS_KEY_X);
+        if (gcHeld & PAD_BUTTON_Y)     ndsButtons |= (1 << NDS_KEY_Y);
+        if (gcHeld & PAD_BUTTON_LEFT)  ndsButtons |= (1 << NDS_KEY_LEFT);
+        if (gcHeld & PAD_BUTTON_RIGHT) ndsButtons |= (1 << NDS_KEY_RIGHT);
+        if (gcHeld & PAD_BUTTON_UP)    ndsButtons |= (1 << NDS_KEY_UP);
+        if (gcHeld & PAD_BUTTON_DOWN)  ndsButtons |= (1 << NDS_KEY_DOWN);
+        if (gcHeld & PAD_TRIGGER_R)    ndsButtons |= (1 << NDS_KEY_R);
+        if (gcHeld & PAD_TRIGGER_L)    ndsButtons |= (1 << NDS_KEY_L);
+        if (gcHeld & PAD_BUTTON_START) ndsButtons |= (1 << NDS_KEY_START);
+
+        if (hasClassic && wdata) {
+            float lx = wdata->exp.classic.ljs.mag *
+                       sinf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            float ly = wdata->exp.classic.ljs.mag *
+                       cosf(wdata->exp.classic.ljs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.ljs.mag > 0.5f) {
+                if (lx >  0.5f) ndsButtons |= (1 << NDS_KEY_RIGHT);
+                if (lx < -0.5f) ndsButtons |= (1 << NDS_KEY_LEFT);
+                if (ly >  0.5f) ndsButtons |= (1 << NDS_KEY_UP);
+                if (ly < -0.5f) ndsButtons |= (1 << NDS_KEY_DOWN);
+            }
+        }
+
+        bool isTouching = false;
+        g_cursorShow = false;
+
+        if (wdata && wdata->ir.valid) {
+            g_cursorX    = wdata->ir.x;
+            g_cursorY    = wdata->ir.y;
+            g_cursorShow = true;
+            if (held & WPAD_BUTTON_A)
+                isTouching = true;
+        }
+
+        s8 cstickX = PAD_SubStickX(0);
+        s8 cstickY = PAD_SubStickY(0);
+        if (abs(cstickX) > 15 || abs(cstickY) > 15) {
+            g_cursorX   += (cstickX / 15.0f) * 2.5f;
+            g_cursorY   -= (cstickY / 15.0f) * 2.5f;
+            g_cursorShow = true;
+
+            if (g_cursorX < 0.0f)   g_cursorX = 0.0f;
+            if (g_cursorX > 640.0f) g_cursorX = 640.0f;
+            if (g_cursorY < 0.0f)   g_cursorY = 0.0f;
+            if (g_cursorY > 480.0f) g_cursorY = 480.0f;
+        }
+
+        if (hasClassic && wdata) {
+            float rx = wdata->exp.classic.rjs.mag *
+                       sinf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            float ry = wdata->exp.classic.rjs.mag *
+                       cosf(wdata->exp.classic.rjs.ang * 3.14159265f / 180.0f);
+            if (wdata->exp.classic.rjs.mag > 0.15f) {
+                g_cursorX   += rx * 4.0f;
+                g_cursorY   -= ry * 4.0f;
+                g_cursorShow = true;
+
+                if (g_cursorX < 0.0f)   g_cursorX = 0.0f;
+                if (g_cursorX > 640.0f) g_cursorX = 640.0f;
+                if (g_cursorY < 0.0f)   g_cursorY = 0.0f;
+                if (g_cursorY > 480.0f) g_cursorY = 480.0f;
+            }
+        }
+
+        if (gcHeld & PAD_TRIGGER_Z) {
+            isTouching   = true;
+            g_cursorShow = true;
+        }
+
+        if (hasClassic && (held & (WPAD_CLASSIC_BUTTON_ZL | WPAD_CLASSIC_BUTTON_ZR))) {
+            isTouching   = true;
+            g_cursorShow = true;
+        }
+
+        int16_t touchX = 0;
+        int16_t touchY = 0;
+
+        if (g_cursorShow) {
+            const int gap    = 2;
+            const int scrW   = NDS_SCREEN_WIDTH;
+            const int scrH   = NDS_SCREEN_HEIGHT;
+            const int totalW = scrW;
+            const int totalH = scrH * 2 + gap;
+
+            const float fbWidth   = 640.0f;
+            const float efbHeight = 480.0f;
+
+            const float originX = (fbWidth   - totalW) / 2.0f;
+            const float originY = (efbHeight - totalH) / 2.0f;
+
+            const float dsLeft   = originX;
+            const float dsRight  = originX + scrW;
+            const float dsTop    = originY + scrH + gap;
+            const float dsBottom = originY + scrH + gap + scrH;
+
+            if (g_cursorX >= dsLeft  && g_cursorX <= dsRight &&
+                g_cursorY >= dsTop   && g_cursorY <= dsBottom) {
+                touchX = (int16_t)(((g_cursorX - dsLeft) /
+                                    (dsRight  - dsLeft)) * 256.0f);
+                touchY = (int16_t)(((g_cursorY - dsTop)  /
+                                    (dsBottom - dsTop))  * 192.0f);
+            } else {
+                isTouching = false;
+            }
+        }
+
+        PPCIrqState st = PPCIrqLockByMsr();
+        g_ndsButtons  = ndsButtons;
+        g_ndsTouching = isTouching;
+        g_ndsTouchX   = touchX;
+        g_ndsTouchY   = touchY;
+        PPCIrqUnlockByMsr(st);
+
+        // Settings combo while in-game:
+        // Wii Remote:         B + PLUS
+        // Classic Controller: B + PLUS
+        // GameCube:           B + START
+        {
+            bool bHeld       = (held    & WPAD_BUTTON_B)
+                             || (held    & WPAD_CLASSIC_BUTTON_B);
+            bool bDown       = (pressed & WPAD_BUTTON_B)
+                             || (pressed & WPAD_CLASSIC_BUTTON_B);
+            bool plusHeld    = (held    & WPAD_BUTTON_PLUS)
+                             || (held    & WPAD_CLASSIC_BUTTON_PLUS);
+            bool plusDown    = (pressed & WPAD_BUTTON_PLUS)
+                             || (pressed & WPAD_CLASSIC_BUTTON_PLUS);
+            bool gcBHeld     = (gcHeld    & PAD_BUTTON_B);
+            bool gcBDown     = (gcPressed & PAD_BUTTON_B);
+            bool gcStartHeld = (gcHeld    & PAD_BUTTON_START);
+            bool gcStartDown = (gcPressed & PAD_BUTTON_START);
+
+            bool openSettings =
+                (bDown && plusHeld) || (plusDown && bHeld) ||
+                (gcBDown && gcStartHeld) || (gcStartDown && gcBHeld);
+
+            if (openSettings)
+                OpenSettingsMenu();
+        }
+    }
+}
+```
+
+And update the in-game overlay hint to reflect the new combo:
+
+```cpp
+        else {
+            Wii_DebugOverlayPrint(0, " ");
+            Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
+            Wii_DebugOverlayPrint(2, "HOME=Quit  B++=Settings");
+            Wii_DebugOverlayPrint(3, " ");
+            Wii_DebugOverlayPrint(4, " ");
+            Wii_DebugOverlayPrint(5, " ");
+            Wii_DebugOverlayPrint(6, " ");
+            Wii_DebugOverlayPrint(7, " ");
+        }
+```
+
+And the browser hint:
+
+```cpp
+            Wii_DebugOverlayPrint(6,
+                "A=Load  B=Back  B++=Settings");
+```
+
+The three changes in summary:
+
+- **Settings table** reduced to the six entries, section headers removed entirely
+- **`NextSelectableSettings`** simplified to a plain wrap since there are no header rows to skip
+- **`OpenSettingsMenu`** simplified for the same reason
+- **Settings combo** is now B + PLUS (Wii/Classic) or B + START (GC), in both the browser and in-game, using the same edge-triggered two-button detection used previously for the browser combo — one button must be the new press while the other is already held, preventing accidental activation
