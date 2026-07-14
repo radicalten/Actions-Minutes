@@ -1284,7 +1284,7 @@ int (Interpreter::* Interpreter::thumbInstrs[])(uint16_t) =
 // ════════════════════════════════════════════════════════════════════════════
 
 __attribute__((section(".rodata"), aligned(32)))
-const uint8_t Interpreter::condition[256] =
+uint8_t Interpreter::condition[256] =
 {
     //        NZCV: 0000 0001 0010 0011  0100 0101 0110 0111
     //              0000 0001 0010 0011  0100 0101 0110 0111
@@ -1344,7 +1344,7 @@ const uint8_t Interpreter::condition[256] =
 // ════════════════════════════════════════════════════════════════════════════
 
 __attribute__((section(".rodata"), aligned(32)))
-const uint8_t Interpreter::bitCount[256] =
+uint8_t Interpreter::bitCount[256] =
 {
     // n:  +0 +1 +2 +3  +4 +5 +6 +7  +8 +9 +A +B  +C +D +E +F
     /* 0x00 */  0, 1, 1, 2,  1, 2, 2, 3,  1, 2, 2, 3,  2, 3, 3, 4,
