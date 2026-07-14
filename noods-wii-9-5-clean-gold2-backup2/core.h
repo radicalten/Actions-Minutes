@@ -247,3 +247,4 @@ private:
     static void shim_wifiTransmit(void* o, int a) {
     static_cast<Wifi*>(o)->transmitPacket(static_cast<PacketType>(a));
 }
+};
