@@ -47,9 +47,6 @@ extern "C" {
     #include <tuxedo/ppc/clock.h>
 }
 
-static void InitializeAudio();
-static void ShutdownAudio();
-
 #define EMULATION_STACK_SIZE (256 * 1024)
 #define AUDIO_STACK_SIZE     (64  * 1024)
 
@@ -290,6 +287,40 @@ static sptr AudioThreadMain(void* /*arg*/)
 
     KThreadExit(0);
     return 0;
+}
+
+static void InitializeAudio()
+{
+    memset(s_audioDbl,     0, sizeof(s_audioDbl));
+    memset(s_audioSilence, 0, sizeof(s_audioSilence));
+    DCFlushRange(s_audioDbl,     sizeof(s_audioDbl));
+    DCFlushRange(s_audioSilence, sizeof(s_audioSilence));
+
+    s_writeBuf = 0;
+    s_readBuf  = 1;
+    s_bufReady = false;
+
+    ASND_Init();
+    ASND_Pause(0);
+
+    ASND_SetVoice(0,
+                  VOICE_STEREO_16BIT_BE,
+                  WIIAUD_OUT_RATE,
+                  0,
+                  s_audioSilence,
+                  WIIAUD_BUF_BYTES_STEREO,
+                  MAX_VOLUME,
+                  MAX_VOLUME,
+                  AudioCallback);
+}
+
+static void ShutdownAudio()
+{
+    runAudioThread = false;
+    s_bufReady     = false;
+    ASND_StopVoice(0);
+    ASND_End();
+    KThreadJoin(&audioThread);
 }
 
 static void InitializeSettings() {
