@@ -161,15 +161,33 @@ struct SettingsEntry {
 
 static const char* const s_toggleNames[]      = { "Off", "On" };
 static const char* const s_frameskipNames[]   = { "None", "1", "2", "3", "4", "5" };
+static const char* const s_filterNames[]      = { "Nearest", "Upscaled", "Linear" };
+static const char* const s_threaded3DNames[]  = { "Off", "1 Thread", "2 Threads" };
 
 // The table — built once, used every frame the menu is open.
+// Section headers have value == nullptr.
 static const SettingsEntry s_settingsTable[] = {
+    // ---- General ----
+    { "-- General --",          nullptr,                    0, nullptr,           0 },
     { "Direct Boot",            &Settings::directBoot,      2, s_toggleNames,     2 },
-    { "Skip Frames",            &Settings::frameskip,       6, s_frameskipNames,  6 },
     { "FPS Limiter",            &Settings::fpsLimiter,      2, s_toggleNames,     2 },
+    // ---- Graphics ----
+    { "-- Graphics --",         nullptr,                    0, nullptr,           0 },
+    { "Skip Frames",            &Settings::frameskip,       6, s_frameskipNames,  6 },
+    { "Threaded 2D",            &Settings::threaded2D,      2, s_toggleNames,     2 },
+    { "Threaded 3D",            &Settings::threaded3D,      3, s_threaded3DNames, 3 },
+    { "High-Res 3D",            &Settings::highRes3D,       2, s_toggleNames,     2 },
+    { "Simulate Ghosting",      &Settings::screenGhost,     2, s_toggleNames,     2 },
+    { "Screen Filter",          &Settings::screenFilter,    3, s_filterNames,     3 },
+    // ---- Audio ----
+    { "-- Audio --",            nullptr,                    0, nullptr,           0 },
     { "Audio Emulation",        &Settings::emulateAudio,    2, s_toggleNames,     2 },
     { "16-bit Output",          &Settings::audio16Bit,      2, s_toggleNames,     2 },
     { "Mono Audio",             &Settings::monoAudio,       2, s_toggleNames,     2 },
+    // ---- Experimental ----
+    { "-- Experimental --",     nullptr,                    0, nullptr,           0 },
+    { "HLE ARM7",               &Settings::arm7Hle,         2, s_toggleNames,     2 },
+    { "DSi Mode",               &Settings::dsiMode,         2, s_toggleNames,     2 },
 };
 
 static const int s_settingsCount =
@@ -395,14 +413,14 @@ static void InitializeSettings() {
     Settings::gbaBiosPath  = "sd:/noods/bios/gba_bios.bin";
     Settings::sdImagePath  = "";
     Settings::basePath     = "sd:/";
-    Settings::fpsLimiter   = 0;
+    Settings::fpsLimiter   = 1;
     Settings::frameskip    = 2;
     Settings::threaded2D   = 0;
     Settings::threaded3D   = 0;
     Settings::highRes3D    = 0;
     Settings::screenGhost  = 0;
-    Settings::emulateAudio = 0;
-    Settings::audio16Bit   = 0;
+    Settings::emulateAudio = 1;
+    Settings::audio16Bit   = 1;
     Settings::monoAudio    = 0;
     Settings::savesFolder  = 1;
     Settings::statesFolder = 1;
@@ -692,7 +710,7 @@ static void HandleSettingsInput(u32 pressed, u32 held,
         settingsScrollHoldTimer = 0;
     }
 
-    // --- Move selection ---
+    // --- Move selection, skipping header rows ---
     if (doUp)
         settingsMenuIndex = NextSelectableSettings(settingsMenuIndex, -1);
     if (doDown)
@@ -754,23 +772,6 @@ static void ScanWiiInputs() {
     bool      hasNunchuk = wdata && (wdata->exp.type == WPAD_EXP_NUNCHUK);
     bool      hasClassic = wdata && (wdata->exp.type == WPAD_EXP_CLASSIC);
     u32       heldExt    = hasNunchuk ? held : 0;
-
-    // Check mapping states for the physical B modifier across all controller types
-    bool bHeld = (gcHeld & PAD_BUTTON_B)
-              || (held & WPAD_BUTTON_B)
-              || (held & WPAD_CLASSIC_BUTTON_B);
-
-    bool bPressed = (gcPressed & PAD_BUTTON_B)
-                 || (pressed & WPAD_BUTTON_B)
-                 || (pressed & WPAD_CLASSIC_BUTTON_B);
-
-    bool plusHeld = (gcHeld & PAD_BUTTON_START)
-                 || (held & WPAD_BUTTON_PLUS)
-                 || (held & WPAD_CLASSIC_BUTTON_PLUS);
-
-    bool plusPressed = (gcPressed & PAD_BUTTON_START)
-                    || (pressed & WPAD_BUTTON_PLUS)
-                    || (pressed & WPAD_CLASSIC_BUTTON_PLUS);
 
     // HOME always quits regardless of menu state.
     if ((pressed & WPAD_BUTTON_HOME) || (pressed & WPAD_CLASSIC_BUTTON_HOME)) {
@@ -920,8 +921,9 @@ static void ScanWiiInputs() {
         }
 
         // B: go up a directory, or close browser if ROM is running.
-        // Block standard B behavior when doing the Settings hotkey.
-        if (bPressed && !plusHeld) {
+        if ((pressed & WPAD_BUTTON_B)
+         || (pressed & WPAD_CLASSIC_BUTTON_B)
+         || (gcPressed & PAD_BUTTON_B)) {
             if (currentDir != "sd:/" && currentDir != "sd://"
              && currentDir != "sd:") {
                 size_t slash = currentDir.find_last_of('/',
@@ -935,8 +937,10 @@ static void ScanWiiInputs() {
             }
         }
 
-        // B + PLUS / START: open settings menu from the file browser.
-        if ((bHeld && plusPressed) || (bPressed && plusHeld)) {
+        // PLUS / START: open settings menu from the file browser.
+        if ((pressed & WPAD_BUTTON_PLUS)
+         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)
+         || (gcPressed & PAD_BUTTON_START)) {
             OpenSettingsMenu();
         }
     }
@@ -1061,8 +1065,17 @@ static void ScanWiiInputs() {
         g_ndsTouchY   = touchY;
         PPCIrqUnlockByMsr(st);
 
-        // B + PLUS / START while in-game: open settings menu directly.
-        if ((bHeld && plusPressed) || (bPressed && plusHeld)) {
+        // MINUS while in-game: open file browser (existing behaviour kept).
+        if (pressed & WPAD_BUTTON_MINUS) {
+            if (!showFileBrowser) {
+                showFileBrowser = true;
+                UpdateFileBrowser(currentDir);
+            }
+        }
+
+        // PLUS while in-game: open settings menu directly.
+        if ((pressed & WPAD_BUTTON_PLUS)
+         || (pressed & WPAD_CLASSIC_BUTTON_PLUS)) {
             OpenSettingsMenu();
         }
     }
@@ -1074,7 +1087,7 @@ static void ScanWiiInputs() {
 // Layout (8 overlay lines, each 32 chars wide):
 //   Line 0  : "Settings  [A]=Toggle [B]=Back"  (title + hint)
 //   Lines 1-5 : up to 5 entries, the selected one prefixed with "->"
-//   Line 6  : scroll indicator  e.g. "  ^^ row 4/6 vv"
+//   Line 6  : scroll indicator  e.g. "  ^^ row 4/17 vv"
 //   Line 7  : blank
 // ---------------------------------------------------------------------------
 static void DrawSettingsOverlay() {
@@ -1090,7 +1103,7 @@ static void DrawSettingsOverlay() {
         const SettingsEntry& e = s_settingsTable[row];
 
         if (!e.value) {
-            // Section header — centred, no arrow (natively dead code now, but kept for safety)
+            // Section header — centred, no arrow
             Wii_DebugOverlayPrint(lineIdx, "%-32s", e.label);
         } else {
             std::string val = SettingsEntryValue(e);
@@ -1189,13 +1202,13 @@ int main(int /*argc*/, char** /*argv*/) {
             while (lineIndex < 6)
                 Wii_DebugOverlayPrint(lineIndex++, " ");
             Wii_DebugOverlayPrint(6,
-                "A=Load  B=Back  B++=Settings");
+                "A=Load  B=Back  +=Settings");
             Wii_DebugOverlayPrint(7, " ");
         }
         else {
             Wii_DebugOverlayPrint(0, " ");
             Wii_DebugOverlayPrint(1, "FPS: %5.1f", perf.fps);
-            Wii_DebugOverlayPrint(2, "HOME=Quit  B++=Settings");
+            Wii_DebugOverlayPrint(2, "HOME=Quit  -=Browser  +=Settings");
             Wii_DebugOverlayPrint(3, " ");
             Wii_DebugOverlayPrint(4, " ");
             Wii_DebugOverlayPrint(5, " ");
