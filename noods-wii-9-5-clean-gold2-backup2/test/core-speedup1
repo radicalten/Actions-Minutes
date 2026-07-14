@@ -1,0 +1,3 @@
+I have .cpp files for a DS emulator to run on Wii. Can you optimize these files as much as possible including using PowerPC assembly to achieve the greatest speedup possible?:
+
+core.h/cpp
