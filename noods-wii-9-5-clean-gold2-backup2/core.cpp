@@ -1,4 +1,3 @@
-//core.cpp (optimized for PowerPC/Wii)
 #include <algorithm>
 #include <cstring>
 
@@ -13,6 +12,9 @@ extern "C" {
 extern void* Noods_MEM2_Alloc(size_t size);
 extern void  Noods_MEM2_Free(void* ptr);
 
+// ---------------------------------------------------------------------------
+// Custom allocators — route to MEM2
+// ---------------------------------------------------------------------------
 void* Core::operator new(size_t size) {
     void* p = Noods_MEM2_Alloc(size);
     if (!p) throw std::bad_alloc();
@@ -27,31 +29,99 @@ void* Core::operator new[](size_t size) {
 }
 void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
 
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
 Core::Core(std::string ndsRom, std::string gbaRom, int id,
            int ndsRomFd,  int gbaRomFd,
            int ndsSaveFd, int gbaSaveFd,
-           int ndsStateFd, int gbaStateFd, int ndsCheatFd):
-    id(id),
-    actionReplay(this), cartridgeGba(this), cartridgeNds(this),
-    cp15(this), divSqrt(this), dldi(this),
-    dma { Dma(this, 0), Dma(this, 1) },
-    gpu(this),
-    gpu2D { Gpu2D(this, 0), Gpu2D(this, 1) },
-    gpu3D(this), gpu3DRenderer(this),
-    hleArm7(this),
-    hleBios { HleBios(this, 0, HleBios::swiTable9),
-              HleBios(this, 1, HleBios::swiTable7),
-              HleBios(this, 1, HleBios::swiTableGba) },
-    input(this),
-    interpreter { Interpreter(this, 0), Interpreter(this, 1) },
-    ipc(this), memory(this), rtc(this), saveStates(this),
-    spi(this), spu(this),
-    timers { Timers(this, 0), Timers(this, 1) },
-    wifi(this),
-    running(0),
-    lastFpsTimeTicks(0),
-    fpsCount(0)
+           int ndsStateFd, int gbaStateFd, int ndsCheatFd)
+    : id(id),
+      actionReplay(this), cartridgeGba(this), cartridgeNds(this),
+      cp15(this), divSqrt(this), dldi(this),
+      dma { Dma(this, 0), Dma(this, 1) },
+      gpu(this),
+      gpu2D { Gpu2D(this, 0), Gpu2D(this, 1) },
+      gpu3D(this), gpu3DRenderer(this),
+      hleArm7(this),
+      hleBios { HleBios(this, 0, HleBios::swiTable9),
+                HleBios(this, 1, HleBios::swiTable7),
+                HleBios(this, 1, HleBios::swiTableGba) },
+      input(this),
+      interpreter { Interpreter(this, 0), Interpreter(this, 1) },
+      ipc(this), memory(this), rtc(this), saveStates(this),
+      spi(this), spu(this),
+      timers { Timers(this, 0), Timers(this, 1) },
+      wifi(this),
+      running(0),
+      lastFpsTimeTicks(0),
+      fpsCount(0)
 {
+    // ------------------------------------------------------------------
+    // Bind task table.
+    //
+    // Layout: SchedCallback(trampoline, receiver_ptr, int_arg)
+    // Tasks that take no integer argument pass 0; the compiler will
+    // constant-fold the unused parameter in release builds.
+    // ------------------------------------------------------------------
+
+    // Core self-tasks
+    tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
+    tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
+
+    // Cartridge — arg selects ARM9 (0) or ARM7 (1)
+    tasks[CART9_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 0);
+    tasks[CART7_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 1);
+
+    // DMA — ARM9 channels 0-3
+    tasks[DMA9_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[0], 0);
+    tasks[DMA9_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[0], 1);
+    tasks[DMA9_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[0], 2);
+    tasks[DMA9_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[0], 3);
+
+    // DMA — ARM7 channels 0-3
+    tasks[DMA7_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[1], 0);
+    tasks[DMA7_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[1], 1);
+    tasks[DMA7_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[1], 2);
+    tasks[DMA7_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[1], 3);
+
+    // GPU scanlines
+    tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,   &gpu);
+    tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,   &gpu);
+    tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
+    tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
+
+    // GPU 3D command FIFO
+    tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
+
+    // CPU interrupts
+    tasks[ARM9_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[0]);
+    tasks[ARM7_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[1]);
+
+    // SPU
+    tasks[NDS_SPU_SAMPLE]   = SchedCallback(shim_spuSample,    &spu);
+    tasks[GBA_SPU_SAMPLE]   = SchedCallback(shim_spuGbaSample, &spu);
+
+    // Timers — ARM9 channels 0-3
+    tasks[TIMER9_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[0], 0);
+    tasks[TIMER9_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[0], 1);
+    tasks[TIMER9_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[0], 2);
+    tasks[TIMER9_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[0], 3);
+
+    // Timers — ARM7 channels 0-3
+    tasks[TIMER7_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[1], 0);
+    tasks[TIMER7_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[1], 1);
+    tasks[TIMER7_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[1], 2);
+    tasks[TIMER7_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[1], 3);
+
+    // WiFi — CMD_REPLY / CMD_ACK are integer constants from wifi.h
+    tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs, &wifi);
+    tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
+    tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
+
+    // ------------------------------------------------------------------
+    // BIOS / firmware loading
+    // ------------------------------------------------------------------
     bool required = !Settings::directBoot ||
                     (ndsRom == "" && gbaRom == "" &&
                      ndsRomFd == -1 && gbaRomFd == -1);
@@ -61,44 +131,9 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     if (!spi.loadFirmware()  && required) throw ERROR_FIRM;
     realGbaBios = memory.loadGbaBios();
 
-    // Bind all task handlers - use raw function pointers where possible
-    // to avoid std::function overhead on the hot path
-    tasks[UPDATE_RUN]       = [this]{ updateRun(); };
-    tasks[RESET_CYCLES]     = [this]{ resetCycles(); };
-    tasks[CART9_WORD_READY] = [this]{ cartridgeNds.wordReady(0); };
-    tasks[CART7_WORD_READY] = [this]{ cartridgeNds.wordReady(1); };
-    tasks[DMA9_TRANSFER0]   = [this]{ dma[0].transfer(0); };
-    tasks[DMA9_TRANSFER1]   = [this]{ dma[0].transfer(1); };
-    tasks[DMA9_TRANSFER2]   = [this]{ dma[0].transfer(2); };
-    tasks[DMA9_TRANSFER3]   = [this]{ dma[0].transfer(3); };
-    tasks[DMA7_TRANSFER0]   = [this]{ dma[1].transfer(0); };
-    tasks[DMA7_TRANSFER1]   = [this]{ dma[1].transfer(1); };
-    tasks[DMA7_TRANSFER2]   = [this]{ dma[1].transfer(2); };
-    tasks[DMA7_TRANSFER3]   = [this]{ dma[1].transfer(3); };
-    tasks[NDS_SCANLINE256]  = [this]{ gpu.scanline256(); };
-    tasks[NDS_SCANLINE355]  = [this]{ gpu.scanline355(); };
-    tasks[GBA_SCANLINE240]  = [this]{ gpu.gbaScanline240(); };
-    tasks[GBA_SCANLINE308]  = [this]{ gpu.gbaScanline308(); };
-    tasks[GPU3D_COMMANDS]   = [this]{ gpu3D.runCommands(); };
-    tasks[ARM9_INTERRUPT]   = [this]{ interpreter[0].interrupt(); };
-    tasks[ARM7_INTERRUPT]   = [this]{ interpreter[1].interrupt(); };
-    tasks[NDS_SPU_SAMPLE]   = [this]{ spu.runSample(); };
-    tasks[GBA_SPU_SAMPLE]   = [this]{ spu.runGbaSample(); };
-    tasks[TIMER9_OVERFLOW0] = [this]{ timers[0].overflow(0); };
-    tasks[TIMER9_OVERFLOW1] = [this]{ timers[0].overflow(1); };
-    tasks[TIMER9_OVERFLOW2] = [this]{ timers[0].overflow(2); };
-    tasks[TIMER9_OVERFLOW3] = [this]{ timers[0].overflow(3); };
-    tasks[TIMER7_OVERFLOW0] = [this]{ timers[1].overflow(0); };
-    tasks[TIMER7_OVERFLOW1] = [this]{ timers[1].overflow(1); };
-    tasks[TIMER7_OVERFLOW2] = [this]{ timers[1].overflow(2); };
-    tasks[TIMER7_OVERFLOW3] = [this]{ timers[1].overflow(3); };
-    tasks[WIFI_COUNT_MS]    = [this]{ wifi.countMs(); };
-    tasks[WIFI_TRANS_REPLY] = [this]{ wifi.transmitPacket(CMD_REPLY); };
-    tasks[WIFI_TRANS_ACK]   = [this]{ wifi.transmitPacket(CMD_ACK); };
-
-    // Reserve space in events vector to avoid reallocations during emulation
-    events.reserve(MAX_TASKS);
-
+    // ------------------------------------------------------------------
+    // Initial scheduling
+    // ------------------------------------------------------------------
     schedule(RESET_CYCLES,    0x7FFFFFFF);
     schedule(NDS_SCANLINE256, 256 * 6);
     schedule(NDS_SCANLINE355, 355 * 6);
@@ -112,6 +147,9 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     interpreter[0].init();
     interpreter[1].init();
 
+    // ------------------------------------------------------------------
+    // GBA ROM
+    // ------------------------------------------------------------------
     if (gbaRom != "" || gbaRomFd != -1) {
         if (!cartridgeGba.setRom(gbaRom, gbaRomFd, gbaSaveFd, gbaStateFd, -1))
             throw ERROR_ROM;
@@ -122,6 +160,9 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         }
     }
 
+    // ------------------------------------------------------------------
+    // NDS ROM
+    // ------------------------------------------------------------------
     if (ndsRom != "" || ndsRomFd != -1) {
         if (!cartridgeNds.setRom(ndsRom, ndsRomFd, ndsSaveFd, ndsStateFd, ndsCheatFd))
             throw ERROR_ROM;
@@ -129,29 +170,23 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         actionReplay.loadCheats();
 
         if (Settings::directBoot) {
-            // ARM9 CP15 setup
             cp15.write(1, 0, 0, 0x0005707D);
             cp15.write(9, 1, 0, 0x0300000A);
             cp15.write(9, 1, 1, 0x00000020);
-
-            // Memory-mapped I/O initialization
-            memory.write<uint8_t> (0, 0x4000247, 0x03);
-            memory.write<uint8_t> (0, 0x4000300, 0x01);
-            memory.write<uint8_t> (1, 0x4000300, 0x01);
-            memory.write<uint16_t>(0, 0x4000304, 0x0001);
-            memory.write<uint16_t>(1, 0x4000504, 0x0200);
-
-            // Firmware header mirror in main RAM
-            memory.write<uint32_t>(0, 0x27FF800, 0x00001FC2);
-            memory.write<uint32_t>(0, 0x27FF804, 0x00001FC2);
-            memory.write<uint16_t>(0, 0x27FF850, 0x5835);
-            memory.write<uint16_t>(0, 0x27FF880, 0x0007);
-            memory.write<uint16_t>(0, 0x27FF884, 0x0006);
-            memory.write<uint32_t>(0, 0x27FFC00, 0x00001FC2);
-            memory.write<uint32_t>(0, 0x27FFC04, 0x00001FC2);
-            memory.write<uint16_t>(0, 0x27FFC10, 0x5835);
-            memory.write<uint16_t>(0, 0x27FFC40, 0x0001);
-
+            memory.write<uint8_t> (0,  0x4000247, 0x03);
+            memory.write<uint8_t> (0,  0x4000300, 0x01);
+            memory.write<uint8_t> (1,  0x4000300, 0x01);
+            memory.write<uint16_t>(0,  0x4000304, 0x0001);
+            memory.write<uint16_t>(1,  0x4000504, 0x0200);
+            memory.write<uint32_t>(0,  0x27FF800, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FF804, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FF850, 0x5835);
+            memory.write<uint16_t>(0,  0x27FF880, 0x0007);
+            memory.write<uint16_t>(0,  0x27FF884, 0x0006);
+            memory.write<uint32_t>(0,  0x27FFC00, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FFC04, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FFC10, 0x5835);
+            memory.write<uint16_t>(0,  0x27FFC40, 0x0001);
             cartridgeNds.directBoot();
             interpreter[0].directBoot();
             interpreter[1].directBoot();
@@ -159,6 +194,9 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         }
     }
 
+    // ------------------------------------------------------------------
+    // HLE ARM7
+    // ------------------------------------------------------------------
     if (!gbaMode && Settings::arm7Hle) {
         arm7Hle = true;
         hleArm7.init();
@@ -171,17 +209,19 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     PPCIrqUnlockByMsr(st);
 }
 
+// ---------------------------------------------------------------------------
+// State save / load
+// ---------------------------------------------------------------------------
 void Core::saveState(FILE* file) {
     fwrite(&arm7Hle,      sizeof(arm7Hle),      1, file);
     fwrite(&dsiMode,      sizeof(dsiMode),      1, file);
     fwrite(&gbaMode,      sizeof(gbaMode),      1, file);
     fwrite(&globalCycles, sizeof(globalCycles), 1, file);
 
-    uint32_t count = (uint32_t)events.size();
+    uint32_t count = static_cast<uint32_t>(events.size());
     fwrite(&count, sizeof(count), 1, file);
-    // Write all events in one shot for efficiency
-    if (count > 0)
-        fwrite(events.data(), sizeof(SchedEvent), count, file);
+    for (uint32_t i = 0; i < count; i++)
+        fwrite(&events[i], sizeof(events[i]), 1, file);
 }
 
 void Core::loadState(FILE* file) {
@@ -190,98 +230,69 @@ void Core::loadState(FILE* file) {
     fread(&gbaMode,      sizeof(gbaMode),      1, file);
     fread(&globalCycles, sizeof(globalCycles), 1, file);
 
-    uint32_t count;
-    fread(&count, sizeof(count), 1, file);
-
     events.clear();
-    events.resize(count);
-    if (count > 0)
-        fread(events.data(), sizeof(SchedEvent), count, file);
+    uint32_t count = 0;
+    fread(&count, sizeof(count), 1, file);
+    SchedEvent event(MAX_TASKS, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        fread(&event, sizeof(event), 1, file);
+        events.push_back(event);
+    }
 
     updateRun();
 }
 
+// ---------------------------------------------------------------------------
+// updateRun — select the tightest interpreter loop for the current state
+// ---------------------------------------------------------------------------
 void Core::updateRun() {
-    // Select the most appropriate run function based on CPU states
-    // Ordered by most common case first for branch prediction
-    if (PPC_LIKELY(!interpreter[0].halted && !interpreter[1].halted && !gbaMode && !dsiMode))
-        runFunc = &Interpreter::runCoreNds;
-    else if (interpreter[0].halted && interpreter[1].halted)
+    if (interpreter[0].halted && interpreter[1].halted)
         runFunc = &Interpreter::runCoreNone;
     else if (gbaMode)
         runFunc = &Interpreter::runCoreSingle<true, 0>;
     else if (dsiMode)
         runFunc = &Interpreter::runCoreDsi;
+    else if (!interpreter[0].halted && !interpreter[1].halted)
+        runFunc = &Interpreter::runCoreNds;
     else if (interpreter[0].halted)
         runFunc = &Interpreter::runCoreSingle<true, 1>;
     else
         runFunc = &Interpreter::runCoreSingle<false, 0>;
 
-    // Signal run loop to restart with new function
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
     PPCIrqUnlockByMsr(st);
 }
 
+// ---------------------------------------------------------------------------
+// resetCycles — prevent globalCycles overflow every ~2 billion ticks
+// ---------------------------------------------------------------------------
 void Core::resetCycles() {
-    // Subtract globalCycles from all scheduled events using PPC efficiently
-    uint32_t gc = globalCycles;
-    int n = (int)events.size();
-    SchedEvent *ev = events.data();
+    const size_t n = events.size();
+    for (size_t i = 0; i < n; i++)
+        events[i].cycles -= globalCycles;
 
-    // Unrolled loop for common case - DS typically has 8-16 events
-    int i = 0;
-    for (; i + 3 < n; i += 4) {
-        ev[i+0].cycles -= gc;
-        ev[i+1].cycles -= gc;
-        ev[i+2].cycles -= gc;
-        ev[i+3].cycles -= gc;
+    for (int i = 0; i < 2; i++) {
+        interpreter[i].resetCycles();
+        timers[i].resetCycles();
     }
-    for (; i < n; i++)
-        ev[i].cycles -= gc;
-
-    // Reset interpreter and timer cycles
-    interpreter[0].resetCycles();
-    interpreter[1].resetCycles();
-    timers[0].resetCycles();
-    timers[1].resetCycles();
 
     globalCycles = 0;
     schedule(RESET_CYCLES, 0x7FFFFFFF);
 }
 
-// Hot path: called very frequently during emulation
-// Uses binary search (std::upper_bound) for O(log n) insertion
-HOT void Core::schedule(SchedTask task, uint32_t cycles) {
+// ---------------------------------------------------------------------------
+// schedule — insert a new event in sorted order (binary search insertion)
+// ---------------------------------------------------------------------------
+void Core::schedule(SchedTask task, uint32_t cycles) {
     SchedEvent event(task, globalCycles + cycles);
-
-    // Binary search for insertion point - events vector is kept sorted
-    // For small vectors (< 32 elements), linear search may be faster
-    // but std::upper_bound compiles well on PPC with -O2
-    int n = (int)events.size();
-
-    if (PPC_UNLIKELY(n == 0)) {
-        events.push_back(event);
-        return;
-    }
-
-    // Fast path: new event goes at the end (common for far-future events)
-    if (PPC_LIKELY(event.cycles >= events.back().cycles)) {
-        events.push_back(event);
-        return;
-    }
-
-    // Fast path: new event goes at the front (common for immediate events)
-    if (event.cycles <= events.front().cycles) {
-        events.insert(events.begin(), event);
-        return;
-    }
-
-    // General case: binary search
     auto it = std::upper_bound(events.cbegin(), events.cend(), event);
     events.insert(it, event);
 }
 
+// ---------------------------------------------------------------------------
+// enterGbaMode
+// ---------------------------------------------------------------------------
 void Core::enterGbaMode() {
     gbaMode = true;
 
@@ -312,26 +323,27 @@ void Core::enterGbaMode() {
     memory.write<uint16_t>(1, 0x4000088, 0x200);
 }
 
+// ---------------------------------------------------------------------------
+// endFrame
+// ---------------------------------------------------------------------------
 void Core::endFrame() {
-    // Signal frame completion to run loop
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
     PPCIrqUnlockByMsr(st);
 
     fpsCount++;
 
-    if (PPC_UNLIKELY(arm7Hle))
+    if (arm7Hle)
         hleArm7.runFrame();
 
-    // FPS counter using PPC timebase - no system call overhead
     uint64_t now     = PPCGetTickCount();
     uint64_t elapsed = now - lastFpsTimeTicks;
-    if (PPC_UNLIKELY(elapsed >= PPCMsToTicks(1000))) {
+    if (elapsed >= PPCMsToTicks(1000)) {
         fps              = fpsCount;
         fpsCount         = 0;
         lastFpsTimeTicks = now;
     }
 
-    if (PPC_UNLIKELY(wifi.shouldSchedule()))
+    if (wifi.shouldSchedule())
         wifi.scheduleInit();
 }
