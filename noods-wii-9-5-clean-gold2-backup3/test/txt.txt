@@ -37,3 +37,8 @@ Overall a good change, but I want fpslimit=1 behavior moved up to 2, and fpslimi
 
 will ask:
 Can you modify fpslimit=2 to have the function on sound that fpslimit=1 has right now? everything is working perfectly so far. However, I would like fpslimit1 to simply play whatever sound is in the buffer at the time. fpslimit=0 can remain the same where it stays silent unless it is full.
+
+==
+the best spu driver was in fact the first one spu.cpp i made a backup called spu winner. works when fpslimter=1.
+
+Will make a backup of this and call it backup4. in that one I will try to make the settings file callable from the sd card in main so settings can be toggled. 
