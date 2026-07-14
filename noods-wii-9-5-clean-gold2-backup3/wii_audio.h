@@ -9,7 +9,7 @@ extern "C" {
 // Output parameters (what ASND expects)
 // ---------------------------------------------------------------------------
 #define WIIAUD_OUT_RATE           48000
-#define WIIAUD_FRAMES_PER_BUF     1024
+#define WIIAUD_FRAMES_PER_BUF     512
 #define WIIAUD_BUF_BYTES_STEREO   (WIIAUD_FRAMES_PER_BUF * 4)   // 1024 * 2ch * 2bytes
 #define WIIAUD_BUF_BYTES_MONO     (WIIAUD_FRAMES_PER_BUF * 2)
 
