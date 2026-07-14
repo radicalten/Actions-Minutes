@@ -182,14 +182,26 @@ struct PerformanceState {
 };
 static PerformanceState perf = {};
 
-// Always stereo layout (L,R pairs) even in mono mode.
+// ---------------------------------------------------------------------------
+// Caller-owned staging buffers — one per double-buffer slot, no heap alloc.
+// Size = max(NDS_FRAMES, GBA_FRAMES).  Since they are now equal this is just
+// SPU_BUF_FRAMES == 548 uint32_t words per slot.
+// ---------------------------------------------------------------------------
+#define AUDIO_SPU_FRAMES  WIIAUD_NDS_FRAMES   // 548, same for GBA
+
+alignas(32) static uint32_t s_spuStaging[AUDIO_SPU_FRAMES];
+
+// s_audioDbl / s_audioSilence are unchanged from before:
 alignas(32) static int16_t s_audioDbl[2][WIIAUD_FRAMES_PER_BUF * 2];
 alignas(32) static int16_t s_audioSilence[WIIAUD_FRAMES_PER_BUF * 2];
 
-static volatile int  s_writeBuf = 0;    
-static volatile int  s_readBuf  = 1;    
+static volatile int  s_writeBuf = 0;
+static volatile int  s_readBuf  = 1;
 static volatile bool s_bufReady = false;
 
+// ---------------------------------------------------------------------------
+// ResampleLinear — unchanged from before
+// ---------------------------------------------------------------------------
 static void ResampleLinear(const uint32_t* src, int nSrc,
                             int16_t*        dst, int nDst,
                             bool            mono)
@@ -200,22 +212,17 @@ static void ResampleLinear(const uint32_t* src, int nSrc,
     for (int i = 0; i < nDst; i++) {
         const int idx0 = pos >> 16;
         const int idx1 = (idx0 + 1 < nSrc) ? idx0 + 1 : nSrc - 1;
-
-        // Fractional part in [0, 65535].
         const int32_t frac = pos & 0xFFFF;
 
-        // Unpack source samples.
         const int16_t l0 = (int16_t)( src[idx0]        & 0xFFFF);
         const int16_t r0 = (int16_t)((src[idx0] >> 16) & 0xFFFF);
         const int16_t l1 = (int16_t)( src[idx1]        & 0xFFFF);
         const int16_t r1 = (int16_t)((src[idx1] >> 16) & 0xFFFF);
 
-        // Linear interpolation.
         const int16_t outL = (int16_t)(l0 + (int32_t)(l1 - l0) * frac / 65536);
         const int16_t outR = (int16_t)(r0 + (int32_t)(r1 - r0) * frac / 65536);
 
         if (mono) {
-            // Average both channels; write to both lanes.
             const int16_t m = (int16_t)(((int32_t)outL + (int32_t)outR) >> 1);
             dst[i * 2 + 0] = m;
             dst[i * 2 + 1] = m;
@@ -223,114 +230,63 @@ static void ResampleLinear(const uint32_t* src, int nSrc,
             dst[i * 2 + 0] = outL;
             dst[i * 2 + 1] = outR;
         }
-
         pos += step;
     }
 }
 
-static uint32_t* PullSpuSamples(int nFrames)
-{
-#if WIIAUD_GBA_FRAMES > WIIAUD_NDS_FRAMES
-    static uint32_t staging[WIIAUD_GBA_FRAMES];
-#else
-    static uint32_t staging[WIIAUD_NDS_FRAMES];
-#endif
-
-    uint32_t* p = ndsCore->spu.getSamples(nFrames);
-    if (!p) return nullptr;
-
-    memcpy(staging, p, (size_t)nFrames * sizeof(uint32_t));
-    delete[] p;        // getSamples() always heap-allocates; free it here.
-    return staging;
-}
-
+// ---------------------------------------------------------------------------
+// AudioCallback — unchanged
+// ---------------------------------------------------------------------------
 static void AudioCallback(s32 voice)
 {
     if (s_bufReady) {
         const int justFilled = s_writeBuf;
-        s_readBuf            = justFilled;
-        s_writeBuf           = justFilled ^ 1;
-        s_bufReady           = false;
-
-        ASND_AddVoice(voice,
-                      s_audioDbl[justFilled],
-                      WIIAUD_BUF_BYTES_STEREO);
+        s_readBuf  = justFilled;
+        s_writeBuf = justFilled ^ 1;
+        s_bufReady = false;
+        ASND_AddVoice(voice, s_audioDbl[justFilled], WIIAUD_BUF_BYTES_STEREO);
     } else {
         ASND_AddVoice(voice, s_audioSilence, WIIAUD_BUF_BYTES_STEREO);
     }
 }
 
+// ---------------------------------------------------------------------------
+// AudioThreadMain — no heap allocation, no delete[]
+// ---------------------------------------------------------------------------
 static sptr AudioThreadMain(void* /*arg*/)
 {
     while (runAudioThread) {
-        while (s_bufReady && runAudioThread) {
+        // Wait until the ASND callback has consumed the previous buffer.
+        while (s_bufReady && runAudioThread)
             KThreadYield();
-        }
         if (!runAudioThread) break;
 
-        int16_t* dst  = s_audioDbl[s_writeBuf];
-        bool     ok   = false;
+        int16_t*   dst  = s_audioDbl[s_writeBuf];
+        bool       ok   = false;
         const bool mono = (Settings::monoAudio != 0);
 
         if (romLoaded && ndsCore) {
-            if (ndsCore->gbaMode) {
-                uint32_t* src = PullSpuSamples(WIIAUD_GBA_FRAMES);
-                if (src) {
-                    ResampleLinear(src, WIIAUD_GBA_FRAMES,
-                                   dst, WIIAUD_FRAMES_PER_BUF, mono);
-                    ok = true;
-                }
-            } else {
-                uint32_t* src = PullSpuSamples(WIIAUD_NDS_FRAMES);
-                if (src) {
-                    ResampleLinear(src, WIIAUD_NDS_FRAMES,
-                                   dst, WIIAUD_FRAMES_PER_BUF, mono);
-                    ok = true;
-                }
+            // Both modes use AUDIO_SPU_FRAMES (== 548) — no branch needed
+            // for the frame count, only for which SPU mode is active.
+            bool got = ndsCore->spu.getSamples(s_spuStaging, AUDIO_SPU_FRAMES);
+            if (got || true) {
+                // Even on silence (got==false) getSamples fills s_spuStaging,
+                // so we can always resample it.
+                ResampleLinear(s_spuStaging, AUDIO_SPU_FRAMES,
+                               dst, WIIAUD_FRAMES_PER_BUF, mono);
+                ok = true;
             }
         }
-        if (!ok) {
+
+        if (!ok)
             memset(dst, 0, WIIAUD_BUF_BYTES_STEREO);
-        }
+
         DCFlushRange(dst, WIIAUD_BUF_BYTES_STEREO);
         s_bufReady = true;
     }
+
     KThreadExit(0);
     return 0;
-}
-
-static void InitializeAudio()
-{
-    memset(s_audioDbl,     0, sizeof(s_audioDbl));
-    memset(s_audioSilence, 0, sizeof(s_audioSilence));
-    DCFlushRange(s_audioDbl,     sizeof(s_audioDbl));
-    DCFlushRange(s_audioSilence, sizeof(s_audioSilence));
-
-    s_writeBuf = 0;
-    s_readBuf  = 1;
-    s_bufReady = false;
-
-    ASND_Init();
-    ASND_Pause(0);
-
-    ASND_SetVoice(0,
-                  VOICE_STEREO_16BIT_BE,
-                  WIIAUD_OUT_RATE,
-                  0,
-                  s_audioSilence,
-                  WIIAUD_BUF_BYTES_STEREO,
-                  MAX_VOLUME,
-                  MAX_VOLUME,
-                  AudioCallback);
-}
-
-static void ShutdownAudio()
-{
-    runAudioThread = false;
-    s_bufReady = false;       
-    ASND_StopVoice(0);
-    ASND_End();
-    KThreadJoin(&audioThread);
 }
 
 static void InitializeSettings() {
