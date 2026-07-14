@@ -1,1 +1,1 @@
-
+the original main by cson4.6 works perfectly for whatever reason, changes made by gemini3.5 flash to make the menu smaller makes the game crash when fps limiter is toggled on and off whereas in the original implementaiton it is fine.
