@@ -24,10 +24,6 @@
 // ============================================================================
 // Gekko PowerPC Register Mapping Configuration
 // ============================================================================
-// PowerPC preserved registers r14-r31 are allocated to map the ARM state.
-// On entrance, the registers are restored from the Interpreter context.
-// On exit (block termination or fallback), they are saved back to the context.
-// ============================================================================
 #define PPC_REG_R0     14
 #define PPC_REG_R1     15
 #define PPC_REG_R2     16
@@ -41,9 +37,9 @@
 #define PPC_REG_R10    24
 #define PPC_REG_R11    25
 #define PPC_REG_R12    26
-#define PPC_REG_SP     27 // ARM R13
-#define PPC_REG_LR     28 // ARM R14
-#define PPC_REG_CPSR   29 // ARM CPSR (Virtual Register)
+#define PPC_REG_SP     27 // ARM R13 (SP)
+#define PPC_REG_LR     28 // ARM R14 (LR)
+#define PPC_REG_CPSR   29 // ARM CPSR
 #define PPC_REG_THIS   30 // Interpreter Pointer ('this')
 #define PPC_REG_CORE   31 // Core Pointer
 
@@ -151,6 +147,10 @@ public:
         emit((38 << 26) | (rS << 21) | (rA << 16) | (uint16_t)d);
     }
 
+    void lwzx(int rD, int rA, int rB) {
+        emit((31 << 26) | (rD << 21) | (rA << 16) | (rB << 11) | (23 << 1));
+    }
+
     // Native PowerPC Hardware Byte-Reversal Load & Stores
     void lwbrx(int rD, int rA, int rB) {
         emit((31 << 26) | (rD << 21) | (rA << 16) | (rB << 11) | (534 << 1));
@@ -178,6 +178,10 @@ public:
 
     void sraw(int rA, int rS, int rB, bool rc = false) {
         emit((31 << 26) | (rS << 21) | (rA << 16) | (rB << 11) | (792 << 1) | (rc ? 1 : 0));
+    }
+
+    void srawi(int rA, int rS, int sh) {
+        emit((31 << 26) | (rS << 21) | (rA << 16) | (sh << 11) | (824 << 1));
     }
 
     void and_(int rA, int rS, int rB, bool rc = false) {
@@ -228,6 +232,10 @@ public:
         emit((21 << 26) | (rS << 21) | (rA << 16) | (sh << 11) | (mb << 6) | (me << 1) | (rc ? 1 : 0));
     }
 
+    void slwi(int rA, int rS, int sh) {
+        rlwinm(rA, rS, sh, 0, 31 - sh);
+    }
+
     void emit_load_imm(int reg, uint32_t imm) {
         if ((imm & 0xFFFF0000) == 0) {
             emit_clear_and_ori(reg, imm & 0xFFFF);
@@ -275,6 +283,7 @@ private:
     bool is_arm7;
     uint32_t start_pc;
     uint32_t accumulated_cycles;
+    uint32_t* block_start;
 
     int map_arm_reg_to_host(int arm_reg) {
         if (arm_reg >= 0 && arm_reg <= 10) return PPC_REG_R0 + arm_reg;
@@ -400,9 +409,18 @@ private:
     }
 
     void patch_cond_branch(uint32_t* branch_instr_ptr) {
-        uint32_t current_offset = (uint32_t)(e.write_ptr - branch_instr_ptr) * 4;
+        int32_t word_offset = (int32_t)(e.write_ptr - branch_instr_ptr);
         uint32_t opcode = *branch_instr_ptr;
-        opcode |= (current_offset & 0xFFFF);
+        opcode &= ~0xFFFC; // Clear old 14-bit BD displacement
+        opcode |= (word_offset & 0x3FFF) << 2; // Inject new signed offset
+        *branch_instr_ptr = opcode;
+    }
+
+    void patch_uncond_branch(uint32_t* branch_instr_ptr) {
+        int32_t word_offset = (int32_t)(e.write_ptr - branch_instr_ptr);
+        uint32_t opcode = *branch_instr_ptr;
+        opcode &= ~0x03FFFFFC; // Clear old 24-bit LI displacement
+        opcode |= (word_offset & 0x00FFFFFF) << 2;
         *branch_instr_ptr = opcode;
     }
 
@@ -500,23 +518,27 @@ private:
             map_offset = is_arm7 ? offsetof(Memory, writeMap7) : offsetof(Memory, writeMap9A);
         }
 
-        e.lwz(4, PPC_REG_CORE, OFF_MEMORY + map_offset);
-        e.rlwinm(5, 3, 22, 10, 29); // Offset calculations
-        e.lwz(6, 4, 5);
+        uint32_t total_offset = OFF_MEMORY + map_offset;
+        e.emit_load_imm(4, total_offset);
+        e.add(4, 4, PPC_REG_CORE); // r4 = &core->memory.readMap
+
+        e.srawi(5, 3, 12); // r5 = Address >> 12
+        e.slwi(5, 5, 2);   // r5 = index * 4
+        e.lwzx(6, 4, 5);   // r6 = MapTable[index]
 
         e.cmpwi(0, 6, 0);
         uint32_t* fallback_branch_patch = e.write_ptr;
-        e.emit(0x41820000); // Jump over native access to C++ lookup on page table miss
+        e.emit(0x41820000); // Jump over native access on page pointer miss
 
-        e.rlwinm(5, 3, 0, 20, 31);
-        e.add(6, 6, 5);
+        e.rlwinm(5, 3, 0, 20, 31); // r5 = Address & 0xFFF
+        e.add(6, 6, 5);            // r6 = host pointer
         
         if (load) {
             if (byte_access) {
                 e.lbz(host_rd, 6, 0);
             } else {
                 e.addi(5, 0, 0);
-                e.lwbrx(host_rd, 6, 5); // Read Word Byte-Reversed (1-cycle native conversion)
+                e.lwbrx(host_rd, 6, 5); // Read Word Byte-Reversed
             }
         } else {
             if (byte_access) {
@@ -538,18 +560,18 @@ private:
             e.stw(host_gpr, 5, 0);
         }
         
-        e.addi(3, PPC_REG_THIS, 0);
-        e.addi(4, 3, 0);
+        e.addi(4, 3, 0);             // Param 2: Target Address
+        e.addi(3, PPC_REG_THIS, 0); // Param 1: Interpreter*
         if (!load) {
-            e.addi(5, host_rd, 0);
+            e.addi(5, host_rd, 0);   // Param 3: Write Value
         }
-        e.emit_load_imm(6, is_arm7 ? 1 : 0);
+        e.emit_load_imm(6, is_arm7 ? 1 : 0); // Param 4: CPU Type
 
         uint32_t fn_address = 0;
         if (load) {
-            fn_address = byte_access ? (uint32_t)jit_fallback_read8 : (uint32_t)jit_fallback_read32;
+            fn_address = (uint32_t)(uintptr_t)(byte_access ? jit_fallback_read8 : jit_fallback_read32);
         } else {
-            fn_address = byte_access ? (uint32_t)jit_fallback_write8 : (uint32_t)jit_fallback_write32;
+            fn_address = (uint32_t)(uintptr_t)(byte_access ? jit_fallback_write8 : jit_fallback_write32);
         }
 
         e.emit_load_imm(12, fn_address);
@@ -566,7 +588,7 @@ private:
             e.lwz(host_gpr, 5, 0);
         }
 
-        patch_cond_branch(fastpath_done_branch_patch);
+        patch_uncond_branch(fastpath_done_branch_patch);
     }
 
     void emit_fallback_interpreter_instruction(uint32_t pc) {
@@ -581,7 +603,7 @@ private:
         e.stw(PPC_REG_CPSR, PPC_REG_THIS, OFF_CPSR);
 
         e.addi(3, PPC_REG_THIS, 0);
-        e.emit_load_imm(12, (uint32_t)jit_fallback_run_opcode);
+        e.emit_load_imm(12, (uint32_t)(uintptr_t)jit_fallback_run_opcode);
         e.mtctr(12);
         e.bctrl();
 
@@ -595,7 +617,7 @@ private:
 
 public:
     JitCompiler(uint32_t* write_buf, Interpreter& interpreter, bool arm7, uint32_t pc) 
-        : e(write_buf), interp(interpreter), is_arm7(arm7), start_pc(pc), accumulated_cycles(0) {}
+        : e(write_buf), interp(interpreter), is_arm7(arm7), start_pc(pc), accumulated_cycles(0), block_start(write_buf) {}
 
     uint32_t compile_block() {
         emit_prologue();
@@ -610,7 +632,7 @@ public:
 
             uint32_t* patch_bypass = emit_cond_branch_over(cond);
 
-            if ((opcode & 0x0E000000) == 0x0A000000) { // Branches
+            if ((opcode & 0x0E000000) == 0x0A000000) { // Branch Operations
                 uint32_t link = (opcode & (1 << 24)) != 0;
                 int32_t offset = opcode & 0xFFFFFF;
                 if (offset & 0x800000) {
@@ -678,7 +700,7 @@ public:
 
 private:
     uint32_t* JIT_COMPILER_GET_START() {
-        return e.write_ptr - (e.write_ptr - jit_buffer);
+        return block_start;
     }
 };
 
@@ -703,10 +725,12 @@ void* jit_compile(Interpreter& interp, uint32_t pc, bool arm7, int cpu_id) {
 }
 
 // ============================================================================
-// Main Execution Dispatch Overrides
+// Main JIT Hook Override
 // ============================================================================
 template <bool ARM7, int CPU>
 void Interpreter::runCoreSingle(Core &core) {
+    jit_init(); // Safe execution guard
+
     Interpreter &cpu = core.interpreter[CPU];
     if (cpu.halted) {
         cpu.cycles += cpu.dsiCycle ? 4 : 2;
@@ -725,38 +749,21 @@ void Interpreter::runCoreSingle(Core &core) {
         entry.ppc_code = jit_compile(cpu, pc, ARM7, CPU);
     }
 
-    // Direct hardware branch execution to native translated Gekko blocks
     typedef void (*JitBlockFunc)(Interpreter*, Core*);
     JitBlockFunc run_block = (JitBlockFunc)entry.ppc_code;
     run_block(&cpu, &core);
 }
 
-void Interpreter::runCoreNds(Core &core) {
-    jit_init();
-    while (core.running) {
-        uint32_t nextCycles = core.events[0].cycles;
-        while (core.globalCycles < nextCycles) {
-            runCoreSingle<false, 0>(core);
-            runCoreSingle<true, 1>(core);
-            core.globalCycles += 2;
-        }
-        core.events[0].cycles = 0xFFFFFFFF;
-        break;
-    }
-}
-
-void Interpreter::runCoreDsi(Core &core) {
-    runCoreNds(core);
-}
-
-void Interpreter::runCoreNone(Core &core) {}
-
-// Explicit Template Instantiation
+// Explicit template instantiations to resolve link requirements
 template void Interpreter::runCoreSingle<false, 0>(Core &core);
 template void Interpreter::runCoreSingle<true, 1>(Core &core);
 
 #pragma GCC diagnostic pop
 
+// ============================================================================
+// Append Original Interpreter Tables for Unmapped Fallback Lookup Resolution
+// ============================================================================
+#define runCoreSingle dummy_runCoreSingle
 // interpreter_lookup.cpp (optimized for PowerPC/Wii)
 // ARM opcode dispatch table - bits 27-20 and 7-4 of opcode select handler.
 // Reference: http://imrannazar.com/ARM-Opcode-Map
@@ -2115,3 +2122,4 @@ const uint8_t Interpreter::bitCount[256] =
     /* 0xE0 */  3, 4, 4, 5,  4, 5, 5, 6,  4, 5, 5, 6,  5, 6, 6, 7,
     /* 0xF0 */  4, 5, 5, 6,  5, 6, 6, 7,  5, 6, 6, 7,  6, 7, 7, 8,
 };
+#undef runCoreSingle
