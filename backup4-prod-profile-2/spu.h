@@ -1,34 +1,47 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
 #pragma once
 
 #include <cstdint>
 #include <cstdio>
-#include <deque>
 
 extern "C" {
     #include <tuxedo/thread.h>
 }
 
 class Core;
+
+// ---------------------------------------------------------------------------
+// Fixed-size ring buffer — replaces std::deque for GBA FIFOs.
+// Avoids heap allocation and pointer chasing entirely.
+// ---------------------------------------------------------------------------
+template<typename T, int CAP>
+struct RingBuf {
+    T    data[CAP];
+    int  head = 0;   // read index
+    int  tail = 0;   // write index
+    int  count = 0;
+
+    void clear()           { head = tail = count = 0; }
+    bool empty()     const { return count == 0; }
+    int  size()      const { return count; }
+    bool full()      const { return count == CAP; }
+
+    void push_back(T v) {
+        if (count < CAP) {
+            data[tail] = v;
+            tail = (tail + 1 == CAP) ? 0 : tail + 1;
+            ++count;
+        }
+    }
+
+    T front() const { return data[head]; }
+
+    void pop_front() {
+        if (count > 0) {
+            head = (head + 1 == CAP) ? 0 : head + 1;
+            --count;
+        }
+    }
+};
 
 class Spu {
 public:
@@ -38,15 +51,6 @@ public:
     void saveState(FILE *file);
     void loadState(FILE *file);
 
-    // ---------------------------------------------------------------------------
-    // Fill `dst` with `count` stereo samples packed as:
-    //   bits 15.. 0  = left  channel (int16_t)
-    //   bits 31..16  = right channel (int16_t)
-    //
-    // Returns true if fresh data was available, false if silence was substituted.
-    // The caller owns `dst`; it must be at least count*4 bytes.
-    // No heap allocation is performed inside this call.
-    // ---------------------------------------------------------------------------
     bool getSamples(uint32_t *dst, int count);
 
     void runGbaSample();
@@ -97,46 +101,37 @@ public:
 private:
     Core *core;
 
-    // ---------------------------------------------------------------------------
-    // Lock-free double buffer.
-    //
-    // The emulator thread writes into buffers[writeIdx] via pushSample().
-    // The audio thread reads from buffers[readIdx ^ 1] via getSamples().
-    //
-    // Swap protocol (emulator thread only):
-    //   1. Finish filling buffers[writeIdx].
-    //   2. Atomically flip writeIdx (PPCIrqLock).
-    //   3. Signal ready.
-    //
-    // Read protocol (audio thread only):
-    //   1. Check ready under lock.
-    //   2. Copy from buffers[readIdx] (the buffer NOT currently being written).
-    //   3. Clear ready under lock.
-    // ---------------------------------------------------------------------------
-    static const int  SPU_BUF_FRAMES = 548;   // == WIIAUD_NDS_FRAMES == WIIAUD_GBA_FRAMES
-    uint32_t          buffers[2][SPU_BUF_FRAMES];
-    int               writeIdx    = 0;         // index emulator thread writes to
-    uint32_t          bufferPointer = 0;       // how many samples written so far
+    // -----------------------------------------------------------------------
+    // Double buffer — 32-byte aligned for cache-line efficiency.
+    // Emulator thread writes buffers[writeIdx].
+    // Audio  thread reads  buffers[writeIdx ^ 1].
+    // -----------------------------------------------------------------------
+    static const int SPU_BUF_FRAMES = 548;
 
-    volatile bool     ready       = false;     // true when a complete frame is available
+    alignas(32) uint32_t buffers[2][SPU_BUF_FRAMES];
+    int          writeIdx     = 0;
+    uint32_t     bufferPointer = 0;
+    volatile bool ready       = false;
 
-    KThrQueue waitQueue1;   // emulator blocks here when audio is behind
-    KThrQueue waitQueue2;   // audio blocks here when emulator is behind
+    KThrQueue waitQueue1;
+    KThrQueue waitQueue2;
 
     // ---- GBA state ----
-    int16_t  gbaFrameSequencer    = 0;
-    int32_t  gbaSoundTimers[4]    = {};
-    int8_t   gbaEnvelopes[3]      = {};
-    int8_t   gbaEnvTimers[3]      = {};
-    int8_t   gbaSweepTimer        = 0;
-    int8_t   gbaWaveDigit         = 0;
-    uint16_t gbaNoiseValue        = 0;
+    int16_t  gbaFrameSequencer     = 0;
+    int32_t  gbaSoundTimers[4]     = {};
+    int8_t   gbaEnvelopes[3]       = {};
+    int8_t   gbaEnvTimers[3]       = {};
+    int8_t   gbaSweepTimer         = 0;
+    int8_t   gbaWaveDigit          = 0;
+    uint16_t gbaNoiseValue         = 0;
 
-    uint8_t  gbaWaveRam[2][16]    = {};
-    std::deque<int8_t> gbaFifos[2];
+    alignas(4) uint8_t gbaWaveRam[2][16] = {};
+
+    // Fixed-size ring buffers replace std::deque — zero heap allocation.
+    RingBuf<int8_t, 32> gbaFifos[2];
     int8_t   gbaSampleA = 0, gbaSampleB = 0;
 
-    uint16_t enabled              = 0;
+    uint16_t enabled = 0;
 
     static const int     indexTable[8];
     static const int16_t adpcmTable[89];
