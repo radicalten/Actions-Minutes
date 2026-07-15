@@ -1,6 +1,3 @@
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Winvalid-offsetof"
-
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -754,9 +751,6 @@ void Interpreter::runCoreNone(Core &core) {}
 // Explicit Template Instantiation
 template void Interpreter::runCoreSingle<false, 0>(Core &core);
 template void Interpreter::runCoreSingle<true, 1>(Core &core);
-
-#pragma GCC diagnostic pop
-
 
 // interpreter_lookup.cpp (optimized for PowerPC/Wii)
 // ARM opcode dispatch table - bits 27-20 and 7-4 of opcode select handler.
