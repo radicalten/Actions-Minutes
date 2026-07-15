@@ -1,1 +1,5 @@
 Goal optimize memory.h/cpp to work with new core.h/cpp dispatch from backup4-prod
+
+This speedup seemed to work perfectly with now drawbacks (compatibility issues)
+
+Next is to optimize audio code so it runs faster. 
