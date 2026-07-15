@@ -6,3 +6,8 @@ Next is to optimize audio code so it runs faster.
 
 ==
 process: audio-speedup-1
+
+it did not actually speed things up with cson4pt6 and also broke sound on nds.
+
+==
+next goal try to write ARM to PPC JIT recompiler.
