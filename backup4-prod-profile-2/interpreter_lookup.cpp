@@ -569,9 +569,17 @@ private:
 
         uint32_t fn_address = 0;
         if (load) {
-            fn_address = (uint32_t)(uintptr_t)(byte_access ? jit_fallback_read8 : jit_fallback_read32);
+            if (byte_access) {
+                fn_address = (uint32_t)(uintptr_t)jit_fallback_read8;
+            } else {
+                fn_address = (uint32_t)(uintptr_t)jit_fallback_read32;
+            }
         } else {
-            fn_address = (uint32_t)(uintptr_t)(byte_access ? jit_fallback_write8 : jit_fallback_write32);
+            if (byte_access) {
+                fn_address = (uint32_t)(uintptr_t)jit_fallback_write8;
+            } else {
+                fn_address = (uint32_t)(uintptr_t)jit_fallback_write32;
+            }
         }
 
         e.emit_load_imm(12, fn_address);
