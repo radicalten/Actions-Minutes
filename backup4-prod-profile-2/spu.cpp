@@ -657,13 +657,13 @@ void Spu::runSample() {
                     uint8_t byte   = core->memory.read<uint8_t>(1, soundCurrent[i]);
                     uint8_t nibble = adpcmToggle[i]
                                      ? ((byte >> 4) & 0xF)
-                                     : ( byte & 0xF);
+                                     : ( byte       & 0xF);
 
-                    // IMA step — avoid repeated table lookup.
+                    // IMA-ADPCM step — pre-load table entry once.
                     const int32_t step = adpcmTable[adpcmIndex[i]];
-                    int32_t diff = step >> 3;
-                    if (nibble & 1) diff += step >> 2;
-                    if (nibble & 2) diff += step >> 1;
+                    int32_t diff = step >> 3;          // step / 8
+                    if (nibble & 1) diff += step >> 2; // step / 4
+                    if (nibble & 2) diff += step >> 1; // step / 2
                     if (nibble & 4) diff += step;
 
                     if (nibble & 8) {
@@ -674,7 +674,8 @@ void Spu::runSample() {
                         if (adpcmValue[i] >  0x7FFF) adpcmValue[i] =  0x7FFF;
                     }
 
-                    int8_t newIdx = adpcmIndex[i] + (int8_t)indexTable[nibble & 7];
+                    int8_t newIdx = (int8_t)(adpcmIndex[i] +
+                                             (int8_t)indexTable[nibble & 7]);
                     if (newIdx <  0) newIdx =  0;
                     if (newIdx > 88) newIdx = 88;
                     adpcmIndex[i] = newIdx;
@@ -686,7 +687,8 @@ void Spu::runSample() {
 
                 case 3:
                     if (i >= 8 && i <= 13) {
-                        dutyCycles[i - 8] = (dutyCycles[i - 8] + 1) & 7;  // %8 via mask
+                        // % 8 → & 7 is safe (power of two)
+                        dutyCycles[i - 8] = (dutyCycles[i - 8] + 1) & 7;
                     } else if (i >= 14) {
                         uint16_t nv = noiseValues[i - 14];
                         nv &= ~0x8000u;
@@ -700,7 +702,8 @@ void Spu::runSample() {
             }
 
             if (format != 3 &&
-                soundCurrent[i] >= soundSad[i] + ((uint32_t)soundPnt[i] + soundLen[i]) * 4)
+                soundCurrent[i] >= soundSad[i] +
+                    ((uint32_t)soundPnt[i] + soundLen[i]) * 4)
             {
                 const uint8_t repeat = (cnt >> 27) & 0x3;
                 if (repeat == 1) {
@@ -718,11 +721,14 @@ void Spu::runSample() {
             }
         }
 
-        // Volume divider: bits 9-8.
+        // ----------------------------------------------------------------
+        // Volume divider (bits 9-8).
+        // Original: divShift == 3 → treat as 4, then data <<= (4 - divShift)
+        // This is kept exactly — it is already shift-only.
+        // ----------------------------------------------------------------
         int divShift = (cnt >> 8) & 0x3;
         if (divShift == 3) divShift = 4;
         data <<= (4 - divShift);
-
         // Per-channel volume multiplier: bits 6-0.
         // Replace / 128 with >> 7.
         int mulFactor = cnt & 0x7F;
