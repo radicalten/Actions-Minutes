@@ -1,6 +1,12 @@
 //interpreter_branch.cpp (optimized for PowerPC/Wii)
 #include "core.h"
 
+#ifdef __wii__
+#  define LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  define FORCE_INLINE __attribute__((always_inline)) inline
+#endif
+
 int Interpreter::bx(uint32_t opcode) {
     uint32_t op0 = *registers[opcode & 0xF];
     // Set THUMB bit if target bit 0 set
