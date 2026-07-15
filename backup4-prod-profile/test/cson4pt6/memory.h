@@ -5,7 +5,10 @@
 #include "defines.h"
 
 // PowerPC byte-swap intrinsics (devkitPPC / GCC)
-#ifdef __powerpc__
+#ifdef __wii__
+#  define LIKELY(x)   __builtin_expect(!!(x), 1)
+#  define UNLIKELY(x) __builtin_expect(!!(x), 0)
+#  define FORCE_INLINE __attribute__((always_inline)) inline
 #  include <stdint.h>
 // lwbrx / stwbrx equivalents via GCC builtins
 static FORCE_INLINE uint16_t bswap16(uint16_t x) {
