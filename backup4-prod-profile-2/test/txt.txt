@@ -1,0 +1,5 @@
+Goal optimize memory.h/cpp to work with new core.h/cpp dispatch from backup4-prod
+
+This speedup seemed to work perfectly with now drawbacks (compatibility issues) (meaasured in HGSS mute seems to average same 5-6fps, but occasionally hits 7fps and leans more towards 6 than 5 than the previous build) Definite candidate for v1.5.1
+
+Next is to optimize audio code so it runs faster. 

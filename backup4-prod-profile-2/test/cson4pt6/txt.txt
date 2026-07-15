@@ -1,0 +1,3 @@
+memory-speedup1-p1 was straightup refused by every model on lmarena ai now. that is sad, I supposed they just recently clamped down on mutli prompt queries. luckily it will work on memory-speedup1-p2 on its own
+
+turns out memory.h and memory-complete.cpp compile and it is either the same speed or 1/2-1 frame faster on average with no noticeable compatibility issues. neat.
