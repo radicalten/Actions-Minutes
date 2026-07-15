@@ -1957,3 +1957,112 @@ Then wire `NOODS_JIT_GLUE` / `bridge*` to those functions (or add proper public 
 7. **Next hardening steps** — full shifter (RRX, reg shifts), ADC/SBC, LDM/STM, accurate PC offsets, block linking (`b` → next block), and sparse invalidation.
 
 I can next: (a) produce `jit_glue.cpp` + header with clean accessors, (b) expand emitters for LDR/STR/Thumb memory/LDM, or (c) sketch the exact `runOpcode` / `runCore*` patch for NooDS.
+
+===
+ok if I am fully replacing the interpreter.cpp file what steps do I take with this file? just paste in that entire .cpp towards the bottom and everything should work?
+No. Pasting that file into the bottom of `interpreter.cpp` (or swapping the whole file for it) will **not** work.
+
+That JIT is a **hybrid add-on**, not a full reimplementation of NooDS’s interpreter. It still needs almost everything `interpreter.cpp` already provides.
+
+### Why a full replace fails
+
+| What `interpreter.cpp` owns | What the JIT file has |
+|---|---|
+| All `Interpreter::*` opcode handlers (`addsImm`, `ldrOf`, …) | Only some emitters + **calls back** into those handlers |
+| `runCoreNds` / `runCoreSingle` / cycle & halt logic | Only `JitRuntime::execute()` for a block |
+| Pipeline, `setCpsr`, banks, IRQ, HLE | Helpers that **assume** those still exist |
+| Real register/`cpsr` access | Needs glue; without it uses **fake** regs |
+
+If you delete `interpreter.cpp` and only keep the JIT, you lose the fallback path and most of the CPU. Link will fail or it will “run” on dummy state.
+
+---
+
+### Correct approach (keep interpreter, add JIT)
+
+**1. Keep `interpreter.cpp` and `interpreter_lookup.cpp`.**  
+Do **not** delete them.
+
+**2. Add the JIT as its own file**, e.g. `jit_recompiler.cpp`, and add it to the build (CMake / Makefile).
+
+**3. Add a tiny glue API** so the JIT can touch private state (pick one style):
+
+In `interpreter.h` (clean way):
+
+```cpp
+// JIT bridge
+uint32_t& jitReg(int i) { return *registers[i]; }
+uint32_t& jitCpsr() { return cpsr; }
+Core* jitCore() { return core; }
+bool jitArm7() { return arm7; }
+void jitFlushPipeline() { flushPipeline(); }
+int jitRunArmOp(uint32_t op);
+int jitRunThumbOp(uint16_t op);
+```
+
+In `interpreter.cpp`:
+
+```cpp
+int Interpreter::jitRunArmOp(uint32_t op) {
+    uint32_t index = ((op >> 16) & 0xFF0) | ((op >> 4) & 0xF);
+    return (this->*armInstrs[index])(op);
+}
+int Interpreter::jitRunThumbOp(uint16_t op) {
+    return (this->*thumbInstrs[op >> 6])(op);
+}
+```
+
+Wire `bridgeReg` / `bridgeCpsr` / etc. in the JIT to these methods (and define `NOODS_JIT_GLUE` or drop the stub path).
+
+**4. Hook the hot path** — usually `runOpcode()` (or whatever your loop uses to step one instruction):
+
+```cpp
+int Interpreter::runOpcode() {
+#if defined(NOODS_USE_JIT)
+    if (!halted) {
+        int c = JitRuntime::execute(this);
+        // match how your interpreter accounts cycles
+        return c;
+    }
+#endif
+    // existing fetch + table dispatch...
+}
+```
+
+**5. Init / reset:**
+
+```cpp
+void Interpreter::init() {
+    JitRuntime::init();
+    // ...existing init...
+}
+// on soft reset / load state: JitRuntime::reset();
+```
+
+**6. PC semantics** — fix `fetchPc` in `JitRuntime::execute` so it matches NooDS (`getOpcode16/32` + pipeline). Wrong PC ⇒ wrong blocks / infinite mess.
+
+**7. Build flags** — e.g. `-DNOODS_USE_JIT`, Wii: executable code region + your `dcbst`/`icbi` path.
+
+**8. Ship interpreter tables** — still need `armInstrs` / `thumbInstrs` from `interpreter_lookup.cpp` for anything the JIT doesn’t emit.
+
+---
+
+### If you truly want to “fully replace” the interpreter
+
+That’s a different project: implement **every** ARMv4/5 + Thumb path in the emitter (or always-native helpers), full CPSR/banks/exceptions/IRQ/HLE/cycles, and reimplement `runCore*`. The current file is a **starting skeleton**, not that.
+
+Rough order if you go all-in later:
+
+1. Stable JIT bridge + block cache + run loop  
+2. Expand coverage until fallback is rare  
+3. Only then remove table handlers you no longer call  
+4. Never remove `Interpreter` state / scheduling / dual-CPU glue until the JIT owns all of it  
+
+---
+
+### Short answer
+
+- **Do not** paste the whole JIT at the bottom of `interpreter.cpp` and expect it to work.  
+- **Do not** replace `interpreter.cpp` with only that file.  
+- **Do** add `jit_recompiler.cpp`, keep the interpreter, add bridge methods, call `JitRuntime::execute()` from `runOpcode()`, fix PC/cycles, link lookup tables for fallback.
+
+If you want, next step can be a minimal patch list: exact edits to `interpreter.h` / `interpreter.cpp` / CMake and a slimmed JIT that only uses the public bridge (no `#define private public`).
