@@ -4543,3 +4543,85 @@ The key points of what this file provides:
 | `Interpreter::armInstrs[4096]` | `ArmFn` | 16KB | ARM dispatch table indexed by `bits[27:20]<<4 \| bits[7:4]` |
 | `Interpreter::thumbInstrs[1024]` | `ThumbFn` | 4KB | THUMB dispatch table indexed by `bits[15:6]` |
 
+===========
+so do I use both of these files together or how do I use them?
+
+Looking at the NooDS source, the original `interpreter_lookup.cpp` **only** provides the three static table definitions. The JIT file I wrote earlier is a separate, self-contained system. Here's how they relate:
+
+## You only need ONE of these approaches:
+
+---
+
+## Option A: Just Fix the Linker Error (Simplest)
+
+Just use the `interpreter_lookup.cpp` replacement alone. Drop it in and it fixes your linker errors by providing the missing symbols. The interpreter runs as normal - no JIT.
+
+```
+NooDS source files:
+├── interpreter.cpp          (unchanged)
+├── interpreter_alu.cpp      (unchanged)  
+├── interpreter_transfer.cpp (unchanged)
+├── interpreter_lookup.cpp   ← REPLACE WITH MY FILE
+└── ... rest of NooDS
+```
+
+---
+
+## Option B: JIT Only (Not recommended yet)
+
+The JIT file alone is not ready to drop in cleanly because it still needs the interpreter's handler functions for edge cases.
+
+---
+
+## Option A is what you want right now.
+
+Look at your actual NooDS source to verify the exact method names match, because the table entries must match what's declared in `interpreter.h` exactly:
+
+```bash
+# Check what methods interpreter.h actually declares
+grep -o 'void [a-zA-Z]*(' src/interpreter.h | sort
+
+# Check what the original lookup file referenced  
+grep 'Interpreter::' src/interpreter_lookup.cpp | sort | uniq
+
+# Check what your linker errors reference specifically
+# The three missing symbols are:
+#   Interpreter::armInstrs
+#   Interpreter::thumbInstrs  
+#   Interpreter::condition
+#   Interpreter::bitCount
+```
+
+Then look at NooDS interpreter.h to get the real method names:
+
+```bash
+# Download the actual NooDS interpreter.h to verify names
+curl -s https://raw.githubusercontent.com/Hydr8gon/NooDS/master/src/interpreter.h | grep -E '(void |static )' | head -80
+```
+
+The safest approach since you have the actual build environment:
+
+```bash
+# 1. Get the ORIGINAL interpreter_lookup.cpp from NooDS git
+cd your_noods_source
+git show HEAD:src/interpreter_lookup.cpp > /tmp/original_lookup.cpp
+
+# 2. Check if it exists and what it contains
+cat /tmp/original_lookup.cpp
+```
+
+If the original file exists in git history, just restore it:
+
+```bash
+git checkout HEAD -- src/interpreter_lookup.cpp
+# or
+git checkout origin/master -- src/interpreter_lookup.cpp
+```
+
+If it genuinely doesn't exist and needs to be written from scratch, share the contents of your `interpreter.h` and I'll generate a `interpreter_lookup.cpp` with the **exact** correct method names that will compile cleanly.
+
+```bash
+cat src/interpreter.h
+```
+
+That's the key file - everything in the lookup table must match the declarations in that header exactly, and without seeing your specific version I can't guarantee the method names I used (`andLli`, `movImm`, etc.) match yours precisely.
