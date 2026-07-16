@@ -137,7 +137,6 @@ struct SchedEvent {
 
 class Core {
 public:
-    void invalidateJitPage(uint32_t addr);
     void* operator new  (size_t size);
     void  operator delete  (void* p) noexcept;
     void* operator new[](size_t size);
@@ -192,6 +191,7 @@ public:
     ~Core();   // <-- add this line
     void saveState(FILE* file);
     void loadState(FILE* file);
+    void invalidateJitPage(uint32_t addr);
 
     // Hot path: single load + indirect branch, no virtual dispatch.
     inline void runCore() { (*runFunc)(*this); }
@@ -201,8 +201,8 @@ public:
     void endFrame();
 
 private:
-    bool jitAvailable = false;   // true when JIT code buffer is live
     bool realGbaBios;
+    bool jitAvailable = false;   // true when JIT code buffer is live
     void (*runFunc)(Core&) = &Interpreter::runCoreNds;
 
     uint64_t lastFpsTimeTicks = 0;
