@@ -518,3 +518,7 @@ void Interpreter::writePostFlg(uint8_t value) {
     postFlg |= value & 0x01;
     if (!arm7) postFlg = (postFlg & ~0x02) | (value & 0x02);
 }
+
+ int Interpreter::jitRunOpcode() {     
+     return runOpcode(); 
+ }
