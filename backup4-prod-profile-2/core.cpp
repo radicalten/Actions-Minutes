@@ -28,7 +28,7 @@ extern "C" {
 }
 
 #include "core.h"
-#include "jit_ppc.h"   // JIT recompiler interface
+#include "jit_ppc.h"
 
 extern void* Noods_MEM2_Alloc(size_t size);
 extern void  Noods_MEM2_Free(void* ptr);
@@ -53,54 +53,22 @@ void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
 // ---------------------------------------------------------------------------
 // JIT run wrappers
 //
-// runFunc is a plain function pointer void(*)(Core&).
-// We provide one JIT wrapper per interpreter-mode variant so that the JIT
-// can be dropped in wherever the interpreter currently sits, while still
-// respecting halted/GBA/DSi state.  Any mode the JIT does not handle falls
-// through to the matching interpreter template.
+// runFunc has signature void(*)(Core&).  We provide one thin wrapper per
+// emulation mode so the JIT can be installed wherever the interpreter sits.
 // ---------------------------------------------------------------------------
-
-// NDS normal mode — both CPUs active, JIT on both
-static void runJitNdsWrapper(Core& core)
-{
-    JitPpc::runJitNds(core);
-}
-
-// Single-CPU wrappers: the JIT runs whichever CPU is active; the other is
-// halted so compileBlock() simply won't be called for it.
-static void runJitSingle9(Core& core)   // ARM9 only
-{
-    JitPpc::runJitNds(core);            // arm9.halted==false, arm7.halted==true
-}
-
-static void runJitSingle7(Core& core)   // ARM7 only (GBA or ARM9 halted)
-{
-    JitPpc::runJitNds(core);            // arm7.halted==false, arm9.halted==true
-}
-
-// DSi mode — JIT translates both; DSi-specific timing is handled inside the
-// per-block cycle accounting.  Fall back to interpreter when unavailable.
-static void runJitDsiWrapper(Core& core)
-{
-    JitPpc::runJitNds(core);
-}
-
-// GBA mode — ARM7 only, 16 MHz clock.  JIT handles it the same way as a
-// single-CPU NDS session but with the GBA memory map already active.
-static void runJitGbaWrapper(Core& core)
-{
-    JitPpc::runJitNds(core);
-}
+static void runJitNdsWrapper(Core& core)  { JitPpc::runJitNds(core); }
+static void runJitSingle9(Core& core)     { JitPpc::runJitNds(core); }
+static void runJitSingle7(Core& core)     { JitPpc::runJitNds(core); }
+static void runJitDsiWrapper(Core& core)  { JitPpc::runJitNds(core); }
+static void runJitGbaWrapper(Core& core)  { JitPpc::runJitNds(core); }
 
 // ---------------------------------------------------------------------------
-// Helper: choose the right JIT function pointer for the current state.
-// Mirrors the logic in updateRun() but returns a JIT wrapper instead of an
-// interpreter template.  Returns nullptr when the JIT has no suitable entry.
+// pickJitFunc — mirror of the interpreter selection logic in updateRun(),
+// but returns a JIT wrapper.  Returns nullptr only when both CPUs are halted
+// (caller handles that case before calling this).
 // ---------------------------------------------------------------------------
 static void (*pickJitFunc(const Core& core))(Core&)
 {
-    if (core.interpreter[0].halted && core.interpreter[1].halted)
-        return nullptr;                     // nothing to run
     if (core.gbaMode)
         return runJitGbaWrapper;
     if (core.dsiMode)
@@ -141,7 +109,7 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
       fpsCount(0)
 {
     // ------------------------------------------------------------------
-    // Bind task table.
+    // Bind task table
     // ------------------------------------------------------------------
     tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
     tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
@@ -211,19 +179,17 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     // ------------------------------------------------------------------
     // JIT initialisation
     //
-    // initJit() allocates the code buffer (MEM1, 4 MB) and precomputes
-    // struct offsets.  If it fails (low memory, OGC cache API unavailable)
-    // we silently fall back to the pure interpreter path — updateRun()
-    // will install the interpreter runFunc in that case.
+    // Must happen after memory maps are set up but before updateRun()
+    // installs runFunc, so that pickJitFunc() can be used immediately.
     // ------------------------------------------------------------------
     jitAvailable = JitPpc::initJit();
 
     if (jitAvailable)
         printf("[Core %d] JIT recompiler active\n", id);
     else
-        printf("[Core %d] JIT unavailable — using interpreter\n", id);
+        printf("[Core %d] JIT unavailable — interpreter only\n", id);
 
-    updateRun();   // installs runFunc (JIT or interpreter)
+    updateRun();
 
     memory.updateMap9(0x00000000, 0xFFFFFFFF);
     memory.updateMap7(0x00000000, 0xFFFFFFFF);
@@ -293,7 +259,7 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
 }
 
 // ---------------------------------------------------------------------------
-// Destructor — shut down JIT and free code buffer
+// Destructor — shut down JIT and release the code buffer
 // ---------------------------------------------------------------------------
 Core::~Core()
 {
@@ -333,8 +299,7 @@ void Core::loadState(FILE* file) {
         events.push_back(event);
     }
 
-    // JIT blocks compiled before the save are now stale — the loaded state
-    // may jump to different code paths.
+    // Blocks compiled against the pre-save state are now stale.
     if (jitAvailable)
         JitPpc::flushJitCache();
 
@@ -343,49 +308,44 @@ void Core::loadState(FILE* file) {
 
 // ---------------------------------------------------------------------------
 // updateRun — select the tightest run function for the current state
-//
-// Priority:
-//   1. Both CPUs halted          → runCoreNone  (no JIT needed)
-//   2. JIT available             → matching JIT wrapper
-//   3. Fallback                  → matching interpreter template
 // ---------------------------------------------------------------------------
-void Core::updateRun() {
-    // Both CPUs halted: nothing to recompile.
+void Core::updateRun()
+{
+    // Determine the new runFunc without using goto so that no
+    // initialisation is skipped across a label.
+    void (*newFunc)(Core&) = nullptr;
+
     if (interpreter[0].halted && interpreter[1].halted) {
-        runFunc = &Interpreter::runCoreNone;
-        goto done;
+        // Nothing to execute; the interpreter's no-op loop is fine.
+        newFunc = &Interpreter::runCoreNone;
+    } else if (jitAvailable) {
+        newFunc = pickJitFunc(*this);
     }
 
-    if (jitAvailable) {
-        auto* jf = pickJitFunc(*this);
-        if (jf) {
-            runFunc = jf;
-            goto done;
-        }
-        // pickJitFunc returned nullptr only for the both-halted case,
-        // which is already handled above.  Should not reach here.
+    // If the JIT is not available, or pickJitFunc somehow returned nullptr
+    // (should not happen for non-halted states), use the interpreter.
+    if (!newFunc) {
+        if (gbaMode)
+            newFunc = &Interpreter::runCoreSingle<true, 0>;
+        else if (dsiMode)
+            newFunc = &Interpreter::runCoreDsi;
+        else if (!interpreter[0].halted && !interpreter[1].halted)
+            newFunc = &Interpreter::runCoreNds;
+        else if (interpreter[0].halted)
+            newFunc = &Interpreter::runCoreSingle<true, 1>;
+        else
+            newFunc = &Interpreter::runCoreSingle<false, 0>;
     }
 
-    // Pure interpreter fallback
-    if (gbaMode)
-        runFunc = &Interpreter::runCoreSingle<true, 0>;
-    else if (dsiMode)
-        runFunc = &Interpreter::runCoreDsi;
-    else if (!interpreter[0].halted && !interpreter[1].halted)
-        runFunc = &Interpreter::runCoreNds;
-    else if (interpreter[0].halted)
-        runFunc = &Interpreter::runCoreSingle<true, 1>;
-    else
-        runFunc = &Interpreter::runCoreSingle<false, 0>;
+    runFunc = newFunc;
 
-done:
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
     PPCIrqUnlockByMsr(st);
 }
 
 // ---------------------------------------------------------------------------
-// resetCycles — prevent globalCycles overflow every ~2 billion ticks
+// resetCycles — prevent globalCycles overflow
 // ---------------------------------------------------------------------------
 void Core::resetCycles() {
     const size_t n = events.size();
@@ -402,7 +362,7 @@ void Core::resetCycles() {
 }
 
 // ---------------------------------------------------------------------------
-// schedule — insert a new event in sorted order (binary search insertion)
+// schedule — insert a new event in sorted order
 // ---------------------------------------------------------------------------
 void Core::schedule(SchedTask task, uint32_t cycles) {
     SchedEvent event(task, globalCycles + cycles);
@@ -419,8 +379,7 @@ void Core::enterGbaMode() {
     interpreter[0].halt(2);
     interpreter[1].unhalt(2);
 
-    // GBA mode uses a different memory map; any cached JIT blocks that
-    // reference NDS addresses are now invalid.
+    // NDS-mapped JIT blocks are invalid once the GBA memory map is live.
     if (jitAvailable)
         JitPpc::flushJitCache();
 
@@ -475,17 +434,11 @@ void Core::endFrame() {
 }
 
 // ---------------------------------------------------------------------------
-// invalidateJitPage — called by the memory subsystem when a writable page
-// that may contain code is modified (e.g. WRAM, main RAM writes via DMA).
-// Keeps the JIT block cache coherent without a full flush.
+// invalidateJitPage — fine-grained cache invalidation for a single 4 KB page
 // ---------------------------------------------------------------------------
 void Core::invalidateJitPage(uint32_t addr)
 {
     if (!jitAvailable) return;
-
-    // Granularity: one 4 KB page.  The JIT cache is indexed by ARM PC so
-    // we invalidate the block that starts inside this page.
     uint32_t pageStart = addr & ~0xFFFu;
-    uint32_t pageEnd   = pageStart + 0x1000u;
-    JitPpc::invalidateJitRange(pageStart, pageEnd);
+    JitPpc::invalidateJitRange(pageStart, pageStart + 0x1000u);
 }
