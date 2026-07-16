@@ -137,6 +137,7 @@ struct SchedEvent {
 
 class Core {
 public:
+    void invalidateJitPage(uint32_t addr);
     void* operator new  (size_t size);
     void  operator delete  (void* p) noexcept;
     void* operator new[](size_t size);
@@ -199,6 +200,7 @@ public:
     void endFrame();
 
 private:
+    bool jitAvailable = false;   // true when JIT code buffer is live
     bool realGbaBios;
     void (*runFunc)(Core&) = &Interpreter::runCoreNds;
 
