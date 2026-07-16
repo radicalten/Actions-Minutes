@@ -189,6 +189,7 @@ public:
          int ndsStateFd = -1, int gbaStateFd = -1,
          int ndsCheatFd = -1);
 
+    ~Core();   // <-- add this line
     void saveState(FILE* file);
     void loadState(FILE* file);
 
