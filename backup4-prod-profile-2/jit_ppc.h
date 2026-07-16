@@ -6,6 +6,7 @@
 #pragma once
 #include <cstdint>
 #include <cstdlib>
+#include "core.h"
 
 namespace JitPpc {
     bool initJit();
