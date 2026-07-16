@@ -9,6 +9,7 @@
 #include "memory.h"
 #include "defines.h"
 
+#include <gccore.h>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
