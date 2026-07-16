@@ -28,6 +28,7 @@ extern "C" {
 }
 
 #include "core.h"
+#include "jit_ppc.h"   // JIT recompiler interface
 
 extern void* Noods_MEM2_Alloc(size_t size);
 extern void  Noods_MEM2_Free(void* ptr);
@@ -48,6 +49,68 @@ void* Core::operator new[](size_t size) {
     return p;
 }
 void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
+
+// ---------------------------------------------------------------------------
+// JIT run wrappers
+//
+// runFunc is a plain function pointer void(*)(Core&).
+// We provide one JIT wrapper per interpreter-mode variant so that the JIT
+// can be dropped in wherever the interpreter currently sits, while still
+// respecting halted/GBA/DSi state.  Any mode the JIT does not handle falls
+// through to the matching interpreter template.
+// ---------------------------------------------------------------------------
+
+// NDS normal mode — both CPUs active, JIT on both
+static void runJitNdsWrapper(Core& core)
+{
+    JitPpc::runJitNds(core);
+}
+
+// Single-CPU wrappers: the JIT runs whichever CPU is active; the other is
+// halted so compileBlock() simply won't be called for it.
+static void runJitSingle9(Core& core)   // ARM9 only
+{
+    JitPpc::runJitNds(core);            // arm9.halted==false, arm7.halted==true
+}
+
+static void runJitSingle7(Core& core)   // ARM7 only (GBA or ARM9 halted)
+{
+    JitPpc::runJitNds(core);            // arm7.halted==false, arm9.halted==true
+}
+
+// DSi mode — JIT translates both; DSi-specific timing is handled inside the
+// per-block cycle accounting.  Fall back to interpreter when unavailable.
+static void runJitDsiWrapper(Core& core)
+{
+    JitPpc::runJitNds(core);
+}
+
+// GBA mode — ARM7 only, 16 MHz clock.  JIT handles it the same way as a
+// single-CPU NDS session but with the GBA memory map already active.
+static void runJitGbaWrapper(Core& core)
+{
+    JitPpc::runJitNds(core);
+}
+
+// ---------------------------------------------------------------------------
+// Helper: choose the right JIT function pointer for the current state.
+// Mirrors the logic in updateRun() but returns a JIT wrapper instead of an
+// interpreter template.  Returns nullptr when the JIT has no suitable entry.
+// ---------------------------------------------------------------------------
+static void (*pickJitFunc(const Core& core))(Core&)
+{
+    if (core.interpreter[0].halted && core.interpreter[1].halted)
+        return nullptr;                     // nothing to run
+    if (core.gbaMode)
+        return runJitGbaWrapper;
+    if (core.dsiMode)
+        return runJitDsiWrapper;
+    if (!core.interpreter[0].halted && !core.interpreter[1].halted)
+        return runJitNdsWrapper;
+    if (core.interpreter[0].halted)
+        return runJitSingle7;
+    return runJitSingle9;
+}
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -79,63 +142,47 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
 {
     // ------------------------------------------------------------------
     // Bind task table.
-    //
-    // Layout: SchedCallback(trampoline, receiver_ptr, int_arg)
-    // Tasks that take no integer argument pass 0; the compiler will
-    // constant-fold the unused parameter in release builds.
     // ------------------------------------------------------------------
-
-    // Core self-tasks
     tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
     tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
 
-    // Cartridge — arg selects ARM9 (0) or ARM7 (1)
     tasks[CART9_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 0);
     tasks[CART7_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 1);
 
-    // DMA — ARM9 channels 0-3
     tasks[DMA9_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[0], 0);
     tasks[DMA9_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[0], 1);
     tasks[DMA9_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[0], 2);
     tasks[DMA9_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[0], 3);
 
-    // DMA — ARM7 channels 0-3
     tasks[DMA7_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[1], 0);
     tasks[DMA7_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[1], 1);
     tasks[DMA7_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[1], 2);
     tasks[DMA7_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[1], 3);
 
-    // GPU scanlines
-    tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,   &gpu);
-    tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,   &gpu);
+    tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,    &gpu);
+    tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,    &gpu);
     tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
     tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
 
-    // GPU 3D command FIFO
     tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
 
-    // CPU interrupts
     tasks[ARM9_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[0]);
     tasks[ARM7_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[1]);
 
-    // SPU
     tasks[NDS_SPU_SAMPLE]   = SchedCallback(shim_spuSample,    &spu);
     tasks[GBA_SPU_SAMPLE]   = SchedCallback(shim_spuGbaSample, &spu);
 
-    // Timers — ARM9 channels 0-3
     tasks[TIMER9_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[0], 0);
     tasks[TIMER9_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[0], 1);
     tasks[TIMER9_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[0], 2);
     tasks[TIMER9_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[0], 3);
 
-    // Timers — ARM7 channels 0-3
     tasks[TIMER7_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[1], 0);
     tasks[TIMER7_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[1], 1);
     tasks[TIMER7_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[1], 2);
     tasks[TIMER7_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[1], 3);
 
-    // WiFi — CMD_REPLY / CMD_ACK are integer constants from wifi.h
-    tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs, &wifi);
+    tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs,  &wifi);
     tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
     tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
 
@@ -160,7 +207,23 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     schedule(NDS_SPU_SAMPLE,  512 * 2);
 
     dsiMode = Settings::dsiMode;
-    updateRun();
+
+    // ------------------------------------------------------------------
+    // JIT initialisation
+    //
+    // initJit() allocates the code buffer (MEM1, 4 MB) and precomputes
+    // struct offsets.  If it fails (low memory, OGC cache API unavailable)
+    // we silently fall back to the pure interpreter path — updateRun()
+    // will install the interpreter runFunc in that case.
+    // ------------------------------------------------------------------
+    jitAvailable = JitPpc::initJit();
+
+    if (jitAvailable)
+        printf("[Core %d] JIT recompiler active\n", id);
+    else
+        printf("[Core %d] JIT unavailable — using interpreter\n", id);
+
+    updateRun();   // installs runFunc (JIT or interpreter)
 
     memory.updateMap9(0x00000000, 0xFFFFFFFF);
     memory.updateMap7(0x00000000, 0xFFFFFFFF);
@@ -230,6 +293,17 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
 }
 
 // ---------------------------------------------------------------------------
+// Destructor — shut down JIT and free code buffer
+// ---------------------------------------------------------------------------
+Core::~Core()
+{
+    if (jitAvailable) {
+        JitPpc::shutdownJit();
+        jitAvailable = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // State save / load
 // ---------------------------------------------------------------------------
 void Core::saveState(FILE* file) {
@@ -259,16 +333,41 @@ void Core::loadState(FILE* file) {
         events.push_back(event);
     }
 
+    // JIT blocks compiled before the save are now stale — the loaded state
+    // may jump to different code paths.
+    if (jitAvailable)
+        JitPpc::flushJitCache();
+
     updateRun();
 }
 
 // ---------------------------------------------------------------------------
-// updateRun — select the tightest interpreter loop for the current state
+// updateRun — select the tightest run function for the current state
+//
+// Priority:
+//   1. Both CPUs halted          → runCoreNone  (no JIT needed)
+//   2. JIT available             → matching JIT wrapper
+//   3. Fallback                  → matching interpreter template
 // ---------------------------------------------------------------------------
 void Core::updateRun() {
-    if (interpreter[0].halted && interpreter[1].halted)
+    // Both CPUs halted: nothing to recompile.
+    if (interpreter[0].halted && interpreter[1].halted) {
         runFunc = &Interpreter::runCoreNone;
-    else if (gbaMode)
+        goto done;
+    }
+
+    if (jitAvailable) {
+        auto* jf = pickJitFunc(*this);
+        if (jf) {
+            runFunc = jf;
+            goto done;
+        }
+        // pickJitFunc returned nullptr only for the both-halted case,
+        // which is already handled above.  Should not reach here.
+    }
+
+    // Pure interpreter fallback
+    if (gbaMode)
         runFunc = &Interpreter::runCoreSingle<true, 0>;
     else if (dsiMode)
         runFunc = &Interpreter::runCoreDsi;
@@ -279,6 +378,7 @@ void Core::updateRun() {
     else
         runFunc = &Interpreter::runCoreSingle<false, 0>;
 
+done:
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
     PPCIrqUnlockByMsr(st);
@@ -318,6 +418,12 @@ void Core::enterGbaMode() {
 
     interpreter[0].halt(2);
     interpreter[1].unhalt(2);
+
+    // GBA mode uses a different memory map; any cached JIT blocks that
+    // reference NDS addresses are now invalid.
+    if (jitAvailable)
+        JitPpc::flushJitCache();
+
     updateRun();
 
     events.clear();
@@ -366,4 +472,20 @@ void Core::endFrame() {
 
     if (wifi.shouldSchedule())
         wifi.scheduleInit();
+}
+
+// ---------------------------------------------------------------------------
+// invalidateJitPage — called by the memory subsystem when a writable page
+// that may contain code is modified (e.g. WRAM, main RAM writes via DMA).
+// Keeps the JIT block cache coherent without a full flush.
+// ---------------------------------------------------------------------------
+void Core::invalidateJitPage(uint32_t addr)
+{
+    if (!jitAvailable) return;
+
+    // Granularity: one 4 KB page.  The JIT cache is indexed by ARM PC so
+    // we invalidate the block that starts inside this page.
+    uint32_t pageStart = addr & ~0xFFFu;
+    uint32_t pageEnd   = pageStart + 0x1000u;
+    JitPpc::invalidateJitRange(pageStart, pageEnd);
 }
