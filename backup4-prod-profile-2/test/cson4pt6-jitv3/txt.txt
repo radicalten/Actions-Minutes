@@ -1,0 +1,15 @@
+everything compiles here including core.cpp or core-v2.cpp and everything even worked fine until the core hooks. however with new core get stackdump isi crash. 
+with invalid reads to every game. (could be due to using noods mem2 on core? before I believe it used standard mem1?)
+
+When launching mkds for example I get:
+Invalid read from 0x000000e3, PC = 0x800ceaf8
+Invalid read from 0x000000df, PC = 0x800ceb08
+Exception (ISI) occurred!
+GPR 00 02000A5c GPR08 02000800
+...
+PC 02000A5c LR 02000A5C MSR 40009032 Thrd 803566A0
+CR 29000444 CTR 80064178 XER 00000000
+
+STACK DUMP:
+0x02000a5c --> 0x800682b4 --> 00000000
+
