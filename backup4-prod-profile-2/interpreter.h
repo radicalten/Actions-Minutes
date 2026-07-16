@@ -28,6 +28,7 @@ class HleBios;
 
 class Interpreter {
 public:
+    int jitRunOpcode();  // delegates to private runOpcode()
     HleBios *bios = nullptr;
     uint32_t entryAddr = 0;
     uint8_t halted = 0;
@@ -66,6 +67,7 @@ public:
     void writeIe(uint32_t mask, uint32_t value);
     void writeIrf(uint32_t mask, uint32_t value);
     void writePostFlg(uint8_t value);
+
 
 private:
     Core *core;
