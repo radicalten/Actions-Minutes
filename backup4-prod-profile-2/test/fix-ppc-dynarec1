@@ -1,0 +1,16 @@
+can you help me fix my arm to ppc dynamic recompiler for written in c++? Here is the error, followed by my code:
+
+When launching ds games for example I get:
+Invalid read from 0x000000e3, PC = 0x800ceaf8
+Invalid read from 0x000000df, PC = 0x800ceb08
+Exception (ISI) occurred!
+GPR 00 02000A5c GPR08 02000800
+...
+PC 02000A5c LR 02000A5C MSR 40009032 Thrd 803566A0
+CR 29000444 CTR 80064178 XER 00000000
+
+STACK DUMP:
+0x02000a5c --> 0x800682b4 --> 00000000
+
+
+//jit_ppc.cpp
