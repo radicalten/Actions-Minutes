@@ -1,4 +1,4 @@
-//interpreter.h
+// interpreter.h
 #pragma once
 
 #include <cstdint>
@@ -9,7 +9,7 @@ class HleBios;
 
 class Interpreter {
 public:
-    int jitRunOpcode();  // delegates to private runOpcode()
+    int jitRunOpcode();
     HleBios *bios = nullptr;
     uint32_t entryAddr = 0;
     uint8_t halted = 0;
@@ -36,7 +36,23 @@ public:
     void interrupt();
 
     bool isThumb() { return cpsr & BIT(5); }
+
+    // Returns the pipelined PC (pc + 8 ARM / pc + 4 Thumb).
     uint32_t getPC() { return *registers[15]; }
+
+    // Returns the true fetch address (what the CPU is about to decode).
+    // The interpreter maintains a 2-stage pipeline so registers[15] is
+    // always ahead by one pipeline stage beyond the fetch stage:
+    //   ARM:   registers[15] = fetch_pc + 8
+    //   Thumb: registers[15] = fetch_pc + 4
+    uint32_t getActualPC() {
+        return *registers[15] - (isThumb() ? 4u : 8u);
+    }
+
+    // Properly update PC and flush the pipeline (used by the JIT sync).
+    // Calling this is equivalent to the interpreter taking a branch.
+    void setPC(uint32_t newPC);
+
     int handleHleIrq();
 
     uint8_t readIme() { return ime; }
@@ -49,30 +65,10 @@ public:
     void writeIrf(uint32_t mask, uint32_t value);
     void writePostFlg(uint8_t value);
 
-    // -----------------------------------------------------------------------
-    // JIT accessor helpers
-    // These expose private fields to the JIT without making everything public.
-    // Using offsetof() directly on private members requires friendship or
-    // these helpers; we choose helpers so the JIT stays loosely coupled.
-    // -----------------------------------------------------------------------
     uint32_t** getRegisters()  { return registers; }
     uint32_t&  getCpsrRef()    { return cpsr; }
 
     static size_t offset_halted() {
-        // offsetof requires a standard-layout type; Interpreter is not (has
-        // virtual-ish things and private members), so we use the safer
-        // placement approach: instantiate a zeroed object and measure.
-        // Because this is called once at init time the overhead is fine.
-        static Interpreter* dummy = nullptr;
-        // We cannot construct one without a Core*, so fall back to the
-        // pointer-difference trick on a real instance via a friend shim.
-        // Instead, expose the offset through a static probe object allocated
-        // on the heap with placement new into a zeroed buffer.
-        //
-        // Simpler: just return the field's address relative to *this using
-        // a null-pointer cast — UB in ISO C++ but universally supported on
-        // GCC/Wii toolchain and used by every embedded codebase.
-        // The cast is safe because we never dereference the null base.
         Interpreter* p = reinterpret_cast<Interpreter*>(0);
         return (size_t)((uintptr_t)&p->halted);
     }
@@ -207,7 +203,6 @@ private:
     int andsRri(uint32_t opcode);
     int andsRrr(uint32_t opcode);
     int andsImm(uint32_t opcode);
-
     int eorLli(uint32_t opcode);
     int eorLlr(uint32_t opcode);
     int eorLri(uint32_t opcode);
@@ -226,7 +221,6 @@ private:
     int eorsRri(uint32_t opcode);
     int eorsRrr(uint32_t opcode);
     int eorsImm(uint32_t opcode);
-
     int subLli(uint32_t opcode);
     int subLlr(uint32_t opcode);
     int subLri(uint32_t opcode);
@@ -245,7 +239,6 @@ private:
     int subsRri(uint32_t opcode);
     int subsRrr(uint32_t opcode);
     int subsImm(uint32_t opcode);
-
     int rsbLli(uint32_t opcode);
     int rsbLlr(uint32_t opcode);
     int rsbLri(uint32_t opcode);
@@ -264,7 +257,6 @@ private:
     int rsbsRri(uint32_t opcode);
     int rsbsRrr(uint32_t opcode);
     int rsbsImm(uint32_t opcode);
-
     int addLli(uint32_t opcode);
     int addLlr(uint32_t opcode);
     int addLri(uint32_t opcode);
@@ -283,7 +275,6 @@ private:
     int addsRri(uint32_t opcode);
     int addsRrr(uint32_t opcode);
     int addsImm(uint32_t opcode);
-
     int adcLli(uint32_t opcode);
     int adcLlr(uint32_t opcode);
     int adcLri(uint32_t opcode);
@@ -302,7 +293,6 @@ private:
     int adcsRri(uint32_t opcode);
     int adcsRrr(uint32_t opcode);
     int adcsImm(uint32_t opcode);
-
     int sbcLli(uint32_t opcode);
     int sbcLlr(uint32_t opcode);
     int sbcLri(uint32_t opcode);
@@ -321,7 +311,6 @@ private:
     int sbcsRri(uint32_t opcode);
     int sbcsRrr(uint32_t opcode);
     int sbcsImm(uint32_t opcode);
-
     int rscLli(uint32_t opcode);
     int rscLlr(uint32_t opcode);
     int rscLri(uint32_t opcode);
@@ -340,7 +329,6 @@ private:
     int rscsRri(uint32_t opcode);
     int rscsRrr(uint32_t opcode);
     int rscsImm(uint32_t opcode);
-
     int tstLli(uint32_t opcode);
     int tstLlr(uint32_t opcode);
     int tstLri(uint32_t opcode);
@@ -359,7 +347,6 @@ private:
     int teqRri(uint32_t opcode);
     int teqRrr(uint32_t opcode);
     int teqImm(uint32_t opcode);
-
     int cmpLli(uint32_t opcode);
     int cmpLlr(uint32_t opcode);
     int cmpLri(uint32_t opcode);
@@ -378,7 +365,6 @@ private:
     int cmnRri(uint32_t opcode);
     int cmnRrr(uint32_t opcode);
     int cmnImm(uint32_t opcode);
-
     int orrLli(uint32_t opcode);
     int orrLlr(uint32_t opcode);
     int orrLri(uint32_t opcode);
@@ -397,7 +383,6 @@ private:
     int orrsRri(uint32_t opcode);
     int orrsRrr(uint32_t opcode);
     int orrsImm(uint32_t opcode);
-
     int movLli(uint32_t opcode);
     int movLlr(uint32_t opcode);
     int movLri(uint32_t opcode);
@@ -416,7 +401,6 @@ private:
     int movsRri(uint32_t opcode);
     int movsRrr(uint32_t opcode);
     int movsImm(uint32_t opcode);
-
     int bicLli(uint32_t opcode);
     int bicLlr(uint32_t opcode);
     int bicLri(uint32_t opcode);
@@ -435,7 +419,6 @@ private:
     int bicsRri(uint32_t opcode);
     int bicsRrr(uint32_t opcode);
     int bicsImm(uint32_t opcode);
-
     int mvnLli(uint32_t opcode);
     int mvnLlr(uint32_t opcode);
     int mvnLri(uint32_t opcode);
@@ -454,7 +437,6 @@ private:
     int mvnsRri(uint32_t opcode);
     int mvnsRrr(uint32_t opcode);
     int mvnsImm(uint32_t opcode);
-
     int mul(uint32_t opcode);
     int mla(uint32_t opcode);
     int umull(uint32_t opcode);
@@ -488,7 +470,6 @@ private:
     int qdadd(uint32_t opcode);
     int qdsub(uint32_t opcode);
     int clz(uint32_t opcode);
-
     int addRegT(uint16_t opcode);
     int subRegT(uint16_t opcode);
     int addHT(uint16_t opcode);
@@ -522,7 +503,6 @@ private:
     int mvnDpT(uint16_t opcode);
     int negDpT(uint16_t opcode);
     int mulDpT(uint16_t opcode);
-
     uint32_t ip(uint32_t opcode);
     uint32_t ipH(uint32_t opcode);
     uint32_t rp(uint32_t opcode);
@@ -530,7 +510,6 @@ private:
     uint32_t rplr(uint32_t opcode);
     uint32_t rpar(uint32_t opcode);
     uint32_t rprr(uint32_t opcode);
-
     int ldrsbOf(uint32_t opcode, uint32_t op2);
     int ldrshOf(uint32_t opcode, uint32_t op2);
     int ldrbOf(uint32_t opcode, uint32_t op2);
@@ -561,7 +540,6 @@ private:
     int strPt(uint32_t opcode, uint32_t op2);
     int ldrdPt(uint32_t opcode, uint32_t op2);
     int strdPt(uint32_t opcode, uint32_t op2);
-
     int ldrsbOfrm(uint32_t opcode);
     int ldrsbOfim(uint32_t opcode);
     int ldrsbOfrp(uint32_t opcode);
@@ -586,7 +564,6 @@ private:
     int ldrshPtim(uint32_t opcode);
     int ldrshPtrp(uint32_t opcode);
     int ldrshPtip(uint32_t opcode);
-
     int ldrbOfim(uint32_t opcode);
     int ldrbOfip(uint32_t opcode);
     int ldrbOfrmll(uint32_t opcode);
@@ -617,7 +594,6 @@ private:
     int ldrbPtrplr(uint32_t opcode);
     int ldrbPtrpar(uint32_t opcode);
     int ldrbPtrprr(uint32_t opcode);
-
     int strbOfim(uint32_t opcode);
     int strbOfip(uint32_t opcode);
     int strbOfrmll(uint32_t opcode);
@@ -648,7 +624,6 @@ private:
     int strbPtrplr(uint32_t opcode);
     int strbPtrpar(uint32_t opcode);
     int strbPtrprr(uint32_t opcode);
-
     int ldrhOfrm(uint32_t opcode);
     int ldrhOfim(uint32_t opcode);
     int ldrhOfrp(uint32_t opcode);
@@ -673,7 +648,6 @@ private:
     int strhPtim(uint32_t opcode);
     int strhPtrp(uint32_t opcode);
     int strhPtip(uint32_t opcode);
-
     int ldrOfim(uint32_t opcode);
     int ldrOfip(uint32_t opcode);
     int ldrOfrmll(uint32_t opcode);
@@ -704,7 +678,6 @@ private:
     int ldrPtrplr(uint32_t opcode);
     int ldrPtrpar(uint32_t opcode);
     int ldrPtrprr(uint32_t opcode);
-
     int strOfim(uint32_t opcode);
     int strOfip(uint32_t opcode);
     int strOfrmll(uint32_t opcode);
@@ -735,7 +708,6 @@ private:
     int strPtrplr(uint32_t opcode);
     int strPtrpar(uint32_t opcode);
     int strPtrprr(uint32_t opcode);
-
     int ldrdOfrm(uint32_t opcode);
     int ldrdOfim(uint32_t opcode);
     int ldrdOfrp(uint32_t opcode);
@@ -760,7 +732,6 @@ private:
     int strdPtim(uint32_t opcode);
     int strdPtrp(uint32_t opcode);
     int strdPtip(uint32_t opcode);
-
     int swpb(uint32_t opcode);
     int swp(uint32_t opcode);
     int ldmda(uint32_t opcode);
@@ -803,7 +774,6 @@ private:
     int mrsRs(uint32_t opcode);
     int mrc(uint32_t opcode);
     int mcr(uint32_t opcode);
-
     int ldrsbRegT(uint16_t opcode);
     int ldrshRegT(uint16_t opcode);
     int ldrbRegT(uint16_t opcode);
@@ -827,14 +797,12 @@ private:
     int pushT(uint16_t opcode);
     int popPcT(uint16_t opcode);
     int pushLrT(uint16_t opcode);
-
     int bx(uint32_t opcode);
     int blxReg(uint32_t opcode);
     int b(uint32_t opcode);
     int bl(uint32_t opcode);
     int blx(uint32_t opcode);
     int swi(uint32_t opcode);
-
     int bxRegT(uint16_t opcode);
     int blxRegT(uint16_t opcode);
     int bT(uint16_t opcode);
