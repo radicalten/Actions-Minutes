@@ -1446,17 +1446,14 @@ bool initJit(Core* core) {
         return false;
     }
     codeBufferPos = 0;
-    for (size_t i=0; i<BLOCK_CACHE_SIZE; i++)
+    for (size_t i = 0; i < BLOCK_CACHE_SIZE; i++)
         blockCache[i].valid = false;
 
     printf("[JIT] ready. buf=%p size=%zuKB\n",
            (void*)codeBuffer, JIT_CODE_SIZE/1024);
 
-    // THIS IS THE KEY FIX: hook the run function pointer so the
-    // emulator actually uses the JIT instead of the interpreter.
+    // Hook runFunc so the emulator actually uses the JIT.
     if (core) {
-        // The Core class needs a way to set runFunc.
-        // We add a friend declaration or a setter.  See core.h patch below.
         core->setRunFunc(core->gbaMode ? runJitGba : runJitNds);
     }
 
@@ -1465,12 +1462,14 @@ bool initJit(Core* core) {
 
 void shutdownJit(Core* core) {
     if (core) {
-        // Restore interpreter
         core->setRunFunc(core->gbaMode
-            ? nullptr   // will be reset by enterGbaMode
+            ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
             : &Interpreter::runCoreNds);
     }
-    if (codeBuffer) { free(codeBuffer); codeBuffer=nullptr; }
+    if (codeBuffer) {
+        free(codeBuffer);
+        codeBuffer = nullptr;
+    }
 }
 
 void invalidateJitRange(uint32_t start, uint32_t end) {
