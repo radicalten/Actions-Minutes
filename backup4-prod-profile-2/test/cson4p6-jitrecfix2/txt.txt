@@ -1,0 +1,2 @@
+Using the ppc_jit-v1.cpp as that was the best one from recfix1 as the base here. as nds games actually launch without crashing will gba games auto crash, I believe that will be the best option. 
+new interpreter.h from recfix1 with ppc_jit-v1.cpp as the base 
