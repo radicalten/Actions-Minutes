@@ -1,4 +1,4 @@
-can you help me fix my arm to ppc dynamic recompiler for written in c++? Here is the error, followed by my code:
+can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code:
 
 My code compiles but when launching nds games I get a blank black screen.
 And when launchin certain gba games I get this: Exception (ISI) occurred!
