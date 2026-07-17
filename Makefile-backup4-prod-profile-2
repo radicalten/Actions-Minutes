@@ -3,7 +3,7 @@ export DEVKITPRO 	:= /opt/devkitpro
 export DEVKITPPC	:= $(DEVKITPRO)/devkitPPC
 include $(DEVKITPPC)/wii_rules
 CC 					:= $(DEVKITPPC)/bin/powerpc-eabi-g++
-AS					:= $(DEVKITPPC)/bin/powerpc-eabi-as
+#AS					:= $(DEVKITPPC)/bin/powerpc-eabi-as
 MACHDEP := -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions
 INCLUDES += -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include
 CXXFLAGS += -O2 \
@@ -33,7 +33,7 @@ $(TARGET).elf: $(OBJECTS)
 %.o: %.cpp
 	$(CC) -c $< -o $@ $(CXXFLAGS)
 %.o: %.S
-	$(AS) -o $@
+	$(CC) $(ASFLAGS) -c $< -o $@
 clean:
 	rm -f $(TARGET).elf $(TARGET).dol $(TARGET).map $(OBJECTS)
 .PHONY: clean test
