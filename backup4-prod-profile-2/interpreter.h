@@ -1,23 +1,4 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+//interpreter.h
 #pragma once
 
 #include <cstdint>
@@ -68,6 +49,53 @@ public:
     void writeIrf(uint32_t mask, uint32_t value);
     void writePostFlg(uint8_t value);
 
+    // -----------------------------------------------------------------------
+    // JIT accessor helpers
+    // These expose private fields to the JIT without making everything public.
+    // Using offsetof() directly on private members requires friendship or
+    // these helpers; we choose helpers so the JIT stays loosely coupled.
+    // -----------------------------------------------------------------------
+    uint32_t** getRegisters()  { return registers; }
+    uint32_t&  getCpsrRef()    { return cpsr; }
+
+    static size_t offset_halted() {
+        // offsetof requires a standard-layout type; Interpreter is not (has
+        // virtual-ish things and private members), so we use the safer
+        // placement approach: instantiate a zeroed object and measure.
+        // Because this is called once at init time the overhead is fine.
+        static Interpreter* dummy = nullptr;
+        // We cannot construct one without a Core*, so fall back to the
+        // pointer-difference trick on a real instance via a friend shim.
+        // Instead, expose the offset through a static probe object allocated
+        // on the heap with placement new into a zeroed buffer.
+        //
+        // Simpler: just return the field's address relative to *this using
+        // a null-pointer cast — UB in ISO C++ but universally supported on
+        // GCC/Wii toolchain and used by every embedded codebase.
+        // The cast is safe because we never dereference the null base.
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->halted);
+    }
+    static size_t offset_pcData() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->pcData);
+    }
+    static size_t offset_pipeline() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->pipeline);
+    }
+    static size_t offset_registersUsr() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->registersUsr);
+    }
+    static size_t offset_cpsr() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->cpsr);
+    }
+    static size_t offset_cycles() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->cycles);
+    }
 
 private:
     Core *core;
