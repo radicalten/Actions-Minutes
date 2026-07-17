@@ -3452,3 +3452,6 @@ The key changes and why each matters:
 | **#6** | `JitPpc_syncToInterp` calls `interp->setPC()` for R15 | Writing raw to `*registers[15]` bypasses pipeline flush, causing wrong fetch |
 | **#7** | `hasExplicitReturn` flag skips duplicate trailing epilogue | Prevents double sync/epilogue when branches already returned |
 | **#8** | R15 set per-instruction to `pc + (thumb?4:8)` in compile loop | Architectural R15 value must reflect each instruction's position |
+
+
+=====================================================
