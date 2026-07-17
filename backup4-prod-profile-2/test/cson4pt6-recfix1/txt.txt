@@ -1,0 +1,11 @@
+These fixes allow nds games to launch without crashing but they get stuck on a black screen.
+
+some gba games launch too but when launching emerald I get this crash (no invalid read)
+
+Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 803568E0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
