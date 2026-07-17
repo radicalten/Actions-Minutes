@@ -26,7 +26,7 @@
 // 'const' on a member pointer array: the pointers are read-only after
 // static initialisation - this is legal in C++ for static data members.
 
-__attribute__((section(".rodata"), aligned(32)))
+//__attribute__((section(".rodata"), aligned(32)))
 int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
 {
     // ── 0x000–0x00F  AND reg / multiply / halfword store-load ────────────────
@@ -1023,7 +1023,7 @@ int (Interpreter::* Interpreter::armInstrs[])(uint32_t) =
     //   • const + aligned(32) keeps the table in .rodata, cache-friendly.
     // ════════════════════════════════════════════════════════════════════════
 
-__attribute__((section(".rodata"), aligned(32)))
+//__attribute__((section(".rodata"), aligned(32)))
 int (Interpreter::* Interpreter::thumbInstrs[])(uint16_t) =
 {
     // ── 0x000–0x01F  LSL imm5 (32 entries) ───────────────────────────────────
