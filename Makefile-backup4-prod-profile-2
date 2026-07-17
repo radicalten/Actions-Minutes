@@ -22,7 +22,7 @@ SRCDIR 	:= backup4-prod-profile-2
 C_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.cpp)))
 S_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.S)))
 SOURCES = $(C_SOURCES) $(S_SOURCES) 
-OBJECTS = $(SOURCES:.cpp=.o) $(SOURCES:.S=.o)
+OBJECTS = $(C_SOURCES:.cpp=.o) $(S_SOURCES:.S=.o)
 
 ELF2DOL  := elf2dol
 all: $(TARGET).dol
