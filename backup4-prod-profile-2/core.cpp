@@ -1,23 +1,4 @@
-/*
-    Copyright (C) 2019-2025 Hydr8gon
-    Copyright (C) 2026 radicalten
-
-    This file is part of NooDS-Wii.
-
-    NooDS-Wii is free software: you can redistribute it and/or modify it
-    under the terms of the GNU General Public License as published by
-    the Free Software Foundation, either version 3 of the License, or
-    (at your option) any later version.
-
-    NooDS-Wii is distributed in the hope that it will be useful, but
-    WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
-    General Public License for more details.
-
-    You should have received a copy of the GNU General Public License
-    along with NooDS-Wii. If not, see <https://www.gnu.org/licenses/>.
-*/
-
+// core.cpp
 #include <algorithm>
 #include <cstring>
 
@@ -34,7 +15,7 @@ extern void* Noods_MEM2_Alloc(size_t size);
 extern void  Noods_MEM2_Free(void* ptr);
 
 // ---------------------------------------------------------------------------
-// Custom allocators — route to MEM2
+// Custom allocators
 // ---------------------------------------------------------------------------
 void* Core::operator new(size_t size) {
     void* p = Noods_MEM2_Alloc(size);
@@ -42,43 +23,12 @@ void* Core::operator new(size_t size) {
     return p;
 }
 void Core::operator delete(void* p) noexcept { Noods_MEM2_Free(p); }
-
 void* Core::operator new[](size_t size) {
     void* p = Noods_MEM2_Alloc(size);
     if (!p) throw std::bad_alloc();
     return p;
 }
 void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
-
-// ---------------------------------------------------------------------------
-// JIT run wrappers
-//
-// runFunc has signature void(*)(Core&).  We provide one thin wrapper per
-// emulation mode so the JIT can be installed wherever the interpreter sits.
-// ---------------------------------------------------------------------------
-static void runJitNdsWrapper(Core& core)  { JitPpc::runJitNds(core); }
-static void runJitSingle9(Core& core)     { JitPpc::runJitNds(core); }
-static void runJitSingle7(Core& core)     { JitPpc::runJitNds(core); }
-static void runJitDsiWrapper(Core& core)  { JitPpc::runJitNds(core); }
-static void runJitGbaWrapper(Core& core)  { JitPpc::runJitNds(core); }
-
-// ---------------------------------------------------------------------------
-// pickJitFunc — mirror of the interpreter selection logic in updateRun(),
-// but returns a JIT wrapper.  Returns nullptr only when both CPUs are halted
-// (caller handles that case before calling this).
-// ---------------------------------------------------------------------------
-static void (*pickJitFunc(const Core& core))(Core&)
-{
-    if (core.gbaMode)
-        return runJitGbaWrapper;
-    if (core.dsiMode)
-        return runJitDsiWrapper;
-    if (!core.interpreter[0].halted && !core.interpreter[1].halted)
-        return runJitNdsWrapper;
-    if (core.interpreter[0].halted)
-        return runJitSingle7;
-    return runJitSingle9;
-}
 
 // ---------------------------------------------------------------------------
 // Constructor
@@ -179,16 +129,20 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     // ------------------------------------------------------------------
     // JIT initialisation
     //
-    // Must happen after memory maps are set up but before updateRun()
-    // installs runFunc, so that pickJitFunc() can be used immediately.
+    // Pass `this` so initJit can immediately hook runFunc.
+    // initJit() must be called before updateRun() so that the first
+    // call to updateRun() already sees jitAvailable == true and can
+    // select the JIT run function.
     // ------------------------------------------------------------------
-    jitAvailable = JitPpc::initJit();
+    jitAvailable = JitPpc::initJit(this);   // FIX: was initJit()
 
     if (jitAvailable)
         printf("[Core %d] JIT recompiler active\n", id);
     else
         printf("[Core %d] JIT unavailable — interpreter only\n", id);
 
+    // updateRun() reads jitAvailable; called after initJit() so the
+    // JIT path is selected immediately.
     updateRun();
 
     memory.updateMap9(0x00000000, 0xFFFFFFFF);
@@ -259,12 +213,12 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
 }
 
 // ---------------------------------------------------------------------------
-// Destructor — shut down JIT and release the code buffer
+// Destructor
 // ---------------------------------------------------------------------------
 Core::~Core()
 {
     if (jitAvailable) {
-        JitPpc::shutdownJit();
+        JitPpc::shutdownJit(this);   // FIX: was shutdownJit()
         jitAvailable = false;
     }
 }
@@ -299,7 +253,6 @@ void Core::loadState(FILE* file) {
         events.push_back(event);
     }
 
-    // Blocks compiled against the pre-save state are now stale.
     if (jitAvailable)
         JitPpc::flushJitCache();
 
@@ -307,23 +260,26 @@ void Core::loadState(FILE* file) {
 }
 
 // ---------------------------------------------------------------------------
-// updateRun — select the tightest run function for the current state
+// updateRun
 // ---------------------------------------------------------------------------
 void Core::updateRun()
 {
-    // Determine the new runFunc without using goto so that no
-    // initialisation is skipped across a label.
     void (*newFunc)(Core&) = nullptr;
 
     if (interpreter[0].halted && interpreter[1].halted) {
-        // Nothing to execute; the interpreter's no-op loop is fine.
+        // Both halted: use the no-op loop regardless of JIT availability.
         newFunc = &Interpreter::runCoreNone;
     } else if (jitAvailable) {
-        newFunc = pickJitFunc(*this);
+        // JIT is available: select JIT wrapper based on current mode.
+        // The JIT wrappers (runJitNds, runJitGba) internally check the
+        // halted flags per-CPU so we don't need per-halted-state variants.
+        if (gbaMode)
+            newFunc = &JitPpc::runJitGba;
+        else
+            newFunc = &JitPpc::runJitNds;
     }
 
-    // If the JIT is not available, or pickJitFunc somehow returned nullptr
-    // (should not happen for non-halted states), use the interpreter.
+    // Fallback to interpreter if JIT not available or not applicable.
     if (!newFunc) {
         if (gbaMode)
             newFunc = &Interpreter::runCoreSingle<true, 0>;
@@ -345,7 +301,7 @@ void Core::updateRun()
 }
 
 // ---------------------------------------------------------------------------
-// resetCycles — prevent globalCycles overflow
+// resetCycles
 // ---------------------------------------------------------------------------
 void Core::resetCycles() {
     const size_t n = events.size();
@@ -362,7 +318,7 @@ void Core::resetCycles() {
 }
 
 // ---------------------------------------------------------------------------
-// schedule — insert a new event in sorted order
+// schedule
 // ---------------------------------------------------------------------------
 void Core::schedule(SchedTask task, uint32_t cycles) {
     SchedEvent event(task, globalCycles + cycles);
@@ -379,7 +335,6 @@ void Core::enterGbaMode() {
     interpreter[0].halt(2);
     interpreter[1].unhalt(2);
 
-    // NDS-mapped JIT blocks are invalid once the GBA memory map is live.
     if (jitAvailable)
         JitPpc::flushJitCache();
 
@@ -434,7 +389,7 @@ void Core::endFrame() {
 }
 
 // ---------------------------------------------------------------------------
-// invalidateJitPage — fine-grained cache invalidation for a single 4 KB page
+// invalidateJitPage
 // ---------------------------------------------------------------------------
 void Core::invalidateJitPage(uint32_t addr)
 {
