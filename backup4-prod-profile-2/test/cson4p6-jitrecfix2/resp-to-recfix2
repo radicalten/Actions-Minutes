@@ -1,0 +1,738 @@
+# JIT Recompiler Debug Analysis
+
+## Root Cause: ISI Exception (Instruction Storage Interrupt)
+
+The `Exception (ISI) occurred!` with `PC 000E2B04` means the PowerPC tried to **execute code at an unmapped/non-executable address**. This is your JIT jumping to bad code.
+
+The address `0x000E2B04` is in a range that looks like it could be heap memory or an ARM address being treated as a PPC address. Several bugs are causing this.
+
+---
+
+## Bug 1: `executeBlock` Missing ABI Frame — Stack Corruption
+
+```cpp
+// BROKEN — no caller frame, LR clobbered immediately
+static void executeBlock(const JitBlock* block) {
+    typedef void (*BlockFn)();
+    ((BlockFn)block->ppcCode)();
+}
+```
+
+The JIT block's prologue does `stwu r1,-160(r1)` and `mflr r0; stw r0,8(r1)` — it saves LR relative to the *new* frame. But `executeBlock` is called from `runJitNds` which is called from the emulator loop. When the block does `blr`, it returns to `executeBlock`'s caller correctly **only if the block's LR save/restore is paired correctly**.
+
+The real problem: `executeBlock` calls the block as a plain function pointer, but the block uses `bctr` (branch-to-CTR) for internal calls via `emit_call`. The CTR is shared — any `emit_call` inside the block clobbers CTR, and then `ppc_bctr(true)` (BCTRL) is used, which is correct. But the **return from BCTRL goes to LR**, and LR is saved in the frame. This part is okay.
+
+**The actual ISI bug here**: `executeBlock` doesn't save/restore its own non-volatile registers before the block overwrites r14-r26. The block's epilogue restores them *from its own frame*, but if the block's prologue wrote garbage into the frame (due to r1 misalignment or wrong offset), you get corruption.
+
+---
+
+## Bug 2: Critical — `emit_call` Clobbers r12 Which is PPC_TMP3
+
+```cpp
+static const uint8_t PPC_TMP3 = 12;  // r12!
+
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    int n = emit_li32(ctx.cur, 12, addr);  // uses r12 = PPC_TMP3
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(12));
+    ctx.emit(ppc_bctr(true));  // BCTRL — also clobbers LR!
+}
+```
+
+`r12` is both `PPC_TMP3` and the scratch register for `emit_call`. Any `emit_call` destroys `PPC_TMP3`. Worse: **BCTRL clobbers LR**. The block saves LR at entry, but any `emit_call` mid-block overwrites LR. When the block later does `lwz r0,8(r1); mtlr r0; blr`, it returns to the right place — *but only if the frame is valid*.
+
+**Fix**: Use r0 as the call scratch (it's volatile and not mapped):
+
+```cpp
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    // r0 is volatile and not used as a mapped reg
+    // Load address into r11 (volatile, not PPC_TMP3)
+    int n = emit_li32(ctx.cur, 11, addr);
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(11));
+    ctx.emit(ppc_bctr(true));
+}
+```
+
+But wait — r11 is `PPC_TMP2`. Use a truly free volatile:
+
+```cpp
+// Add a dedicated call-scratch register that isn't mapped to anything
+static const uint8_t PPC_CALL_SCRATCH = 0;  // r0, safe for mtctr source
+
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    // r0 cannot be used as base in lwz/stw but CAN be used for mtctr
+    // However emit_li32 uses addi/addis which treat r0 as 0 when RA=0
+    // So we need a real register. Use r11 carefully, or restructure.
+    
+    // Safest: use r2 (not used by Wii/OGC in this context) or
+    // reserve a non-volatile scratch that isn't in ARM_TO_PPC map.
+    // r29, r30, r31 are free — let's use r29 as CALL_SCRATCH
+    uint32_t tmp[2];
+    int n = emit_li32(ctx.cur, 29, addr);
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(29));
+    ctx.emit(ppc_bctr(true));
+}
+```
+
+And remove r29/r30/r31 from the saved range or include them:
+
+```cpp
+// Change saved range to include r29
+// FRAME_R14 + (r - 14) * 4 for r14..r29 = 16 regs = 64 bytes
+// Update FRAME_SIZE accordingly
+static const int FRAME_SIZE    = 176;  // 16-byte aligned
+```
+
+---
+
+## Bug 3: `emit_prologue` Saves LR *Before* the `stwu`
+
+```cpp
+static void emit_prologue(EmitCtx& ctx, Interpreter* interp, Core* core) {
+    ctx.emit(ppc_stwu(1, -(int16_t)FRAME_SIZE, 1));  // r1 updated HERE
+    ctx.emit(ppc_mflr(0));
+    ctx.emit(ppc_stw(0, FRAME_LR, 1));               // stored at new r1+8
+```
+
+This looks correct. `stwu` stores old r1 at 0(new_r1) and updates r1. Then `mflr r0` gets LR (still valid), and `stw r0,8(r1)` stores at new r1+8. **This is correct ABI.**
+
+---
+
+## Bug 4: `emit_syncToInterp`/`emit_syncFromInterp` Corrupt the Frame During Load/Store
+
+In `emit_loadStore`, you save volatile regs to `FRAME_REGSYNC`:
+
+```cpp
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));
+```
+
+Then later `emit_syncToInterp` also uses `FRAME_REGSYNC`:
+
+```cpp
+static void emit_syncToInterp(EmitCtx& ctx) {
+    for (int i = 0; i < 16; i++)
+        ctx.emit(ppc_stw(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
+    ctx.emit(ppc_stw(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
+```
+
+`emit_syncToInterp` needs 17 words = 68 bytes. `emit_loadStore` saves 8 words = 32 bytes. **They overlap**. But the issue is: `emit_loadStore` saves r3-r10 at `FRAME_REGSYNC+0..28`, while `emit_syncToInterp` would store ARM r0-r7 (mapped to PPC r3-r10) at the same locations. This is fine as long as they're not interleaved — and they're not, since `emit_syncToInterp` is only called at block end. So this is **not a bug by itself**, but it's fragile.
+
+The **real problem** with the load/store emitter: after `emit_call`, r3-r10 are clobbered by the ABI. You save them before the call and restore after. But your save/restore code does:
+
+```cpp
+// Before call
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));  // saves r3..r10
+
+// Set up args (overwrites r3, r4, r5, possibly r6)
+ctx.emit(ppc_mr(3, PPC_CORE));
+ctx.emit(ppc_addi(4, 0, ctx.arm7 ? 1 : 0));
+ctx.emit(ppc_mr(5, PPC_TMP1));
+if (!isLoad) ctx.emit(ppc_mr(6, ppcRd));
+
+emit_call(ctx, memFn);
+
+// After call — restore
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_lwz(3 + i, FRAME_REGSYNC + i * 4, 1));
+```
+
+**The values saved at `FRAME_REGSYNC+0..7` are the pre-call ARM register values in r3-r10. But `ppcRd` might be r14-r21 (non-volatile mapped regs), not r3-r10**. So saving/restoring r3-r10 around the call is actually *wrong* — you're restoring the *old* ARM register values (R0-R7) back to r3-r10, but those are non-volatile regs! The callee doesn't modify non-volatile regs. Only r3-r10 are volatile.
+
+Wait, ARM R0-R7 map to PPC r3-r10, which ARE volatile. So yes, you need to save them. But the save happens *after* the argument setup clobbers r3-r5. **The save happens before argument setup, so you're saving the ARM values first (correct), then setting up args (clobbers r3-r5), then calling, then restoring ARM R0-R7 from the saved values (correct).**
+
+This is actually correct. The bug is elsewhere.
+
+---
+
+## Bug 5: The Actual ISI Cause — Block Returns to Wrong Address
+
+Looking at the crash: `PC 000E2B04`, `LR 000E2B04`. LR equals PC, which means the CPU jumped to a bad address that was *in LR*. This happens when:
+
+```
+blr  →  PC = LR = 0x000E2B04 (bad address, causes ISI)
+```
+
+LR at the time of the bad `blr` = `0x000E2B04`, which looks like an **ARM address** (GBA ROM is typically at `0x08000000`, but internal RAM/ROM varies). 
+
+`0x000E2B04` could be the ARM PC value that got written into the PPC LR somehow.
+
+**The smoking gun**: In `emit_branch` for BX:
+
+```cpp
+ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRm, 0, 0, 30));
+emit_syncToInterp(ctx);
+```
+
+`emit_syncToInterp` calls `emit_call(ctx, JitPpc_syncToInterp)`. `emit_call` does `ppc_bctr(true)` — **BCTRL sets LR to the return address** (next PPC instruction). That's correct.
+
+But what if `ppcRm` is `PPC_ARM_R14` = r20, and the ARM register Rm contains `0x000E2B04`? After `emit_syncToInterp` writes it to the interpreter, we reach `emit_epilogue` which does:
+
+```cpp
+ctx.emit(ppc_lwz(0, FRAME_LR, 1));
+ctx.emit(ppc_mtlr(0));
+ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));
+ctx.emit(ppc_blr());
+```
+
+This restores LR from the frame and does `blr`. This should return to `executeBlock`'s call site, not to an ARM address.
+
+**UNLESS**: `FRAME_LR = 8` and something overwrote `r1+8` during the block execution.
+
+Let me check: In `emit_loadStore`, the volatile reg save uses `FRAME_REGSYNC + i*4` for i=0..7, i.e., offsets 72,76,80,84,88,92,96,100. That doesn't overlap with FRAME_LR=8. OK.
+
+**But**: r3-r10 correspond to offsets 72-100 in the save area. Meanwhile, ARM R0 maps to PPC r3. What if a store instruction stores a value via `JitPpc_memWrite32`, where r6 (ARM R3, `PPC_ARM_R3`) holds an ARM address `0x000E2B04`? The function call is fine. The restore puts the ARM value back in r3. Still fine.
+
+---
+
+## Bug 6: Frame Back-Chain Written to Wrong Place by `stwu`
+
+`ppc_stwu(1, -160, 1)` = `stwu r1,-160(r1)`:
+- Effective address = r1 - 160
+- Stores old r1 at EA (= old_r1 - 160 = new_r1)  
+- Updates r1 = EA
+
+So `0(new_r1)` = old_r1. That's the back-chain. ✓
+
+`ppc_stw(0, 8, 1)` = stores LR at `new_r1 + 8`. ✓
+
+`ppc_lwz(0, 8, 1)` in epilogue restores from same place. ✓
+
+This looks correct. **But wait** — check the epilogue:
+
+```cpp
+static void emit_epilogue(EmitCtx& ctx) {
+    for (int r = 14; r <= 26; r++)
+        ctx.emit(ppc_lwz(r, FRAME_R14 + (r - 14) * 4, 1));
+    
+    ctx.emit(ppc_lwz(0, FRAME_LR, 1));
+    ctx.emit(ppc_mtlr(0));
+    ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));  // r1 += 160
+    ctx.emit(ppc_blr());
+}
+```
+
+`ppc_addi(1, 1, 160)`: Since 160 < 32768, this is fine as `int16_t`. ✓
+
+---
+
+## Bug 7: `emit_syncToInterp` Called Mid-Block Without Restoring Non-Volatiles
+
+In `emit_branch` (BX, B/BL), after computing the new PC, you call:
+
+```cpp
+emit_syncToInterp(ctx);
+```
+
+`emit_syncToInterp` calls `emit_call` which uses `BCTRL`. The return address (LR) after BCTRL is the next PPC instruction — correct. But `JitPpc_syncToInterp` is a C function that **may clobber r3-r12 per ABI**. Since r14-r26 are non-volatile, they're preserved. But the `emit_call` itself uses r12 (`PPC_TMP3 = 12`) as the CTR load register:
+
+```cpp
+int n = emit_li32(ctx.cur, 12, addr);  // r12 = address
+ctx.cur += n;
+ctx.emit(ppc_mtctr(12));
+ctx.emit(ppc_bctr(true));
+```
+
+**r12 is not saved in the prologue** (only r14-r26 are saved). r12 is volatile. So `emit_li32(12, addr)` into r12, `mtctr r12`, `bctrl` — the bctrl saves LR (return addr after bctrl). The callee can trash r12. On return, r12 is undefined. But since the JIT never reads r12 as a meaningful value after a call (PPC_TMP3 is only a temporary), this is OK.
+
+The **real** issue with r12: `emit_li32(ctx.cur, 12, addr)` uses r12 = `PPC_TMP3`. What if there's a pending value in `PPC_TMP3` that's needed after the call? Looking at usage, `PPC_TMP3` is only used locally within individual emit functions, so this is OK.
+
+---
+
+## The Real ISI Bug — Identified
+
+Looking more carefully at the crash: **`PC = LR = 0x000E2B04`**.
+
+When LR = PC and both are bad, this is a `blr` executing where LR was not properly set. 
+
+The most likely scenario: **the block's `blr` at the end returns into an ARM address because `FRAME_LR` slot was corrupted**.
+
+Let me trace what can write to `r1+8` (FRAME_LR):
+
+1. Prologue: `stw r0, 8(r1)` — saves LR here. ✓
+2. `emit_call` via BCTRL — BCTRL **updates LR to return address** in the LR *register*, but does NOT write to the stack. The stack slot at r1+8 is untouched by BCTRL. ✓
+3. The callee (`JitPpc_syncToInterp`, etc.) creates its own frame with `stwu` and saves its LR there. When it returns (`blr`), it restores its own LR and pops its own frame. Our r1+8 slot is untouched. ✓
+
+**So the frame LR slot should be safe.** Unless...
+
+**The callee uses `stw r0, 8(r1)` before doing `stwu`**! Some GCC prologues for non-leaf functions do:
+
+```asm
+mflr r0
+stw  r0, 4(r1)   ; ABI: LR save at caller's frame + 4 (old PPC ABI)
+```
+
+**This is the bug!** The old PPC ABI (used by devkitPPC/Wii) saves LR at `4(r1)` in the *caller's* frame, not `8(r1)` in *its own* frame. Our JIT uses `8(r1)` as FRAME_LR in *its own* frame (after `stwu`). But C functions compiled by GCC for Wii/devkitPPC save LR at `old_r1 + 4` — which is **our frame's offset 4**, not offset 8!
+
+Wait, let me recheck: The Wii/OGC toolchain uses the **EABI** (Embedded ABI), not the old AIX ABI. In EABI:
+- LR is saved at `r1+4` of the *caller's* frame (i.e., before the callee's `stwu`)
+- Actually in PowerPC EABI: LR is saved at the *caller's* stack frame offset 4, but this means the callee writes `stw r0, 4(r1)` *before* updating r1
+
+Specifically: GCC for PPC EABI generates:
+```asm
+mflr r0
+stw  r0, 4(r1)    ; save LR at *current* r1+4 (= OLD frame's LR slot)
+stwu r1, -N(r1)   ; allocate new frame
+```
+
+This means the callee writes LR to `old_r1 + 4`. In our JIT prologue:
+- We do `stwu r1, -160(r1)` first → old_r1 is now stored at new_r1+0
+- Then `mflr r0; stw r0, 8(r1)` → saves LR at new_r1+8
+
+When `JitPpc_syncToInterp` is called via BCTRL:
+- LR = return address (next JIT instruction)
+- r1 = our JIT frame (new_r1)
+- GCC-generated prologue: `mflr r0; stw r0, 4(r1)` → writes return addr to **our frame's offset 4**!
+
+**This does NOT corrupt our FRAME_LR at offset 8.** The callee writes to offset 4, we use offset 8. So no collision.
+
+Actually wait — GCC EABI for Wii writes at `r1+4` (current r1, before stwu). Let me re-examine:
+
+```
+Call sequence:
+  JIT code: bctrl          ; LR = next_instr, PC = JitPpc_syncToInterp
+  JitPpc_syncToInterp:
+    mflr r0               ; r0 = LR (return to JIT)
+    stw  r0, 4(r1)        ; store at our_frame + 4  ← CLOBBERS our frame!
+    stwu r1, -N(r1)       ; allocate callee frame
+    ...
+    lwz  r0, N+4(r1)      ; restore LR from our frame
+    mtlr r0
+    addi r1, r1, N
+    blr
+```
+
+`stw r0, 4(r1)` writes to our JIT frame at offset +4. Our `FRAME_LR = 8` is at offset +8. **Offset 4 is different from offset 8, so no corruption.** ✓
+
+But: **offset 4 is within our frame**. What's at offset 4 in our frame? Looking at the layout:
+- `[r1+0]` = back-chain (written by `stwu`)
+- `[r1+4]` = **ABI LR save area** — this is reserved for exactly this purpose!
+- `[r1+8]` = our LR (FRAME_LR)
+
+The comment in your code says:
+```
+// [r1+ 4] (ABI: reserved for callee LR save area — not used by us)
+```
+
+So offset 4 is the **ABI-designated LR save slot**, used by callees. Our FRAME_LR is at offset 8 to avoid collision. This is correct design! The callee writes to `r1+4`, we use `r1+8`. ✓
+
+---
+
+## Bug Found: `getPC()` Returns Wrong Value for JIT Dispatch
+
+```cpp
+uint32_t getPC() { return *registers[15]; }
+```
+
+In the interpreter, `registers[15]` points into `registersUsr` and holds `pc + pipeline_depth`. When the JIT calls `arm9.getPC()` to decide which block to compile/execute, it gets the pipelined PC, not the actual fetch address.
+
+```cpp
+void runJitNds(Core& core) {
+    if (!arm9.halted) {
+        uint32_t pc9 = arm9.getPC();  // Returns pc+8 (ARM) or pc+4 (Thumb)!
+        JitBlock* b  = compileBlock(&arm9, &core, pc9, false);
+```
+
+Then in `compileBlock`:
+```cpp
+ctx.armPC = armPC;  // = pc+8, not actual fetch PC
+```
+
+And in `emit_prologue`:
+```cpp
+n = emit_li32(ctx.cur, PPC_ARM_R15, ctx.armPC);  // sets R15 = pc+8
+```
+
+And in the compile loop:
+```cpp
+n = emit_li32(ctx.cur, PPC_ARM_R15, pc + (isThumb ? 4u : 8u));
+// pc starts at armPC = actual_pc+8, so R15 = actual_pc+8+8 = actual_pc+16 !
+```
+
+**This is wrong.** The block starts executing from `armPC` (= pipelined PC = real_pc+8), but the code at that address is wrong — you should be reading from `real_pc`, not `real_pc+8`.
+
+**Fix**: Get the true fetch PC before calling `compileBlock`:
+
+```cpp
+// The interpreter's registers[15] holds pc+pipeline. We need raw fetch PC.
+// After flushPipeline, registers[15] = next_fetch_pc + pipeline_refill.
+// The interpreter uses a 2-stage pipeline: R15 = fetch_pc + 8 (ARM) or +4 (Thumb)
+// So actual fetch PC = *registers[15] - (isThumb ? 4 : 8)
+uint32_t getActualPC() {
+    bool thumb = cpsr & BIT(5);
+    return *registers[15] - (thumb ? 4u : 8u);
+}
+```
+
+Add this to `interpreter.h`:
+```cpp
+uint32_t getActualPC() {
+    bool thumb = cpsr & BIT(5);
+    return *registers[15] - (thumb ? 4u : 8u);
+}
+```
+
+Then in `runJitNds`:
+```cpp
+uint32_t pc9 = arm9.getActualPC();  // true fetch PC
+```
+
+---
+
+## Complete Fix Summary
+
+Here are all the fixes with corrected code:
+
+### Fix 1: Add `getActualPC()` to interpreter.h
+
+```cpp
+// In interpreter.h, public section:
+uint32_t getActualPC() {
+    bool thumb = isThumb();
+    return *registers[15] - (thumb ? 4u : 8u);
+}
+```
+
+### Fix 2: Use `getActualPC()` in `runJitNds`
+
+```cpp
+void runJitNds(Core& core) {
+    Interpreter& arm9 = core.interpreter[0];
+    Interpreter& arm7 = core.interpreter[1];
+
+    if (!arm9.halted) {
+        uint32_t pc9 = arm9.getActualPC();  // FIX: was getPC()
+        JitBlock* b  = compileBlock(&arm9, &core, pc9, false);
+        if (b) executeBlock(b);
+    }
+
+    if (!arm7.halted) {
+        uint32_t pc7 = arm7.getActualPC();  // FIX: was getPC()
+        JitBlock* b  = compileBlock(&arm7, &core, pc7, true);
+        if (b) executeBlock(b);
+    }
+}
+```
+
+### Fix 3: Fix `emit_call` to Not Use `PPC_TMP3` (r12)
+
+Declare a dedicated call scratch register and update the frame:
+
+```cpp
+// Add these constants near the register mapping section:
+static const uint8_t PPC_CALL_TMP = 29;   // r29: saved, used only for calls
+
+// Update saved register range to include r29:
+static const int FRAME_SIZE = 176;  // was 160; 16-byte aligned
+// r14..r29 = 16 regs × 4 = 64 bytes at FRAME_R14=16 → bytes 16..79
+// FRAME_REGSYNC shifts to 80: 17×4=68 bytes → bytes 80..147
+// Padding to 176 (next 16-byte boundary after 148): 28 bytes pad
+static const int FRAME_R14     = 16;
+static const int FRAME_REGSYNC = 80;  // was 72; now after 16 saved regs
+```
+
+Update static_asserts:
+```cpp
+static_assert(FRAME_SIZE % 16 == 0,               "Frame must be 16-byte aligned");
+static_assert(FRAME_REGSYNC + 17*4 <= FRAME_SIZE, "Sync area overflows frame");
+static_assert(FRAME_R14 + 16*4     <= FRAME_REGSYNC, "Saved regs overlap sync area");
+```
+
+Update prologue/epilogue to save/restore r14..r29:
+```cpp
+static void emit_prologue(EmitCtx& ctx, Interpreter* interp, Core* core) {
+    ctx.emit(ppc_stwu(1, -(int16_t)FRAME_SIZE, 1));
+    ctx.emit(ppc_mflr(0));
+    ctx.emit(ppc_stw(0, FRAME_LR, 1));
+
+    // Save r14..r29 (16 regs, includes PPC_CALL_TMP=r29)
+    for (int r = 14; r <= 29; r++)
+        ctx.emit(ppc_stw(r, FRAME_R14 + (r - 14) * 4, 1));
+
+    int n = emit_li32(ctx.cur, PPC_INTERP, (uint32_t)(uintptr_t)interp);
+    ctx.cur += n;
+    n = emit_li32(ctx.cur, PPC_CORE, (uint32_t)(uintptr_t)core);
+    ctx.cur += n;
+    n = emit_li32(ctx.cur, PPC_ARM_R15, ctx.armPC);
+    ctx.cur += n;
+}
+
+static void emit_epilogue(EmitCtx& ctx) {
+    // Restore r14..r29
+    for (int r = 14; r <= 29; r++)
+        ctx.emit(ppc_lwz(r, FRAME_R14 + (r - 14) * 4, 1));
+
+    ctx.emit(ppc_lwz(0, FRAME_LR, 1));
+    ctx.emit(ppc_mtlr(0));
+    ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));
+    ctx.emit(ppc_blr());
+}
+```
+
+Fix `emit_call`:
+```cpp
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    // Use r29 (PPC_CALL_TMP, non-volatile, saved in frame)
+    // This avoids clobbering PPC_TMP3 (r12) or any ARM-mapped reg
+    int n = emit_li32(ctx.cur, PPC_CALL_TMP, addr);
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(PPC_CALL_TMP));
+    ctx.emit(ppc_bctr(true));
+}
+```
+
+### Fix 4: `emit_prologue` Must Sync From Interpreter, Not Set R15 Early
+
+The current code sets R15 in prologue and then also in `emit_syncFromInterp` loop. The `emit_syncFromInterp` skips R15 (correct), but the prologue sets PPC_ARM_R15 = `ctx.armPC` = the block's start PC. Then the compile loop sets it again to `pc + offset`. This double-set is wasteful but not wrong.
+
+**However**: after `emit_syncFromInterp`, PPC_ARM_R15 is reloaded from the sync area at slot 15, which `JitPpc_syncFromInterp` leaves undefined:
+
+```cpp
+void JitPpc_syncFromInterp(Interpreter* interp, uint32_t* regs) {
+    for (int i = 0; i < 15; i++)
+        regs[i] = *regPtrs[i];
+    regs[16] = interp->getCpsrRef();
+    // regs[15] intentionally left undefined
+}
+```
+
+Then `emit_syncFromInterp` in JIT does:
+```cpp
+for (int i = 0; i < 15; i++)
+    ctx.emit(ppc_lwz(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
+ctx.emit(ppc_lwz(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
+// Note: does NOT reload PPC_ARM_R15 (ARM_TO_PPC[15]) ← correct
+```
+
+So `PPC_ARM_R15` keeps whatever value the prologue set (`ctx.armPC`). Then the first iteration of the compile loop overwrites it with `pc + (thumb ? 4 : 8)`. Since `pc == ctx.armPC` at the start, this becomes `armPC + 4` or `armPC + 8`. ✓
+
+This is correct — no fix needed here.
+
+### Fix 5: Block End Detection Missing for Interpreter Fallback Branches
+
+When `emit_interpFallback` is called (interpreter handles the instruction), the interpreter might execute a branch, changing the PC. But `blockEnded` stays false and the JIT continues compiling the next sequential instruction. After returning from the fallback, the interpreter's PC has changed, but the JIT then executes whatever comes next in the ROM sequentially.
+
+```cpp
+// After emit_interpFallback, we don't know if a branch occurred.
+// Safest: always end the block after a fallback.
+if (!emitARMInstr(ctx, opcode, pc))  {
+    emit_interpFallback(ctx);
+    blockEnded = true;  // ADD THIS
+}
+```
+
+Same for Thumb:
+```cpp
+if (!emitThumbInstr(ctx, top, pc)) {
+    emit_interpFallback(ctx);
+    blockEnded = true;  // ADD THIS
+}
+```
+
+### Fix 6: `emit_syncToInterp` at Block End Followed by `emit_epilogue` — Double Sync on Branch
+
+For branches, the flow is:
+```
+emit_branch → emit_syncToInterp → [fall through to block end] → emit_syncToInterp → emit_epilogue
+```
+
+The second `emit_syncToInterp` at block end re-syncs, which is harmless but wastes time. More importantly, **if a branch is taken mid-block** (blockEnded=true), the compile loop still calls `emit_syncToInterp` and `emit_epilogue` after the loop. But the branch handler already called `emit_syncToInterp` and left without calling `emit_epilogue`! The block then falls through to the `emit_syncToInterp; emit_epilogue` at the end of `compileBlock`.
+
+```cpp
+// In compileBlock, after the loop:
+emit_syncToInterp(ctx);
+emit_epilogue(ctx);
+```
+
+If the last instruction was a branch, the branch handler called `emit_syncToInterp` but NOT `emit_epilogue`. Then these two lines add another sync + epilogue. **This means the block has code like**:
+
+```
+[branch taken path]:
+  ... set R15 ...
+  emit_syncToInterp   ← branch's sync
+  [no blr here, falls through]
+  
+[block end]:
+  emit_syncToInterp   ← duplicate sync
+  emit_epilogue (blr) ← correct return
+```
+
+The duplicate sync is wasteful but the `blr` at the end is correct. However, the branch path **does NOT have a `blr`** — it falls through to the extra sync and then the epilogue's `blr`. This actually works correctly! The branch syncs the interpreter, then falls to the epilogue which returns. ✓
+
+But wait — for branches with condition codes, the non-taken path also falls through to the end, which re-syncs (potentially with the wrong R15 from the last `emit_li32`). This is a problem:
+
+```
+[conditional branch]:
+  emit_setupCondFlags
+  ppc_bc (skip if not taken)
+  ... [taken path] ...
+  set R15 = target
+  emit_syncToInterp
+  patchBranchOffset → points here ↓
+  [not-taken path falls through]
+  
+[block continues or ends]:
+  emit_li32 R15, pc+next_offset  ← next instruction's R15
+  [possibly more instructions]
+  
+[end of block]:
+  emit_syncToInterp  ← syncs with R15 = last instruction's R15, not target!
+  emit_epilogue
+```
+
+For the taken path: after the branch's `emit_syncToInterp`, execution falls through to the next instruction's `emit_li32 R15, ...` which corrupts R15, then the final `emit_syncToInterp` syncs the wrong R15. **This is a real bug.**
+
+**Fix**: After a branch is taken (emit_syncToInterp done), immediately `blr`:
+
+```cpp
+static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
+    // ... [existing code] ...
+    
+    // For BX:
+    ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRm, 0, 0, 30));
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);  // ADD: return from block immediately
+    
+    if (hasCondBranch)
+        patchBranchOffset(ctx, condBranchIdx, ctx.size());
+    return true;
+}
+```
+
+But then `compileBlock` will also add `emit_syncToInterp; emit_epilogue` after the loop. Fix this by having the branch set `blockEnded = true` and skipping the final sync/epilogue, or by adding an early-return flag.
+
+**Simplest approach**: Always add `emit_epilogue` after `emit_syncToInterp` in the branch emitters, and have `compileBlock` track whether the block already ended with a return:
+
+```cpp
+// Add to EmitCtx:
+struct EmitCtx {
+    // ... existing fields ...
+    bool hasExplicitReturn = false;  // true if block already ends with blr
+};
+
+// In emit_branch, after emit_syncToInterp:
+emit_epilogue(ctx);
+ctx.hasExplicitReturn = true;
+
+// In compileBlock, at the end:
+if (!ctx.hasExplicitReturn) {
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);
+}
+```
+
+But this breaks conditional branches where only the *taken* path has `emit_epilogue`. The not-taken path falls through and needs its own epilogue.
+
+**Better approach**: Restructure branch emission so both paths explicitly epilogue:
+
+```cpp
+static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
+    // B/BL example:
+    if ((opcode & 0x0E000000) == 0x0A000000) {
+        bool    isLink = (opcode >> 24) & 1;
+        int32_t offset = (int32_t)(opcode << 8) >> 6;
+        uint32_t target = pc + 8 + offset;
+
+        size_t condBranchIdx = 0;
+        bool   hasCondBranch = false;
+        if (cond != 14) {
+            emit_setupCondFlags(ctx);
+            CondBranch cb = armCondToPpc(cond);
+            if (!cb.valid) return false;
+            if (cb.bo != 20) {
+                condBranchIdx = ctx.size();
+                hasCondBranch = true;
+                ctx.emit(ppc_bc((cb.bo == 12) ? 4 : 12, cb.bi, 0));
+            }
+        }
+
+        // Taken path:
+        if (isLink) {
+            int n = emit_li32(ctx.cur, PPC_ARM_R14, pc + 4);
+            ctx.cur += n;
+        }
+        {
+            int n = emit_li32(ctx.cur, PPC_ARM_R15, target);
+            ctx.cur += n;
+        }
+        emit_syncToInterp(ctx);
+        emit_epilogue(ctx);  // Return from block (taken)
+
+        if (hasCondBranch) {
+            // Not-taken path: patch condition branch to here
+            patchBranchOffset(ctx, condBranchIdx, ctx.size());
+            // R15 for not-taken = pc + 4 (next instruction)
+            int n = emit_li32(ctx.cur, PPC_ARM_R15, pc + 4);
+            ctx.cur += n;
+            emit_syncToInterp(ctx);
+            emit_epilogue(ctx);  // Return from block (not-taken)
+        }
+
+        ctx.hasExplicitReturn = true;
+        return true;
+    }
+    // Similar for BX...
+}
+```
+
+### Fix 7: `JitPpc_syncToInterp` Writes Wrong PC (Stale from Register Array)
+
+```cpp
+void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 16; i++)
+        *regPtrs[i] = regs[i];  // regs[15] should be the new PC
+    interp->getCpsrRef() = regs[16];
+}
+```
+
+This writes `regs[15]` (PPC_ARM_R15) to `*regPtrs[15]`. But `regPtrs[15]` points to the PC slot in `registersUsr`. The interpreter expects PC to be `fetch_addr + pipeline_depth`. If we write the target address directly, the interpreter will read it as a pipelined value.
+
+The interpreter's `flushPipeline()` sets `*registers[15] = target + pipeline` and reloads the pipeline. We're bypassing this by directly writing `*registers[15] = target`, then returning. When the interpreter resumes, it reads `*registers[15]` as the PC and tries to continue, but without a proper pipeline refill.
+
+**Fix**: Instead of writing directly, call into the interpreter to do a proper branch:
+
+```cpp
+// Add to interpreter.h:
+void setPC(uint32_t newPC);  // properly flushes pipeline
+
+// In interpreter.cpp:
+void Interpreter::setPC(uint32_t newPC) {
+    *registers[15] = newPC;
+    flushPipeline();
+}
+```
+
+```cpp
+extern "C" void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 15; i++)  // R0-R14
+        *regPtrs[i] = regs[i];
+    interp->getCpsrRef() = regs[16];
+    // R15: properly set via setPC to flush pipeline
+    interp->setPC(regs[15]);
+}
+```
+
+---
+
+## Summary of All Fixes
+
+| # | Location | Bug | Fix |
+|---|----------|-----|-----|
+| 1 | `runJitNds` | Uses `getPC()` (pipelined) instead of actual fetch PC | Add `getActualPC()`, use it |
+| 2 | `emit_call` | Uses r12 (`PPC_TMP3`), volatile and shared | Use r29 as `PPC_CALL_TMP`, save in frame |
+| 3 | `FRAME_*` constants | Frame too small for r14..r29, `FRAME_REGSYNC` too small | Resize to 176, adjust `FRAME_REGSYNC` to 80 |
+| 4 | Branch emitters | Taken path lacks `emit_epilogue`, falls through to corrupt code | Add `emit_epilogue` after each `emit_syncToInterp` in branch paths |
+| 5 | Fallback handler | Interpreter fallback may branch, but block continues sequential | Set `blockEnded = true` after `emit_interpFallback` |
+| 6 | `JitPpc_syncToInterp` | Writes raw address to `*registers[15]`, bypassing pipeline | Call `interp->setPC()` for R15 to flush pipeline properly |
+| 7 | `compileBlock` | Final `emit_syncToInterp/epilogue` redundant when block has explicit return | Add `hasExplicitReturn` flag to `EmitCtx` |
+
+The ISI exception specifically is caused by bugs **1** (wrong PC → compiling/executing wrong block, possibly non-code memory) and **4** (taken branch path falls through to wrong code, eventually jumping to an ARM address as if it were PPC). Fix these two first and you should eliminate the ISI.
