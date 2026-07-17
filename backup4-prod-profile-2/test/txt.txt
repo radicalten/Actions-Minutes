@@ -11,3 +11,33 @@ it did not actually speed things up with cson4pt6 and also broke sound on nds.
 
 ==
 next goal try to write ARM to PPC JIT recompiler.
+
+==
+using Arm-jit-v3 cson4pt6 created a compiling but not yet working dynarec. 
+
+Arm-jit-v3:
+Can you write an ARMv4/5 to PPC JIT recompiler for translating ARMv4 and ARMv5 opcode instructions for DS to Native PowerPC PPC/Gekko instructions for Wii. 
+You may use http://imrannazar.com/ARM-Opcode-Map for ARMv4/5 instructions and https://fenixfox-studios.com/manual/powerpc/index.html for Wii PowerPC gekko instructions, as well as any other reference material you require.
+The goal is to create a .cpp file to drop into the NooDS DS emulator https://github.com/Hydr8gon/NooDS that uses the current interpreter inplemenatation as a fallback.
+Here is core.h interpreter.h and memory.h:
+
+
+fix-ppc-dynarec1:
+can you help me fix my arm to ppc dynamic recompiler for written in c++? Here is the error, followed by my code:
+
+When launching ds games for example I get:
+Invalid read from 0x000000e3, PC = 0x800ceaf8
+Invalid read from 0x000000df, PC = 0x800ceb08
+Exception (ISI) occurred!
+GPR 00 02000A5c GPR08 02000800
+...
+PC 02000A5c LR 02000A5C MSR 40009032 Thrd 803566A0
+CR 29000444 CTR 80064178 XER 00000000
+
+STACK DUMP:
+0x02000a5c --> 0x800682b4 --> 00000000
+
+interpreter.h
+core.h
+jit_ppc.h
+jit_ppc.c
