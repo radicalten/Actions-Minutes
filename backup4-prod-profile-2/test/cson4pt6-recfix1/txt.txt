@@ -18,3 +18,45 @@ PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 803568E0
 CR 22887494 CTR 00000000 XER 00000000
 STACK DUMP:
 0x000e2b04 --> 0x000e2b04 --> 00000000
+
+===
+after sending it this it made some changes and now both GBA and NDS isi crash: 
+And NDS gets an invalid read whereas before it did not.
+
+GBA
+This compiles but when launching a GBA game I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 803567E0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+And when launching an NDS game I get this:
+Invalid read from 0x00000000, PC = 0x80064174
+Invalid read from 0x00000000, PC = 0x80064184
+Invalid read from 0x00000000, PC = 0x80064194
+Invalid read from 0x00000000, PC = 0x800641a4
+Invalid read from 0x00000000, PC = 0x800641b4
+Invalid read from 0x00000000, PC = 0x800641c0
+Invalid read from 0x00000000, PC = 0x800641c8
+Invalid read from 0x00000000, PC = 0x800641d0
+Invalid read from 0x00000000, PC = 0x800641d8
+Invalid read from 0x00000000, PC = 0x800641e0
+Invalid read from 0x00000000, PC = 0x800641e8
+Invalid read from 0x00000000, PC = 0x800641f8
+Invalid read from 0x00000000, PC = 0x80064208
+Invalid read from 0x00000000, PC = 0x80064210
+Invalid read from 0x00000000, PC = 0x80064218
+Invalid write to 0x00000000, PC = 0x800640ac
+Invalid write to 0x00000000, PC = 0x800640bc
+Invalid write to 0x00000000, PC = 0x800640cc
+...
+Exception (ISI) occurred!
+GPR00 00000000 GPR08 00000000 GPR16 00000000 GPR24 00000000
+...
+PC 00000000 LR 00000000 MSR 40009032 Thrd 803567E0
+CR 29000292 CTR 800640A0 XER 20000000
+STACK DUMP:
+00000000 -->  00000000
+
