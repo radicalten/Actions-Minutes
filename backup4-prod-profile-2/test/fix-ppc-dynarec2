@@ -1,7 +1,7 @@
 can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code:
 
-My code compiles but when launching nds games I get a blank black screen.
-And when launchin certain gba games I get this: Exception (ISI) occurred!
+My code compiles but when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
 GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
 ...
 PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 803568E0
