@@ -1,1 +1,72 @@
+OK with this one both nds and gba games still boot to black screen but then they bring down the fps to 1fps for the wii itself. Also emerald still crashes. 
 
+Fix1 info:
+======
+AFter all the changes here once again it compiles. NDS and Most gba games go to black screen but now we get a new error ISI on emerald. 
+
+old new crash behavior: almost identical to before but no thrd is 80356AA0 on gba emerald.
+instead of Thrd 803568E0
+
+With these changes the behavior is largely the same: My code compiles and when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356AA0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+The difference seems to be Thrd 80356AA0 instead of Thrd 803568E0
+
+
+new new crash behavior: almost identical to before but now Thrd is 80356BC0 thrd was 80356AA0 on gba emerald.
+instead of Thrd 803568E0
+
+With these changes the behavior is largely the same: My code compiles and when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 8052DA88 GPR17 07E00000 GPR24 09188900
+GPR02 8012EDF0 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 80545AD0 GPR19 44470202 GPR27 08780138
+GPR04 80545EC0 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80152880 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 8052DA60 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356BC0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+=====
+
+fix2 info:
+With these changes the behavior is largely the same: My code compiles and when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 8052DD68 GPR17 07E00000 GPR24 09188900
+GPR02 8012EDF0 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 8053DDD0 GPR19 44470202 GPR27 08780138
+GPR04 8054E1C0 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80152B60 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 8052DD60 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356EA0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+======
+fix3 info: this is a promising change some games turn white like mkds and display high framerate 30-60fps DS. others like contra 4 stay black and have 9 wii fps. emerald still broken with ISI. 
+With these changes the behavior a bit different: My code compiles and when launching most ds/gba games I get either a blank white or blank black screen. The fps also varies from 10-60fps
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 8052DD68 GPR17 07E00000 GPR24 09188900
+GPR02 8012EDF0 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 8053DDD0 GPR19 44470202 GPR27 08780138
+GPR04 8054E1C0 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80152B60 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 8052DD60 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356EA0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
