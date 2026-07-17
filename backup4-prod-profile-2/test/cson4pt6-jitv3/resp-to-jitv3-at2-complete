@@ -6043,3 +6043,67 @@ The single root cause of the original error and all secondary issues:
 | `goto` in `updateRun()` can skip over variable initialisations, causing `-Wjump-to-label-crosses-initialization` | Replaced with a plain `if/else if` chain writing into a local `newFunc` pointer |
 | `jitAvailable` used in `core.cpp` but not declared in `core.h` | Added `bool jitAvailable = false;` to the private section of `Core` |
 | `invalidateJitPage` defined in `core.cpp` but not declared in `core.h` | Added the declaration to the public section of `Core` |
+
+========
+
+When launching ds roms for example I get:
+Invalid read from 0x000000e3, PC = 0x800ceaf8
+Invalid read from 0x000000df, PC = 0x800ceb08
+Exception (ISI) occurred!
+GPR 00 02000A5c GPR08 02000800
+...
+PC 02000A5c LR 02000A5C MSR 40009032 Thrd 803566A0
+CR 29000444 CTR 80064178 XER 00000000
+
+STACK DUMP:
+0x02000a5c --> 0x800682b4 --> 00000000
+
+
+Partial Answer then freeze:
+The crash is a PowerPC ISI (Instruction Storage Interrupt) — the CPU tried to execute code at 0x02000A5C, which is DS main RAM address space, not a valid Wii executable address. This means the JIT emitted a block whose epilogue or a branch target landed in the wrong place, or the bctrl trampoline left a bad address in CTR/LR.
+
+The root causes are:
+
+    emit_call uses r12 as scratch but r12 is also PPC_TMP3 — if any instruction between saving LR and the bctrl touches r12, the function address gets clobbered.
+    The prologue saves LR to the frame but emit_call overwrites LR via mflr/mtlr — nested calls corrupt the saved return address.
+    ppc_bctr(true) = bctrl is correct but the address loaded into CTR via emit_li32 may be sign-extended incorrectly on addresses whose high bit is set (all Wii .text addresses are 0x800xxxxx).
+    emit_li32 uses ppc_addi with a signed 16-bit immediate — when lo16 >= 0x8000 the addis + addi sequence underflows by 1 because addi sign-extends.
+    Block function pointer cast — the compiled block is called as void(*)() with no arguments, which is fine on PPC SysV, but the block itself uses PPC_INTERP (r23) and PPC_CORE (r24) which it loads from constants inside the prologue. If initJit() runs before the Interpreter objects are fully constructed the stored pointers are stale.
+
+Here is the fully corrected jit_ppc.cpp addressing all of these:
+
+C++
+
+// jit_ppc.cpp
+// ARMv4/5 -> PowerPC/Gekko JIT Recompiler for NooDS on Wii
+
+#include "jit_ppc.h"
+#include "core.h"
+#include "interpreter.h"
+#include "memory.h"
+#include "defines.h"
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cstdio>
+#include <malloc.h>      // memalign on Wii GCC
+
+extern "C" {
+    #include <ogc/cache.h>
+}
+
+// ============================================================
+// PowerPC instruction encoders
+// ============================================================
+namespace JitPpc {
+
+// ---- I-form ----
+static inline uint32_t ppc_b(int32_t off, bool aa=false, bool lk=false){
+    return (18u<<26)|((uint32_t)(off&0x3FFFFFC))|(aa?2u:0u)|(lk?1u:0u);
+}
+// ---- B-form ----
+static inline uint32_t 
+
+
+
