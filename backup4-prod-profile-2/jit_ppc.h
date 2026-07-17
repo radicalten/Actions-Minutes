@@ -6,14 +6,15 @@
 class Core;
 
 namespace JitPpc {
-    // Core* overloads (preferred — hook runFunc automatically)
+    // Core* versions — hook runFunc automatically
     bool initJit(Core* core);
     void shutdownJit(Core* core);
 
-    // No-argument overloads for call sites that don't have a Core* handy.
-    // These skip the runFunc hook; caller must call core->setRunFunc() separately.
-    inline bool initJit()      { return initJit(nullptr); }
-    inline void shutdownJit()  { shutdownJit(nullptr);    }
+    // No-argument inline wrappers for call sites without a Core* handy.
+    // The header-inline definition means jit_ppc.cpp must NOT define
+    // no-argument versions of these — they live here only.
+    inline bool initJit()     { return initJit(nullptr);  }
+    inline void shutdownJit() { shutdownJit(nullptr);      }
 
     void runJitNds(Core& core);
     void runJitGba(Core& core);
