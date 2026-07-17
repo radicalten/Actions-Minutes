@@ -196,7 +196,6 @@ public:
     // Hot path: single load + indirect branch, no virtual dispatch.
     inline void runCore() { (*runFunc)(*this); }
 
-
     void setRunFunc(void (*f)(Core&)) {
     runFunc = (f != nullptr) ? f : &Interpreter::runCoreNds;
     }
