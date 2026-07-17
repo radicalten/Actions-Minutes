@@ -3,6 +3,7 @@ export DEVKITPRO 	:= /opt/devkitpro
 export DEVKITPPC	:= $(DEVKITPRO)/devkitPPC
 include $(DEVKITPPC)/wii_rules
 CC 					:= $(DEVKITPPC)/bin/powerpc-eabi-g++
+AS					:= $(DEVKITPPC)/bin/powerpc-eabi-as
 MACHDEP := -DGEKKO -mrvl -mcpu=750 -meabi -mhard-float -fsigned-char -ffast-math -funroll-loops -fauto-inc-dec -finline-functions
 INCLUDES += -I/opt/devkitpro/portlibs/wii/include -I/opt/devkitpro/portlibs/ppc/include -I/opt/devkitpro/libogc/include
 CXXFLAGS += -O2 \
@@ -19,8 +20,9 @@ TARGET  := myapp
 EXCLUDE :=
 SRCDIR 	:= backup4-prod-profile-2
 C_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.cpp)))
-SOURCES = $(C_SOURCES) 
-OBJECTS = $(SOURCES:.cpp=.o)
+S_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.S)))
+SOURCES = $(C_SOURCES) $(S_SOURCES) 
+OBJECTS = $(SOURCES:.cpp=.o) $(SOURCES:.S=.o)
 
 ELF2DOL  := elf2dol
 all: $(TARGET).dol
@@ -30,6 +32,8 @@ $(TARGET).elf: $(OBJECTS)
 	$(CC) $^ -o $@ $(LDFLAGS)
 %.o: %.cpp
 	$(CC) -c $< -o $@ $(CXXFLAGS)
+%.o: %.S
+	$(AS) -o $@ $(CXXFLAGS)
 clean:
 	rm -f $(TARGET).elf $(TARGET).dol $(TARGET).map $(OBJECTS)
 .PHONY: clean test
