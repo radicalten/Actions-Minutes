@@ -196,6 +196,10 @@ public:
     // Hot path: single load + indirect branch, no virtual dispatch.
     inline void runCore() { (*runFunc)(*this); }
 
+    void setRunFunc(void (*f)(Core&)) {
+    runFunc = f ? f : &Interpreter::runCoreNds;
+}
+
     void schedule(SchedTask task, uint32_t cycles);
     void enterGbaMode();
     void endFrame();
