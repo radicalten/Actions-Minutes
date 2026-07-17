@@ -1,16 +1,13 @@
 can you help me fix my arm to ppc dynamic recompiler for written in c++? Here is the error, followed by my code:
 
-When launching gba games for example I get:
-Invalid read from 0x000000e3, PC = 0x800ceaf8
-Invalid read from 0x000000df, PC = 0x800ceb08
-Exception (ISI) occurred!
-GPR 00 02000A5c GPR08 02000800
+My code compiles but when launching nds games I get a blank black screen.
+And when launchin certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
 ...
-PC 02000A5c LR 02000A5C MSR 40009032 Thrd 803566A0
-CR 29000444 CTR 80064178 XER 00000000
-
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 803568E0
+CR 22887494 CTR 00000000 XER 00000000
 STACK DUMP:
-0x02000a5c --> 0x800682b4 --> 00000000
+0x000e2b04 --> 0x000e2b04 --> 00000000
 
 
 //interpreter.h
@@ -64,6 +61,53 @@ public:
     void writeIrf(uint32_t mask, uint32_t value);
     void writePostFlg(uint8_t value);
 
+    // -----------------------------------------------------------------------
+    // JIT accessor helpers
+    // These expose private fields to the JIT without making everything public.
+    // Using offsetof() directly on private members requires friendship or
+    // these helpers; we choose helpers so the JIT stays loosely coupled.
+    // -----------------------------------------------------------------------
+    uint32_t** getRegisters()  { return registers; }
+    uint32_t&  getCpsrRef()    { return cpsr; }
+
+    static size_t offset_halted() {
+        // offsetof requires a standard-layout type; Interpreter is not (has
+        // virtual-ish things and private members), so we use the safer
+        // placement approach: instantiate a zeroed object and measure.
+        // Because this is called once at init time the overhead is fine.
+        static Interpreter* dummy = nullptr;
+        // We cannot construct one without a Core*, so fall back to the
+        // pointer-difference trick on a real instance via a friend shim.
+        // Instead, expose the offset through a static probe object allocated
+        // on the heap with placement new into a zeroed buffer.
+        //
+        // Simpler: just return the field's address relative to *this using
+        // a null-pointer cast — UB in ISO C++ but universally supported on
+        // GCC/Wii toolchain and used by every embedded codebase.
+        // The cast is safe because we never dereference the null base.
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->halted);
+    }
+    static size_t offset_pcData() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->pcData);
+    }
+    static size_t offset_pipeline() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->pipeline);
+    }
+    static size_t offset_registersUsr() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->registersUsr);
+    }
+    static size_t offset_cpsr() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->cpsr);
+    }
+    static size_t offset_cycles() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->cycles);
+    }
 
 private:
     Core *core;
@@ -1098,8 +1142,7 @@ namespace JitPpc {
 
 // jit_ppc.cpp
 // ARMv4/5 -> PowerPC/Gekko JIT Recompiler for NooDS on Wii
-// Translates DS ARM9/ARM7 instructions to native Wii Gekko PPC instructions
-// Falls back to interpreter for unhandled opcodes
+// All 8 bugs from code review fixed.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -1111,58 +1154,49 @@ namespace JitPpc {
 #include <cstdlib>
 #include <cstring>
 #include <cassert>
-#include <unordered_map>
-#include <vector>
 #include <cstdio>
-#include <malloc.h>      // memalign on Wii/GCC
+#include <malloc.h>
 
-// ============================================================
-// Wii/Gekko memory management for executable code
-// ============================================================
 extern "C" {
-    #include <ogc/cache.h>   // DCFlushRange / ICInvalidateRange
+    #include <ogc/cache.h>
 }
 
 // ============================================================
-// PowerPC Instruction Encoding Helpers
+// Static assertions — catch frame overflow at compile time
 // ============================================================
-// All PPC instructions are 32-bit big-endian words.
-// Gekko is a 32-bit PowerPC 750CXe derivative.
-//
-// Register allocation strategy:
-//   r3  - r10  : ARM registers R0-R7  (volatile across calls, save/restore)
-//   r14 - r20  : ARM registers R8-R14 (non-volatile, persistent)
-//   r21        : ARM R15 (PC) - managed carefully
-//   r22        : ARM CPSR
-//   r23        : pointer to Interpreter struct (ARM state)
-//   r24        : pointer to Core struct
-//   r25        : scratch / temp
-//   r26        : scratch / temp
-//   r27        : ARM carry flag (extracted from CPSR bit 29)
-//   r0         : linkage / scratch (PPC ABI)
-//   r1         : stack pointer (PPC ABI, do not touch)
-//   r2         : reserved (TOC on ELF, unused on Wii)
-//   r11, r12   : scratch for codegen
-// ============================================================
+// Frame layout (all offsets from new r1 after stwu):
+//   [r1+ 0] back-chain (written by stwu)
+//   [r1+ 4] (ABI: reserved for callee LR save area — not used by us)
+//   [r1+ 8] our saved LR
+//   [r1+12] padding
+//   [r1+16] saved r14..r26  (13 regs × 4 = 52 bytes)  → bytes 16..67
+//   [r1+68] padding (4 bytes to reach 72)
+//   [r1+72] ARM reg sync area (17 words × 4 = 68 bytes) → bytes 72..139
+//   [r1+140] padding to reach 160 (next 16-byte boundary)
+// Total: 160 bytes, 16-byte aligned.
+
+static const int FRAME_SIZE    = 160;   // must be divisible by 16
+static const int FRAME_LR      = 8;    // where we store LR
+static const int FRAME_R14     = 16;   // r14..r26 saved here
+static const int FRAME_REGSYNC = 72;   // 17 × 4 = 68 bytes for ARM R0-R15 + CPSR
+
+static_assert(FRAME_SIZE % 16 == 0,          "Frame must be 16-byte aligned");
+static_assert(FRAME_REGSYNC + 17*4 <= FRAME_SIZE, "Sync area overflows frame");
+static_assert(FRAME_R14 + 13*4    <= FRAME_REGSYNC, "Saved regs overlap sync area");
 
 namespace JitPpc {
 
-// ------------------------------------------------------------------
-// PPC instruction word builders
-// ------------------------------------------------------------------
+// ============================================================
+// PPC instruction word builders  (unchanged from original)
+// ============================================================
 
-// I-form: BL / B
 static inline uint32_t ppc_b(int32_t offset, bool aa = false, bool lk = false) {
     return (18u << 26) | ((uint32_t)(offset & 0x3FFFFFC)) | (aa ? 2u : 0u) | (lk ? 1u : 0u);
 }
-
-// B-form: conditional branch
 static inline uint32_t ppc_bc(uint8_t bo, uint8_t bi, int16_t offset, bool lk = false) {
     return (16u << 26) | ((uint32_t)(bo & 0x1F) << 21) |
            ((uint32_t)(bi & 0x1F) << 16) | ((uint32_t)(offset & 0xFFFC)) | (lk ? 1u : 0u);
 }
-
-// XL-form: BCLR / BCCTR
 static inline uint32_t ppc_bclr(uint8_t bo, uint8_t bi, bool lk = false) {
     return (19u << 26) | ((uint32_t)(bo & 0x1F) << 21) |
            ((uint32_t)(bi & 0x1F) << 16) | (16u << 1) | (lk ? 1u : 0u);
@@ -1170,8 +1204,6 @@ static inline uint32_t ppc_bclr(uint8_t bo, uint8_t bi, bool lk = false) {
 static inline uint32_t ppc_bctr(bool lk = false) {
     return (19u << 26) | (20u << 21) | (528u << 1) | (lk ? 1u : 0u);
 }
-
-// D-form: addi, addis, ori, oris, andi., andis., lwz, stw, lbz, stb, lhz, sth, lha, etc.
 static inline uint32_t ppc_addi(uint8_t rt, uint8_t ra, int16_t imm) {
     return (14u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)imm;
 }
@@ -1225,32 +1257,21 @@ static inline uint32_t ppc_cmpli(uint8_t crD, uint8_t ra, uint16_t imm, bool l =
     return (10u << 26) | ((uint32_t)(crD & 7) << 23) | (l ? (1u << 21) : 0u) |
            ((uint32_t)ra << 16) | imm;
 }
-
-// subfic: rt = imm - ra  (sets XER[CA])
 static inline uint32_t ppc_subfic(uint8_t rt, uint8_t ra, int16_t imm) {
     return (8u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)imm;
 }
-
-// X-form
 static inline uint32_t ppc_Xform(uint32_t op, uint8_t rt, uint8_t ra, uint8_t rb,
                                    uint32_t xop, bool rc = false) {
     return (op << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) |
            ((uint32_t)rb << 11) | (xop << 1) | (rc ? 1u : 0u);
 }
-
-// XO-form: add, subf, and, or, xor, mullw, divwu, divw, etc.
 static inline uint32_t ppc_XOform(uint32_t op, uint8_t rt, uint8_t ra, uint8_t rb,
                                     bool oe, uint32_t xop, bool rc = false) {
     return (op << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) |
            ((uint32_t)rb << 11) | (oe ? (1u << 10) : 0u) | (xop << 1) | (rc ? 1u : 0u);
 }
-
-// Common XO shortcuts
 static inline uint32_t ppc_add(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
     return ppc_XOform(31, rt, ra, rb, false, 266, rc);
-}
-static inline uint32_t ppc_addo(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
-    return ppc_XOform(31, rt, ra, rb, true, 266, rc);
 }
 static inline uint32_t ppc_addc(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
     return ppc_XOform(31, rt, ra, rb, false, 10, rc);
@@ -1259,7 +1280,6 @@ static inline uint32_t ppc_adde(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = fa
     return ppc_XOform(31, rt, ra, rb, false, 138, rc);
 }
 static inline uint32_t ppc_subf(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
-    // subf rt, ra, rb => rt = rb - ra
     return ppc_XOform(31, rt, ra, rb, false, 40, rc);
 }
 static inline uint32_t ppc_subfc(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
@@ -1289,8 +1309,6 @@ static inline uint32_t ppc_divwu(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = f
 static inline uint32_t ppc_divw(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
     return ppc_XOform(31, rt, ra, rb, false, 491, rc);
 }
-
-// X-form logical
 static inline uint32_t ppc_and(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
     return ppc_Xform(31, rs, ra, rb, 28, rc);
 }
@@ -1315,18 +1333,12 @@ static inline uint32_t ppc_nand(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = fa
 static inline uint32_t ppc_orc(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
     return ppc_Xform(31, rs, ra, rb, 412, rc);
 }
-
-// MR = OR rs,rs,rs
 static inline uint32_t ppc_mr(uint8_t ra, uint8_t rs) {
     return ppc_or(ra, rs, rs);
 }
-
-// NOP = ORI r0,r0,0
 static inline uint32_t ppc_nop() {
     return ppc_ori(0, 0, 0);
 }
-
-// Shift/rotate
 static inline uint32_t ppc_slw(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
     return ppc_Xform(31, rs, ra, rb, 24, rc);
 }
@@ -1336,8 +1348,6 @@ static inline uint32_t ppc_srw(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = fal
 static inline uint32_t ppc_sraw(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
     return ppc_Xform(31, rs, ra, rb, 792, rc);
 }
-
-// M-form: rlwinm, rlwimi, rlwnm
 static inline uint32_t ppc_rlwinm(uint8_t ra, uint8_t rs, uint8_t sh,
                                     uint8_t mb, uint8_t me, bool rc = false) {
     return (21u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) |
@@ -1353,19 +1363,13 @@ static inline uint32_t ppc_rlwnm(uint8_t ra, uint8_t rs, uint8_t rb,
     return (23u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) |
            ((uint32_t)rb << 11) | ((uint32_t)mb << 6) | ((uint32_t)me << 1) | (rc ? 1u : 0u);
 }
-
-// srawi
 static inline uint32_t ppc_srawi(uint8_t ra, uint8_t rs, uint8_t sh, bool rc = false) {
     return (31u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) |
            ((uint32_t)sh << 11) | (824u << 1) | (rc ? 1u : 0u);
 }
-
-// cntlzw
 static inline uint32_t ppc_cntlzw(uint8_t ra, uint8_t rs, bool rc = false) {
     return ppc_Xform(31, rs, ra, 0, 26, rc);
 }
-
-// compare
 static inline uint32_t ppc_cmp(uint8_t crD, uint8_t ra, uint8_t rb) {
     return (31u << 26) | ((uint32_t)(crD & 7) << 23) | ((uint32_t)ra << 16) |
            ((uint32_t)rb << 11) | (0u << 1);
@@ -1374,8 +1378,6 @@ static inline uint32_t ppc_cmpl(uint8_t crD, uint8_t ra, uint8_t rb) {
     return (31u << 26) | ((uint32_t)(crD & 7) << 23) | ((uint32_t)ra << 16) |
            ((uint32_t)rb << 11) | (32u << 1);
 }
-
-// mtspr / mfspr
 static inline uint32_t ppc_mtspr(uint16_t spr, uint8_t rs) {
     uint8_t sprLo = spr & 0x1F;
     uint8_t sprHi = (spr >> 5) & 0x1F;
@@ -1388,37 +1390,21 @@ static inline uint32_t ppc_mfspr(uint8_t rt, uint16_t spr) {
     return (31u << 26) | ((uint32_t)rt << 21) | ((uint32_t)sprLo << 16) |
            ((uint32_t)sprHi << 11) | (339u << 1);
 }
-
-// mtctr / mfctr
 static inline uint32_t ppc_mtctr(uint8_t rs) { return ppc_mtspr(9, rs); }
 static inline uint32_t ppc_mfctr(uint8_t rt) { return ppc_mfspr(rt, 9); }
 static inline uint32_t ppc_mtlr(uint8_t rs)  { return ppc_mtspr(8, rs); }
 static inline uint32_t ppc_mflr(uint8_t rt)  { return ppc_mfspr(rt, 8); }
-
-// XER SPR = 1
 static inline uint32_t ppc_mtxer(uint8_t rs) { return ppc_mtspr(1, rs); }
 static inline uint32_t ppc_mfxer(uint8_t rt) { return ppc_mfspr(rt, 1); }
-
-// mfcr / mtcrf
 static inline uint32_t ppc_mfcr(uint8_t rt) {
     return (31u << 26) | ((uint32_t)rt << 21) | (19u << 1);
 }
 static inline uint32_t ppc_mtcrf(uint8_t fxm, uint8_t rs) {
     return (31u << 26) | ((uint32_t)rs << 21) | ((uint32_t)(fxm & 0xFF) << 12) | (144u << 1);
 }
-
-// Sync/isync
-static inline uint32_t ppc_isync() {
-    return (19u << 26) | (150u << 1);
-}
-static inline uint32_t ppc_sync() {
-    return (31u << 26) | (598u << 1);
-}
-static inline uint32_t ppc_eieio() {
-    return (31u << 26) | (854u << 1);
-}
-
-// lwzx, lbzx, lhzx, lhax, stwx, stbx, sthx
+static inline uint32_t ppc_isync() { return (19u << 26) | (150u << 1); }
+static inline uint32_t ppc_sync()  { return (31u << 26) | (598u << 1); }
+static inline uint32_t ppc_eieio() { return (31u << 26) | (854u << 1); }
 static inline uint32_t ppc_lwzx(uint8_t rt, uint8_t ra, uint8_t rb) {
     return ppc_Xform(31, rt, ra, rb, 23);
 }
@@ -1440,19 +1426,13 @@ static inline uint32_t ppc_stbx(uint8_t rs, uint8_t ra, uint8_t rb) {
 static inline uint32_t ppc_sthx(uint8_t rs, uint8_t ra, uint8_t rb) {
     return ppc_Xform(31, rs, ra, rb, 407);
 }
-
-// stwu / stmw / lmw
 static inline uint32_t ppc_stwu(uint8_t rs, int16_t d, uint8_t ra) {
     return (37u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
 }
 static inline uint32_t ppc_lwzu(uint8_t rt, int16_t d, uint8_t ra) {
     return (33u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
 }
-
-// blr
 static inline uint32_t ppc_blr() { return ppc_bclr(20, 0); }
-
-// extsb / extsh
 static inline uint32_t ppc_extsb(uint8_t ra, uint8_t rs, bool rc = false) {
     return ppc_Xform(31, rs, ra, 0, 954, rc);
 }
@@ -1461,26 +1441,59 @@ static inline uint32_t ppc_extsh(uint8_t ra, uint8_t rs, bool rc = false) {
 }
 
 // ============================================================
-// Load a 32-bit immediate into a register (1 or 2 instructions)
+// FIX #4: emit_li32 — correct handling of all 32-bit immediates
+//
+// Original bug: addi r,0,lo sign-extends, so values with bit15
+// set produce wrong results (e.g. 0x0000E300 → 0xFFFFE300).
+// Also: when lo has bit15 set, addis must compensate by adding 1
+// to hi, but the original code only handled lo==0 and hi==0
+// cases, missing the compensation entirely.
+//
+// Fix: always use addis+ori. Use ori (zero-extend) for the low
+// half so the addis value is never adjusted. Only use a single
+// addis when lo==0, and only use a single ori when hi==0 (and
+// lo < 0x8000, otherwise we still need two instructions because
+// addi sign-extends).
 // ============================================================
 static int emit_li32(uint32_t* out, uint8_t rt, uint32_t imm) {
     uint16_t lo = (uint16_t)(imm & 0xFFFF);
     uint16_t hi = (uint16_t)(imm >> 16);
-    if (hi == 0) {
-        out[0] = ppc_addi(rt, 0, (int16_t)lo);
+
+    if (imm == 0) {
+        // li rt, 0
+        out[0] = ppc_addi(rt, 0, 0);
         return 1;
-    } else if (lo == 0) {
-        out[0] = ppc_addis(rt, 0, (int16_t)hi);
-        return 1;
-    } else {
-        out[0] = ppc_addis(rt, 0, (int16_t)hi);
-        out[1] = ppc_ori(rt, rt, lo);
-        return 2;
     }
+
+    if (hi == 0) {
+        if (lo < 0x8000u) {
+            // fits in a positive signed 16-bit, addi is safe
+            out[0] = ppc_addi(rt, 0, (int16_t)lo);
+            return 1;
+        } else {
+            // bit15 set: addi would sign-extend. Use addis(0)+ori instead.
+            // addis rt,0,0 then ori rt,rt,lo
+            out[0] = ppc_addi(rt, 0, 0);   // li rt, 0
+            out[1] = ppc_ori(rt, rt, lo);
+            return 2;
+        }
+    }
+
+    if (lo == 0) {
+        // Pure upper half
+        out[0] = ppc_addis(rt, 0, (int16_t)hi);
+        return 1;
+    }
+
+    // General case: addis loads upper 16 bits, ori fills lower 16.
+    // ori is zero-extending so no compensation needed for hi.
+    out[0] = ppc_addis(rt, 0, (int16_t)hi);
+    out[1] = ppc_ori(rt, rt, lo);
+    return 2;
 }
 
 // ============================================================
-// ARM -> PPC register mapping
+// ARM -> PPC register mapping  (unchanged)
 // ============================================================
 static const uint8_t PPC_ARM_R0  = 3;
 static const uint8_t PPC_ARM_R1  = 4;
@@ -1495,9 +1508,9 @@ static const uint8_t PPC_ARM_R9  = 15;
 static const uint8_t PPC_ARM_R10 = 16;
 static const uint8_t PPC_ARM_R11 = 17;
 static const uint8_t PPC_ARM_R12 = 18;
-static const uint8_t PPC_ARM_R13 = 19;  // SP
-static const uint8_t PPC_ARM_R14 = 20;  // LR
-static const uint8_t PPC_ARM_R15 = 21;  // PC
+static const uint8_t PPC_ARM_R13 = 19;
+static const uint8_t PPC_ARM_R14 = 20;
+static const uint8_t PPC_ARM_R15 = 21;
 static const uint8_t PPC_CPSR    = 22;
 static const uint8_t PPC_INTERP  = 23;
 static const uint8_t PPC_CORE    = 24;
@@ -1514,7 +1527,7 @@ static const uint8_t ARM_TO_PPC[16] = {
 };
 
 // ============================================================
-// ARM Condition Code definitions
+// CPSR bit definitions
 // ============================================================
 #define CPSR_N  (1u << 31)
 #define CPSR_Z  (1u << 30)
@@ -1528,10 +1541,10 @@ static const uint8_t ARM_TO_PPC[16] = {
 // ============================================================
 // JIT Code Buffer
 // ============================================================
-static const size_t JIT_CODE_SIZE   = 4 * 1024 * 1024; // 4 MB code cache
+static const size_t JIT_CODE_SIZE   = 4 * 1024 * 1024;
 static const size_t JIT_MAX_INSTRS  = JIT_CODE_SIZE / 4;
-static const size_t MAX_BLOCK_SIZE  = 256;  // max ARM instructions per block
-static const size_t MAX_PPC_PER_ARM = 64;   // max PPC words per ARM instruction
+static const size_t MAX_BLOCK_SIZE  = 256;
+static const size_t MAX_PPC_PER_ARM = 64;
 
 static uint32_t* codeBuffer    = nullptr;
 static size_t    codeBufferPos = 0;
@@ -1556,9 +1569,6 @@ static inline size_t hashPC(uint32_t pc) {
     return (pc >> 1) & (BLOCK_CACHE_SIZE - 1);
 }
 
-// ============================================================
-// flushJitCache — not static; declared extern in jit_ppc.h
-// ============================================================
 void flushJitCache() {
     codeBufferPos = 0;
     for (size_t i = 0; i < BLOCK_CACHE_SIZE; i++)
@@ -1589,7 +1599,7 @@ struct EmitCtx {
 };
 
 // ============================================================
-// Flush caches for newly written code
+// Cache flush
 // ============================================================
 static void flushCaches(uint32_t* start, size_t words) {
     DCFlushRange(start, words * 4);
@@ -1597,43 +1607,33 @@ static void flushCaches(uint32_t* start, size_t words) {
 }
 
 // ============================================================
-// Condition check helpers
+// Condition check helpers  (unchanged)
 // ============================================================
-
-// Setup NZCV in CR0 from PPC_CPSR before a conditional instruction.
-// After this:
-//   CR0[LT]=V (CPSR bit28), CR0[GT]=C (bit29), CR0[EQ]=Z (bit30), CR0[SO]=N (bit31)
-// Clobbers PPC_TMP0.
 static void emit_setupCondFlags(EmitCtx& ctx) {
-    // Isolate CPSR bits 28-31 (VCZN) into TMP0[28:31]
     ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_CPSR, 0, 28, 31));
-    // mtcrf 0x80 writes TMP0[28:31] -> CR[28:31] = CR0
     ctx.emit(ppc_mtcrf(0x80, PPC_TMP0));
 }
 
-// BO/BI condition mapping after emit_setupCondFlags:
-//   CR0[LT]=V (bit 0), CR0[GT]=C (bit 1), CR0[EQ]=Z (bit 2), CR0[SO]=N (bit 3)
 struct CondBranch { uint8_t bo; uint8_t bi; bool valid; };
 
 static CondBranch armCondToPpc(uint8_t cond) {
-    // BI numbering for CR0: LT=0, GT=1, EQ=2, SO=3
     switch (cond) {
-        case 0:  return {12, 2, true};  // EQ: Z=1
-        case 1:  return {4,  2, true};  // NE: Z=0
-        case 2:  return {12, 1, true};  // CS: C=1 (GT slot)
-        case 3:  return {4,  1, true};  // CC: C=0
-        case 4:  return {12, 3, true};  // MI: N=1 (SO slot)
-        case 5:  return {4,  3, true};  // PL: N=0
-        case 6:  return {12, 0, true};  // VS: V=1 (LT slot)
-        case 7:  return {4,  0, true};  // VC: V=0
-        case 14: return {20, 0, true};  // AL: always (BO=20)
-        // HI/LS/GE/LT/GT/LE need compound logic -> fall back
+        case 0:  return {12, 2, true};
+        case 1:  return {4,  2, true};
+        case 2:  return {12, 1, true};
+        case 3:  return {4,  1, true};
+        case 4:  return {12, 3, true};
+        case 5:  return {4,  3, true};
+        case 6:  return {12, 0, true};
+        case 7:  return {4,  0, true};
+        case 14: return {20, 0, true};
         default: return {0,  0, false};
     }
 }
 
 // ============================================================
-// Struct offsets (computed once at init)
+// FIX #1: Struct offsets — computed from actual build via
+// Interpreter's public static offset helpers.
 // ============================================================
 static size_t off_registersUsr = 0;
 static size_t off_cpsr         = 0;
@@ -1643,33 +1643,35 @@ static size_t off_pipeline     = 0;
 static size_t off_pcData       = 0;
 
 // ============================================================
-// Stack frame constants
-// ============================================================
-static const int FRAME_SIZE     = 128;
-static const int FRAME_LR       = 124;
-static const int FRAME_R14      = 8;    // saved r14..r26 at bytes 8..60
-static const int FRAME_REGSYNC  = 64;   // 17 words (ARM R0-R15 + CPSR) at 64..131
-static const int FRAME_VOLATILE = 68;   // 8 words (ARM R0-R7) at 68..99 — overlaps REGSYNC intentionally
-
-// ============================================================
-// Public C-callable helpers (no internal linkage)
+// FIX #2 + FIX #8: Sync functions use register pointer array
+// and skip R15 on load (R15 is set per-instruction from armPC).
 // ============================================================
 extern "C" {
 
+// JitPpc_syncToInterp: write JIT's register snapshot back to
+// interpreter, going through the registers[] pointer array so
+// banked-register indirection is respected.
+// R15 IS written back (JIT may have updated PC via branch).
 void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
-    uint32_t* usr    = (uint32_t*)((uint8_t*)interp + off_registersUsr);
-    uint32_t* cpsrPtr = (uint32_t*)((uint8_t*)interp + off_cpsr);
+    uint32_t** regPtrs = interp->getRegisters();
     for (int i = 0; i < 16; i++)
-        usr[i] = regs[i];
-    *cpsrPtr = regs[16];
+        *regPtrs[i] = regs[i];
+    interp->getCpsrRef() = regs[16];
 }
 
+// JitPpc_syncFromInterp: load interpreter's current register
+// values into the JIT snapshot.  R15 is intentionally SKIPPED
+// here because compileBlock sets PPC_ARM_R15 to the correct
+// architectural PC (pc + 8 or pc + 4) at the start of each
+// emitted instruction, avoiding a conflict between the two
+// sources.
 void JitPpc_syncFromInterp(Interpreter* interp, uint32_t* regs) {
-    const uint32_t* usr    = (const uint32_t*)((uint8_t*)interp + off_registersUsr);
-    const uint32_t* cpsrPtr = (const uint32_t*)((uint8_t*)interp + off_cpsr);
-    for (int i = 0; i < 16; i++)
-        regs[i] = usr[i];
-    regs[16] = *cpsrPtr;
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 15; i++)   // R0-R14 only; skip R15
+        regs[i] = *regPtrs[i];
+    regs[16] = interp->getCpsrRef();
+    // regs[15] (R15 slot) intentionally left undefined here;
+    // emit_prologue sets PPC_ARM_R15 from the block's armPC.
 }
 
 int JitPpc_interpFallback(Interpreter* interp) {
@@ -1703,147 +1705,142 @@ void JitPpc_addCycles(Interpreter* interp, uint32_t cycles) {
 } // extern "C"
 
 // ============================================================
-// Emit an indirect call to a C function via CTR
-// Clobbers r0, r12
+// Indirect call via CTR  (unchanged)
 // ============================================================
 static void emit_call(EmitCtx& ctx, void* fnAddr) {
     uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
     int n = emit_li32(ctx.cur, 12, addr);
     ctx.cur += n;
     ctx.emit(ppc_mtctr(12));
-    ctx.emit(ppc_bctr(true));   // bctrl
+    ctx.emit(ppc_bctr(true));
 }
 
 // ============================================================
-// Block prologue / epilogue
+// FIX #3 + FIX #6: Prologue/epilogue use corrected frame layout.
+//
+// FIX #8: Prologue loads PPC_ARM_R15 from the block's known
+// armPC rather than from the interpreter's R15 field (which may
+// be ahead by the pipeline depth and conflicts with the per-
+// instruction PC update emitted in the compile loop).
 // ============================================================
 static void emit_prologue(EmitCtx& ctx, Interpreter* interp, Core* core) {
-    ctx.emit(ppc_stwu(1, -FRAME_SIZE, 1));
+    // Allocate frame (16-byte aligned, back-chain written by stwu)
+    ctx.emit(ppc_stwu(1, -(int16_t)FRAME_SIZE, 1));
+
+    // Save LR
     ctx.emit(ppc_mflr(0));
     ctx.emit(ppc_stw(0, FRAME_LR, 1));
+
+    // Save non-volatile regs r14..r26
     for (int r = 14; r <= 26; r++)
         ctx.emit(ppc_stw(r, FRAME_R14 + (r - 14) * 4, 1));
 
+    // Load interpreter and core pointers into dedicated regs
     int n = emit_li32(ctx.cur, PPC_INTERP, (uint32_t)(uintptr_t)interp);
     ctx.cur += n;
     n = emit_li32(ctx.cur, PPC_CORE, (uint32_t)(uintptr_t)core);
     ctx.cur += n;
+
+    // FIX #8: set PPC_ARM_R15 to the block's starting PC here.
+    // The compile loop will overwrite it per-instruction with the
+    // correct architectural value (pc+8 ARM / pc+4 Thumb).
+    n = emit_li32(ctx.cur, PPC_ARM_R15, ctx.armPC);
+    ctx.cur += n;
 }
 
 static void emit_epilogue(EmitCtx& ctx) {
+    // Restore non-volatile regs r14..r26
     for (int r = 14; r <= 26; r++)
         ctx.emit(ppc_lwz(r, FRAME_R14 + (r - 14) * 4, 1));
+
+    // Restore LR and deallocate frame
     ctx.emit(ppc_lwz(0, FRAME_LR, 1));
     ctx.emit(ppc_mtlr(0));
-    ctx.emit(ppc_addi(1, 1, FRAME_SIZE));
+    ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));
     ctx.emit(ppc_blr());
 }
 
 // ============================================================
 // Sync helpers emitted inline
 // ============================================================
+
+// Spill all ARM regs (R0-R15) + CPSR into the frame sync area,
+// then call JitPpc_syncToInterp to write them through the
+// register pointer array.
 static void emit_syncToInterp(EmitCtx& ctx) {
-    // Spill all ARM regs + CPSR into stack frame scratch area
+    // Spill ARM R0-R14 and R15 and CPSR to sync area on stack
     for (int i = 0; i < 16; i++)
         ctx.emit(ppc_stw(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
     ctx.emit(ppc_stw(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
 
-    // Call JitPpc_syncToInterp(interp, &frame[FRAME_REGSYNC])
+    // JitPpc_syncToInterp(interp, &frame[FRAME_REGSYNC])
     ctx.emit(ppc_mr(3, PPC_INTERP));
-    ctx.emit(ppc_addi(4, 1, FRAME_REGSYNC));
+    ctx.emit(ppc_addi(4, 1, (int16_t)FRAME_REGSYNC));
     emit_call(ctx, (void*)JitPpc_syncToInterp);
 }
 
+// Call JitPpc_syncFromInterp to read R0-R14 + CPSR back from
+// the interpreter (R15 is deliberately skipped by the C helper).
+// Then reload all mapped regs from the sync area.
 static void emit_syncFromInterp(EmitCtx& ctx) {
-    // Call JitPpc_syncFromInterp(interp, &frame[FRAME_REGSYNC])
+    // JitPpc_syncFromInterp(interp, &frame[FRAME_REGSYNC])
     ctx.emit(ppc_mr(3, PPC_INTERP));
-    ctx.emit(ppc_addi(4, 1, FRAME_REGSYNC));
+    ctx.emit(ppc_addi(4, 1, (int16_t)FRAME_REGSYNC));
     emit_call(ctx, (void*)JitPpc_syncFromInterp);
 
-    // Reload ARM regs + CPSR from frame
-    for (int i = 0; i < 16; i++)
+    // Reload ARM R0-R14 from sync area (R15 not reloaded here;
+    // it was set in the prologue and is refreshed per-instruction)
+    for (int i = 0; i < 15; i++)
         ctx.emit(ppc_lwz(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
     ctx.emit(ppc_lwz(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
 }
 
 // ============================================================
-// CPSR flag update helpers
+// CPSR flag update helpers  (unchanged from original)
 // ============================================================
-
-// Update N and Z in PPC_CPSR from `result` register.
-// IBM bit notation: bit0=MSB. C++ bit31=IBM bit0, C++ bit30=IBM bit1, etc.
-// CPSR N = C++ bit31 = IBM bit0
-// CPSR Z = C++ bit30 = IBM bit1
 static void emit_updateNZ(EmitCtx& ctx, uint8_t result) {
-    // Clear N (IBM 0) and Z (IBM 1) = C++ bits 31, 30
-    // rlwinm with IBM mb=2,me=31 keeps IBM bits 2..31 = C++ bits 29..0
     ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 2, 31));
-
-    // Insert N: copy result[IBM0]=C++bit31 into CPSR[IBM0]
     ctx.emit(ppc_rlwimi(PPC_CPSR, result, 0, 0, 0));
-
-    // Compute Z: cmpwi result,0 sets CR0[EQ]
     ctx.emit(ppc_cmpi(0, result, 0));
     ctx.emit(ppc_mfcr(PPC_TMP0));
-    // CR0[EQ] = C++ bit29 of mfcr value.
-    // We need it at CPSR C++ bit30.
-    // Rotate left by 1: C++bit29 -> C++bit30, then mask.
     ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 1, 30, 30));
     ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));
 }
 
-// Update C from XER[CA] (set by addc/adde/subfc/subfe)
-// XER[CA] = C++ bit29 of XER.
-// CPSR C  = C++ bit29 of CPSR.
 static void emit_updateC_fromXER(EmitCtx& ctx) {
     ctx.emit(ppc_mfxer(PPC_TMP0));
-    // Isolate XER[CA] at C++ bit29
     ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 0, 2, 2));
-    // Clear CPSR[C] (IBM bit2 = C++ bit29):
-    // rlwinm IBM mb=3,me=1 wraps: keeps IBM 3..31 and 0..1, clears IBM 2
     ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 3, 1));
     ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));
 }
 
-// Update V from XER[OV] (set by addo/subfo)
-// XER[OV] = C++ bit30 of XER.
-// CPSR V  = C++ bit28.
 static void emit_updateV_fromXER(EmitCtx& ctx) {
     ctx.emit(ppc_mfxer(PPC_TMP0));
-    // XER[OV] at C++ bit30 -> shift right 2 -> C++ bit28
     ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 30, 29, 29));
-    // Clear CPSR[V] (IBM bit3 = C++ bit28):
-    // rlwinm IBM mb=4,me=2 wraps: keeps IBM 4..31,0..2, clears IBM 3
     ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 4, 2));
     ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));
 }
 
-// Full NZCV update after an add with carry/overflow tracking
-// Requires: operation used addc/adde (sets XER[CA]) and addo (sets XER[OV])
 static void emit_updateNZCV_add(EmitCtx& ctx, uint8_t result) {
     emit_updateNZ(ctx, result);
     emit_updateC_fromXER(ctx);
     emit_updateV_fromXER(ctx);
 }
 
-// Full NZCV update after a subtract
-// ARM SUB C = NOT borrow. PPC subfc sets XER[CA] = NOT borrow. ✓
 static void emit_updateNZCV_sub(EmitCtx& ctx, uint8_t result) {
     emit_updateNZ(ctx, result);
     emit_updateC_fromXER(ctx);
     emit_updateV_fromXER(ctx);
 }
 
-// Update C from PPC_TMP1 bit0 (carry out of shift)
 static void emit_updateC_fromTMP1(EmitCtx& ctx) {
-    // PPC_TMP1 bit0 -> CPSR C++ bit29
     ctx.emit(ppc_rlwinm(PPC_TMP2, PPC_TMP1, 29, 29, 29));
-    ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 3, 1));  // clear CPSR[C]
+    ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 3, 1));
     ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP2));
 }
 
 // ============================================================
-// ARM Immediate operand decoder
+// ARM Immediate operand decoder  (unchanged)
 // ============================================================
 static uint32_t armImm(uint32_t opcode) {
     uint32_t imm = opcode & 0xFF;
@@ -1853,17 +1850,14 @@ static uint32_t armImm(uint32_t opcode) {
 }
 
 // ============================================================
-// Shift / rotate helpers
+// Shift / rotate helpers  (unchanged)
 // ============================================================
-
 static void emit_lsl_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
                           bool setCarry = false) {
     if (imm == 0) {
         if (dst != src) ctx.emit(ppc_mr(dst, src));
-        if (setCarry) {
-            // carry unchanged; extract C from CPSR
+        if (setCarry)
             ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 3, 31, 31));
-        }
     } else if (imm < 32) {
         if (setCarry)
             ctx.emit(ppc_rlwinm(PPC_TMP1, src, imm, 31, 31));
@@ -1910,17 +1904,17 @@ static void emit_asr_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
 static void emit_ror_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
                           bool setCarry = false) {
     if (imm == 0) {
-        // RRX: rotate right 1 through carry
-        ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 3, 31, 31)); // old carry -> TMP1 bit0
+        // RRX
+        ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 3, 31, 31));
         if (setCarry)
-            ctx.emit(ppc_rlwinm(PPC_TMP0, src, 0, 31, 31));   // new carry = bit0 of src
-        ctx.emit(ppc_rlwinm(dst, src, 31, 1, 31));             // dst = src >> 1
-        ctx.emit(ppc_rlwimi(dst, PPC_TMP1, 31, 0, 0));         // dst |= carry << 31
+            ctx.emit(ppc_rlwinm(PPC_TMP0, src, 0, 31, 31));
+        ctx.emit(ppc_rlwinm(dst, src, 31, 1, 31));
+        ctx.emit(ppc_rlwimi(dst, PPC_TMP1, 31, 0, 0));
         if (setCarry)
             ctx.emit(ppc_mr(PPC_TMP1, PPC_TMP0));
     } else {
         imm &= 31;
-        if (imm == 0) imm = 32; // ror by 32 = identity but carry = bit31
+        if (imm == 0) imm = 32;
         if (setCarry)
             ctx.emit(ppc_rlwinm(PPC_TMP1, src, 33 - imm, 31, 31));
         ctx.emit(ppc_rlwinm(dst, src, 32 - imm, 0, 31));
@@ -1929,7 +1923,7 @@ static void emit_ror_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
 
 static void emit_lsl_reg(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t shiftReg,
                           bool setCarry = false) {
-    if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0)); // simplified: carry=0
+    if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
     ctx.emit(ppc_slw(dst, src, shiftReg));
 }
 
@@ -1947,16 +1941,11 @@ static void emit_asr_reg(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t shiftRe
 
 static void emit_ror_reg(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t shiftReg,
                           bool setCarry = false) {
-    // ror dst,src,shiftReg  =  rlwnm dst,src,(32-shiftReg),0,31
-    // Compute (32 - shiftReg) using subfic (rt = 32 - ra)
     if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
-    ctx.emit(ppc_subfic(PPC_TMP0, shiftReg, 32));   // TMP0 = 32 - shiftReg
+    ctx.emit(ppc_subfic(PPC_TMP0, shiftReg, 32));
     ctx.emit(ppc_rlwnm(dst, src, PPC_TMP0, 0, 31));
 }
 
-// ============================================================
-// Shifter operand decoder
-// ============================================================
 static bool emit_shifterOp(EmitCtx& ctx, uint32_t opcode, uint8_t dstReg,
                             bool setCarry, bool& outCarryValid) {
     outCarryValid = setCarry;
@@ -1986,15 +1975,14 @@ static bool emit_shifterOp(EmitCtx& ctx, uint32_t opcode, uint8_t dstReg,
     if (!isRegShift) {
         uint8_t shiftAmt = (opcode >> 7) & 0x1F;
         switch (shiftType) {
-            case 0: emit_lsl_imm(ctx, dstReg, ppcRm, shiftAmt, setCarry);                          break;
-            case 1: emit_lsr_imm(ctx, dstReg, ppcRm, shiftAmt ? shiftAmt : 32, setCarry);          break;
-            case 2: emit_asr_imm(ctx, dstReg, ppcRm, shiftAmt ? shiftAmt : 32, setCarry);          break;
-            case 3: emit_ror_imm(ctx, dstReg, ppcRm, shiftAmt, setCarry);                          break;
+            case 0: emit_lsl_imm(ctx, dstReg, ppcRm, shiftAmt, setCarry);                 break;
+            case 1: emit_lsr_imm(ctx, dstReg, ppcRm, shiftAmt ? shiftAmt : 32, setCarry); break;
+            case 2: emit_asr_imm(ctx, dstReg, ppcRm, shiftAmt ? shiftAmt : 32, setCarry); break;
+            case 3: emit_ror_imm(ctx, dstReg, ppcRm, shiftAmt, setCarry);                 break;
         }
     } else {
         uint8_t rs    = (opcode >> 8) & 0xF;
         uint8_t ppcRs = ARM_TO_PPC[rs];
-        // Use only low 8 bits of Rs
         ctx.emit(ppc_rlwinm(PPC_TMP2, ppcRs, 0, 24, 31));
         ctx.emit(ppc_mr(PPC_TMP3, ppcRm));
         switch (shiftType) {
@@ -2003,13 +1991,13 @@ static bool emit_shifterOp(EmitCtx& ctx, uint32_t opcode, uint8_t dstReg,
             case 2: emit_asr_reg(ctx, dstReg, PPC_TMP3, PPC_TMP2, setCarry); break;
             case 3: emit_ror_reg(ctx, dstReg, PPC_TMP3, PPC_TMP2, setCarry); break;
         }
-        outCarryValid = false; // variable-shift carry not fully tracked
+        outCarryValid = false;
     }
     return true;
 }
 
 // ============================================================
-// Data processing
+// Data processing  (branch patching uses corrected mask)
 // ============================================================
 enum ArmDpOp {
     DP_AND=0, DP_EOR=1, DP_SUB=2, DP_RSB=3,
@@ -2018,6 +2006,16 @@ enum ArmDpOp {
     DP_ORR=12, DP_MOV=13, DP_BIC=14, DP_MVN=15
 };
 
+// ============================================================
+// FIX #5: Corrected branch offset patch helper.
+// BC format: bits[15:2] hold the 14-bit signed word offset.
+// Mask 0xFFFF0003 clears the BD field; (off & 0xFFFC) fills it.
+// ============================================================
+static void patchBranchOffset(EmitCtx& ctx, size_t branchIdx, size_t targetIdx) {
+    int32_t off = (int32_t)((targetIdx - branchIdx) * 4);
+    ctx.base[branchIdx] = (ctx.base[branchIdx] & 0xFFFF0003u) | (uint32_t)(off & 0xFFFC);
+}
+
 static bool emit_dataProc(EmitCtx& ctx, uint32_t opcode) {
     uint8_t cond  = (opcode >> 28) & 0xF;
     uint8_t dpOp  = (opcode >> 21) & 0xF;
@@ -2025,13 +2023,12 @@ static bool emit_dataProc(EmitCtx& ctx, uint32_t opcode) {
     uint8_t rn    = (opcode >> 16) & 0xF;
     uint8_t rd    = (opcode >> 12) & 0xF;
 
-    if (rd == 15 && setCC) return false; // CPSR restore
-    if (rd == 15)          return false; // PC write - end block, complex
+    if (rd == 15 && setCC) return false;
+    if (rd == 15)          return false;
 
     uint8_t ppcRd = ARM_TO_PPC[rd];
     uint8_t ppcRn = ARM_TO_PPC[rn];
 
-    // Condition gating
     size_t condBranchIdx = 0;
     bool   hasCondBranch = false;
     if (cond != 14) {
@@ -2054,9 +2051,8 @@ static bool emit_dataProc(EmitCtx& ctx, uint32_t opcode) {
     if (!emit_shifterOp(ctx, opcode, PPC_TMP0, needShiftCarry, carryValid))
         return false;
 
-    // Carry into XER for ADC/SBC/RSC
     if (needCarry) {
-        ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 0, 2, 2)); // isolate CPSR[C] at C++ bit29
+        ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 0, 2, 2));
         ctx.emit(ppc_mtxer(PPC_TMP1));
     }
 
@@ -2066,74 +2062,53 @@ static bool emit_dataProc(EmitCtx& ctx, uint32_t opcode) {
 
     switch ((ArmDpOp)dpOp) {
         case DP_AND: case DP_TST:
-            ctx.emit(ppc_and(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_and(resReg, ppcRn, PPC_TMP0)); break;
         case DP_EOR: case DP_TEQ:
-            ctx.emit(ppc_xor(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_xor(resReg, ppcRn, PPC_TMP0)); break;
         case DP_SUB: case DP_CMP:
-            // subfc: resReg = ppcRn - PPC_TMP0, sets XER[CA]=NOT borrow
-            ctx.emit(ppc_subfc(resReg, PPC_TMP0, ppcRn));
-            break;
+            ctx.emit(ppc_subfc(resReg, PPC_TMP0, ppcRn)); break;
         case DP_RSB:
-            ctx.emit(ppc_subfc(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_subfc(resReg, ppcRn, PPC_TMP0)); break;
         case DP_ADD: case DP_CMN:
-            ctx.emit(ppc_addc(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_addc(resReg, ppcRn, PPC_TMP0)); break;
         case DP_ADC:
-            ctx.emit(ppc_adde(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_adde(resReg, ppcRn, PPC_TMP0)); break;
         case DP_SBC:
-            // ARM SBC: rd = rn - op2 - NOT(C)  =>  subfe rd, op2, rn  (uses XER[CA]=C)
-            ctx.emit(ppc_subfe(resReg, PPC_TMP0, ppcRn));
-            break;
+            ctx.emit(ppc_subfe(resReg, PPC_TMP0, ppcRn)); break;
         case DP_RSC:
-            ctx.emit(ppc_subfe(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_subfe(resReg, ppcRn, PPC_TMP0)); break;
         case DP_ORR:
-            ctx.emit(ppc_or(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_or(resReg, ppcRn, PPC_TMP0)); break;
         case DP_MOV:
-            if (resReg != PPC_TMP0)
-                ctx.emit(ppc_mr(resReg, PPC_TMP0));
-            break;
+            if (resReg != PPC_TMP0) ctx.emit(ppc_mr(resReg, PPC_TMP0)); break;
         case DP_BIC:
-            ctx.emit(ppc_andc(resReg, ppcRn, PPC_TMP0));
-            break;
+            ctx.emit(ppc_andc(resReg, ppcRn, PPC_TMP0)); break;
         case DP_MVN:
-            ctx.emit(ppc_nor(resReg, PPC_TMP0, PPC_TMP0));
-            break;
+            ctx.emit(ppc_nor(resReg, PPC_TMP0, PPC_TMP0)); break;
     }
 
     if (setCC) {
         switch ((ArmDpOp)dpOp) {
-            case DP_ADD: case DP_CMN:
-            case DP_ADC:
-                emit_updateNZCV_add(ctx, resReg);
-                break;
-            case DP_SUB: case DP_CMP:
-            case DP_RSB: case DP_SBC: case DP_RSC:
-                emit_updateNZCV_sub(ctx, resReg);
-                break;
+            case DP_ADD: case DP_CMN: case DP_ADC:
+                emit_updateNZCV_add(ctx, resReg); break;
+            case DP_SUB: case DP_CMP: case DP_RSB:
+            case DP_SBC: case DP_RSC:
+                emit_updateNZCV_sub(ctx, resReg); break;
             default:
                 emit_updateNZ(ctx, resReg);
-                if (carryValid)
-                    emit_updateC_fromTMP1(ctx);
+                if (carryValid) emit_updateC_fromTMP1(ctx);
                 break;
         }
     }
 
-    if (hasCondBranch) {
-        size_t endIdx    = ctx.size();
-        int32_t off      = (int32_t)(endIdx - condBranchIdx) * 4;
-        ctx.base[condBranchIdx] = (ctx.base[condBranchIdx] & ~0xFFFC) | (uint32_t)(off & 0xFFFC);
-    }
+    if (hasCondBranch)
+        patchBranchOffset(ctx, condBranchIdx, ctx.size());
+
     return true;
 }
 
 // ============================================================
-// Branch instructions
+// Branch instructions  (uses patchBranchOffset)
 // ============================================================
 static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
     uint8_t cond = (opcode >> 28) & 0xF;
@@ -2157,19 +2132,16 @@ static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
             }
         }
 
-        // Update CPSR T bit from Rm[0]
-        ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 27, 25)); // clear T (IBM bit26=C++bit5)
-        ctx.emit(ppc_rlwinm(PPC_TMP0, ppcRm, 5, 26, 26));     // Rm[0] -> bit5
+        ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 27, 25));
+        ctx.emit(ppc_rlwinm(PPC_TMP0, ppcRm, 5, 26, 26));
         ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));
-        ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRm, 0, 0, 30));   // PC = Rm & ~1
+        ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRm, 0, 0, 30));
 
         emit_syncToInterp(ctx);
 
-        if (hasCondBranch) {
-            size_t endIdx = ctx.size();
-            int32_t off   = (int32_t)(endIdx - condBranchIdx) * 4;
-            ctx.base[condBranchIdx] = (ctx.base[condBranchIdx] & ~0xFFFC) | (uint32_t)(off & 0xFFFC);
-        }
+        if (hasCondBranch)
+            patchBranchOffset(ctx, condBranchIdx, ctx.size());
+
         return true;
     }
 
@@ -2201,11 +2173,9 @@ static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
 
         emit_syncToInterp(ctx);
 
-        if (hasCondBranch) {
-            size_t endIdx = ctx.size();
-            int32_t off   = (int32_t)(endIdx - condBranchIdx) * 4;
-            ctx.base[condBranchIdx] = (ctx.base[condBranchIdx] & ~0xFFFC) | (uint32_t)(off & 0xFFFC);
-        }
+        if (hasCondBranch)
+            patchBranchOffset(ctx, condBranchIdx, ctx.size());
+
         return true;
     }
 
@@ -2213,7 +2183,8 @@ static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
 }
 
 // ============================================================
-// Load / Store (LDR, STR, LDRB, STRB)
+// FIX #7: Load/Store — result saved to non-volatile PPC_TMP0
+// before volatile regs are restored, avoiding overwrite.
 // ============================================================
 static bool emit_loadStore(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
     uint8_t cond    = (opcode >> 28) & 0xF;
@@ -2244,7 +2215,7 @@ static bool emit_loadStore(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
         }
     }
 
-    // Compute offset -> PPC_TMP0
+    // Compute offset into PPC_TMP0
     if (immOff) {
         uint32_t offset = opcode & 0xFFF;
         int n = emit_li32(ctx.cur, PPC_TMP0, offset);
@@ -2252,11 +2223,10 @@ static bool emit_loadStore(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
     } else {
         uint8_t rm    = opcode & 0xF;
         uint8_t ppcRm = ARM_TO_PPC[rm];
-        // Simple register offset (ignore shift encoding for now)
         ctx.emit(ppc_mr(PPC_TMP0, ppcRm));
     }
 
-    // Effective address -> PPC_TMP1
+    // Effective address into PPC_TMP1
     if (preIdx) {
         if (isUp)
             ctx.emit(ppc_add(PPC_TMP1, ppcRn, PPC_TMP0));
@@ -2266,11 +2236,13 @@ static bool emit_loadStore(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
         ctx.emit(ppc_mr(PPC_TMP1, ppcRn));
     }
 
-    // Save volatile ARM regs (PPC r3-r10) around the C call
-    static const int VSAVE = FRAME_REGSYNC; // reuse sync area (safe: not active here)
+    // Save volatile ARM regs (r3-r10) around the C call.
+    // We use FRAME_REGSYNC for this; it is safe here because
+    // emit_syncToInterp/syncFromInterp are not active at this point.
     for (int i = 0; i < 8; i++)
-        ctx.emit(ppc_stw(3 + i, VSAVE + i * 4, 1));
+        ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));
 
+    // Set up call arguments
     ctx.emit(ppc_mr(3, PPC_CORE));
     ctx.emit(ppc_addi(4, 0, ctx.arm7 ? 1 : 0));
     ctx.emit(ppc_mr(5, PPC_TMP1));
@@ -2286,19 +2258,19 @@ static bool emit_loadStore(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
 
     emit_call(ctx, memFn);
 
-    // Stash return value before restoring volatile regs
+    // FIX #7: Save the load result into PPC_TMP0 (r25, non-volatile)
+    // BEFORE restoring volatile regs. This prevents the restore from
+    // overwriting r3 (which holds the result) before we copy it out.
     if (isLoad)
-        ctx.emit(ppc_stw(3, VSAVE + 0 * 4, 1)); // overwrite slot 0 with result
+        ctx.emit(ppc_mr(PPC_TMP0, 3));   // PPC_TMP0 = r25 (non-volatile, safe)
 
+    // Restore volatile ARM regs
     for (int i = 0; i < 8; i++)
-        ctx.emit(ppc_lwz(3 + i, VSAVE + i * 4, 1));
+        ctx.emit(ppc_lwz(3 + i, FRAME_REGSYNC + i * 4, 1));
 
-    if (isLoad) {
-        // Result was written to VSAVE+0; now it's in r3 after reload.
-        // If ppcRd != r3 copy it across.
-        if (ppcRd != 3)
-            ctx.emit(ppc_mr(ppcRd, 3));
-    }
+    // Now copy result from the non-volatile holding reg to destination
+    if (isLoad)
+        ctx.emit(ppc_mr(ppcRd, PPC_TMP0));
 
     // Write-back
     if (!preIdx) {
@@ -2310,16 +2282,14 @@ static bool emit_loadStore(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
         ctx.emit(ppc_mr(ppcRn, PPC_TMP1));
     }
 
-    if (hasCondBranch) {
-        size_t endIdx = ctx.size();
-        int32_t off   = (int32_t)(endIdx - condBranchIdx) * 4;
-        ctx.base[condBranchIdx] = (ctx.base[condBranchIdx] & ~0xFFFC) | (uint32_t)(off & 0xFFFC);
-    }
+    if (hasCondBranch)
+        patchBranchOffset(ctx, condBranchIdx, ctx.size());
+
     return true;
 }
 
 // ============================================================
-// Multiply
+// Multiply  (unchanged)
 // ============================================================
 static bool emit_multiply(EmitCtx& ctx, uint32_t opcode) {
     bool    setCC = (opcode >> 20) & 1;
@@ -2331,7 +2301,7 @@ static bool emit_multiply(EmitCtx& ctx, uint32_t opcode) {
     bool    isLong= (opcode >> 23) & 1;
 
     if (rd == 15 || rm == 15 || rs == 15) return false;
-    if (isLong) return false; // UMULL/SMULL/UMLAL/SMLAL - fall back
+    if (isLong) return false;
 
     uint8_t ppcRd = ARM_TO_PPC[rd];
     uint8_t ppcRn = ARM_TO_PPC[rn];
@@ -2356,15 +2326,13 @@ static bool emit_multiply(EmitCtx& ctx, uint32_t opcode) {
 // ============================================================
 static void emit_interpFallback(EmitCtx& ctx) {
     emit_syncToInterp(ctx);
-
     ctx.emit(ppc_mr(3, PPC_INTERP));
     emit_call(ctx, (void*)JitPpc_interpFallback);
-
     emit_syncFromInterp(ctx);
 }
 
 // ============================================================
-// Thumb emitters
+// Thumb emitters  (patchBranchOffset used throughout)
 // ============================================================
 static bool emit_thumb_lslImm(EmitCtx& ctx, uint16_t opcode) {
     uint8_t rd  = (opcode >> 0) & 7;
@@ -2433,7 +2401,7 @@ static bool emit_thumb_movImm(EmitCtx& ctx, uint16_t opcode) {
 }
 
 static bool emit_thumb_cmpImm(EmitCtx& ctx, uint16_t opcode) {
-    uint8_t rs  = (opcode >> 8) & 7;
+    uint8_t rs   = (opcode >> 8) & 7;
     uint32_t imm = opcode & 0xFF;
     int n = emit_li32(ctx.cur, PPC_TMP0, imm);
     ctx.cur += n;
@@ -2470,10 +2438,10 @@ static bool emit_thumb_aluOp(EmitCtx& ctx, uint16_t opcode) {
     uint8_t ppcRs = ARM_TO_PPC[rs];
 
     switch (op) {
-        case 0:  ctx.emit(ppc_and(ppcRd, ppcRd, ppcRs)); emit_updateNZ(ctx, ppcRd); break;
-        case 1:  ctx.emit(ppc_xor(ppcRd, ppcRd, ppcRs)); emit_updateNZ(ctx, ppcRd); break;
-        case 2:  ctx.emit(ppc_slw(ppcRd, ppcRd, ppcRs)); emit_updateNZ(ctx, ppcRd); break;
-        case 3:  ctx.emit(ppc_srw(ppcRd, ppcRd, ppcRs)); emit_updateNZ(ctx, ppcRd); break;
+        case 0:  ctx.emit(ppc_and(ppcRd, ppcRd, ppcRs));  emit_updateNZ(ctx, ppcRd); break;
+        case 1:  ctx.emit(ppc_xor(ppcRd, ppcRd, ppcRs));  emit_updateNZ(ctx, ppcRd); break;
+        case 2:  ctx.emit(ppc_slw(ppcRd, ppcRd, ppcRs));  emit_updateNZ(ctx, ppcRd); break;
+        case 3:  ctx.emit(ppc_srw(ppcRd, ppcRd, ppcRs));  emit_updateNZ(ctx, ppcRd); break;
         case 4:  ctx.emit(ppc_sraw(ppcRd, ppcRd, ppcRs)); emit_updateNZ(ctx, ppcRd); break;
         case 5: {
             ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_CPSR, 0, 2, 2));
@@ -2514,10 +2482,10 @@ static bool emit_thumb_aluOp(EmitCtx& ctx, uint16_t opcode) {
             emit_updateNZCV_add(ctx, PPC_TMP0);
             break;
         }
-        case 12: ctx.emit(ppc_or(ppcRd, ppcRd, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
-        case 13: ctx.emit(ppc_mullw(ppcRd, ppcRd, ppcRs)); emit_updateNZ(ctx, ppcRd); break;
-        case 14: ctx.emit(ppc_andc(ppcRd, ppcRd, ppcRs));  emit_updateNZ(ctx, ppcRd); break;
-        case 15: ctx.emit(ppc_nor(ppcRd, ppcRs, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
+        case 12: ctx.emit(ppc_or(ppcRd, ppcRd, ppcRs));    emit_updateNZ(ctx, ppcRd); break;
+        case 13: ctx.emit(ppc_mullw(ppcRd, ppcRd, ppcRs));  emit_updateNZ(ctx, ppcRd); break;
+        case 14: ctx.emit(ppc_andc(ppcRd, ppcRd, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
+        case 15: ctx.emit(ppc_nor(ppcRd, ppcRs, ppcRs));    emit_updateNZ(ctx, ppcRd); break;
         default: return false;
     }
     return true;
@@ -2560,25 +2528,25 @@ static bool emit_thumb_ldrPc(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
     uint32_t off  = (opcode & 0xFF) << 2;
     uint32_t addr = ((pc + 4) & ~3u) + off;
 
-    int n = emit_li32(ctx.cur, PPC_TMP0, addr);
+    int n = emit_li32(ctx.cur, PPC_TMP1, addr);
     ctx.cur += n;
 
-    static const int VSAVE = FRAME_REGSYNC;
+    // Save volatile regs
     for (int i = 0; i < 8; i++)
-        ctx.emit(ppc_stw(3 + i, VSAVE + i * 4, 1));
+        ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));
 
     ctx.emit(ppc_mr(3, PPC_CORE));
     ctx.emit(ppc_addi(4, 0, ctx.arm7 ? 1 : 0));
-    ctx.emit(ppc_mr(5, PPC_TMP0));
+    ctx.emit(ppc_mr(5, PPC_TMP1));
     emit_call(ctx, (void*)JitPpc_memRead32);
 
-    ctx.emit(ppc_stw(3, VSAVE + 0 * 4, 1));
-    for (int i = 1; i < 8; i++)
-        ctx.emit(ppc_lwz(3 + i, VSAVE + i * 4, 1));
-    ctx.emit(ppc_lwz(ARM_TO_PPC[rd], VSAVE, 1));
-    if (ARM_TO_PPC[rd] != 3)
-        ctx.emit(ppc_lwz(3, VSAVE, 1));
+    // FIX #7 applied here too: save result before restoring volatiles
+    ctx.emit(ppc_mr(PPC_TMP0, 3));
 
+    for (int i = 0; i < 8; i++)
+        ctx.emit(ppc_lwz(3 + i, FRAME_REGSYNC + i * 4, 1));
+
+    ctx.emit(ppc_mr(ARM_TO_PPC[rd], PPC_TMP0));
     return true;
 }
 
@@ -2608,7 +2576,7 @@ static bool emit_thumb_branch(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
     CondBranch cb = armCondToPpc(cond);
     if (!cb.valid) return false;
 
-    // Skip body if condition NOT met
+    // Skip taken path if condition NOT met
     size_t condBranchIdx = ctx.size();
     ctx.emit(ppc_bc((cb.bo == 12) ? 4 : 12, cb.bi, 0));
 
@@ -2617,25 +2585,21 @@ static bool emit_thumb_branch(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
     ctx.cur += n;
     emit_syncToInterp(ctx);
 
-    // Jump past fall-through
+    // Jump past fall-through path
     size_t skipIdx = ctx.size();
     ctx.emit(ppc_b(0));
 
-    // Patch condition branch to here
-    {
-        size_t bodyStart = ctx.size();
-        int32_t off = (int32_t)(bodyStart - condBranchIdx) * 4;
-        ctx.base[condBranchIdx] = (ctx.base[condBranchIdx] & ~0xFFFC) | (uint32_t)(off & 0xFFFC);
-    }
+    // Patch condition branch to point here (start of fall-through)
+    patchBranchOffset(ctx, condBranchIdx, ctx.size());
 
     // Fall-through path
     n = emit_li32(ctx.cur, PPC_ARM_R15, fallthrough);
     ctx.cur += n;
 
-    // Patch skip branch
+    // Patch unconditional skip branch to point to end
     {
         size_t endIdx = ctx.size();
-        int32_t off   = (int32_t)(endIdx - skipIdx) * 4;
+        int32_t off   = (int32_t)((endIdx - skipIdx) * 4);
         ctx.base[skipIdx] = ppc_b(off);
     }
 
@@ -2656,8 +2620,8 @@ static bool emit_thumb_bl(EmitCtx& ctx, uint16_t op1, uint16_t op2, uint32_t pc)
     // BLX: switch to ARM mode
     uint8_t botBits = (op2 >> 11) & 0x1F;
     if (botBits == 0x1C) {
-        ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 27, 25)); // clear T
-        ctx.emit(ppc_rlwinm(PPC_ARM_R15, PPC_ARM_R15, 0, 0, 29)); // align to 4
+        ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 27, 25));
+        ctx.emit(ppc_rlwinm(PPC_ARM_R15, PPC_ARM_R15, 0, 0, 29));
     }
 
     emit_syncToInterp(ctx);
@@ -2665,25 +2629,22 @@ static bool emit_thumb_bl(EmitCtx& ctx, uint16_t op1, uint16_t op2, uint32_t pc)
 }
 
 // ============================================================
-// ARM instruction dispatch
+// ARM instruction dispatch  (unchanged logic)
 // ============================================================
 static bool emitARMInstr(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
-    uint8_t cond      = (opcode >> 28) & 0xF;
-    if (cond == 15)   return false; // unconditional instructions (complex)
+    uint8_t cond = (opcode >> 28) & 0xF;
+    if (cond == 15) return false;
 
     uint32_t instrType = (opcode >> 25) & 7;
 
     switch (instrType) {
         case 0:
         case 1: {
-            // Multiply: bits[27:24]=0000 and bits[7:4]=1001
             if ((opcode & 0x0FC000F0) == 0x00000090)
                 return emit_multiply(ctx, opcode);
-            // BX / BLX reg
             if ((opcode & 0x0FFFFFF0) == 0x012FFF10 ||
                 (opcode & 0x0FFFFFF0) == 0x012FFF30)
                 return emit_branch(ctx, opcode, pc);
-            // MSR/MRS/CLZ/etc. — fall back
             if ((opcode & 0x0FB00FF0) == 0x01000000 ||
                 (opcode & 0x0FB00000) == 0x03200000 ||
                 (opcode & 0x0DB0F000) == 0x010F0000)
@@ -2694,7 +2655,7 @@ static bool emitARMInstr(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
         case 3:
             return emit_loadStore(ctx, opcode, pc);
         case 4:
-            return false; // LDM/STM - fall back
+            return false; // LDM/STM
         case 5:
             return emit_branch(ctx, opcode, pc);
         case 6:
@@ -2708,7 +2669,7 @@ static bool emitARMInstr(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
 }
 
 // ============================================================
-// Thumb instruction dispatch
+// Thumb instruction dispatch  (unchanged)
 // ============================================================
 static bool emitThumbInstr(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
     uint8_t bits1514 = (opcode >> 14) & 3;
@@ -2732,15 +2693,15 @@ static bool emitThumbInstr(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
             if (bits10 == 0) return emit_thumb_aluOp(ctx, opcode);
             if (bits10 == 1) return emit_thumb_hiRegOp(ctx, opcode);
             if (bits1311 == 0x09) return emit_thumb_ldrPc(ctx, opcode, pc);
-            return false; // load/store register offset
+            return false;
         }
         case 2:
-            return false; // load/store with immediate offset / SP / push/pop
+            return false;
         case 3: {
             uint8_t bits1512 = (opcode >> 12) & 0xF;
             if (bits1512 == 0xD || bits1512 == 0xE)
                 return emit_thumb_branch(ctx, opcode, pc);
-            return false; // BL halves, SWI
+            return false;
         }
     }
     return false;
@@ -2753,7 +2714,7 @@ static JitBlock* compileBlock(Interpreter* interp, Core* core,
                                uint32_t armPC, bool arm7) {
     bool isThumb = interp->isThumb();
 
-    size_t bucket = hashPC(armPC);
+    size_t bucket  = hashPC(armPC);
     JitBlock& slot = blockCache[bucket];
     if (slot.valid && slot.armPC == armPC && slot.thumb == isThumb)
         return &slot;
@@ -2782,15 +2743,17 @@ static JitBlock* compileBlock(Interpreter* interp, Core* core,
          instrCount < (int)MAX_BLOCK_SIZE && !blockEnded;
          instrCount++) {
 
-        // Keep live PC up to date
+        // FIX #8: update PPC_ARM_R15 to the correct architectural
+        // value at the start of each instruction (after pipeline).
+        // ARM: PC reads return pc+8; Thumb: pc+4.
         int n = emit_li32(ctx.cur, PPC_ARM_R15, pc + (isThumb ? 4u : 8u));
         ctx.cur += n;
 
         if (isThumb) {
-            uint16_t top = core->memory.read<uint16_t>(arm7, pc);
+            uint16_t top     = core->memory.read<uint16_t>(arm7, pc);
+            uint8_t  bits1511 = (top >> 11) & 0x1F;
 
             // Detect BL/BLX pair
-            uint8_t bits1511 = (top >> 11) & 0x1F;
             if (bits1511 == 0x1E) {
                 uint16_t bot     = core->memory.read<uint16_t>(arm7, pc + 2);
                 uint8_t  botBits = (bot >> 11) & 0x1F;
@@ -2831,7 +2794,6 @@ static JitBlock* compileBlock(Interpreter* interp, Core* core,
         }
     }
 
-    // End-of-block sync
     emit_syncToInterp(ctx);
     emit_epilogue(ctx);
 
@@ -2877,45 +2839,25 @@ void runJitNds(Core& core) {
 }
 
 // ============================================================
-// Offset computation (called once at startup)
+// FIX #1: computeOffsets uses the real compiler-computed layout
+// via Interpreter's public static offset helpers. A diagnostic
+// print lets you verify the values match a manual dump.
 // ============================================================
 static void computeOffsets() {
-    // Layout of Interpreter (private fields, order matches interpreter.h):
-    //
-    //  public:
-    //    HleBios*  bios        @ 0   (4 B)
-    //    uint32_t  entryAddr   @ 4   (4 B)
-    //    uint8_t   halted      @ 8   (1 B) + 3 pad
-    //  private:
-    //    Core*     core        @ 12  (4 B)
-    //    bool      arm7        @ 16  (1 B) + 3 pad
-    //    uint8_t*  pcData      @ 20  (4 B)
-    //    uint32_t  pipeline[2] @ 24  (8 B)
-    //    uint32_t* registers[32] @ 32 (128 B)
-    //    uint32_t  registersUsr[16] @ 160 (64 B)
-    //    uint32_t  registersFiq[7]  @ 224 (28 B)
-    //    uint32_t  registersSvc[2]  @ 252 (8  B)
-    //    uint32_t  registersAbt[2]  @ 260 (8  B)
-    //    uint32_t  registersIrq[2]  @ 268 (8  B)
-    //    uint32_t  registersUnd[2]  @ 276 (8  B)
-    //    uint32_t  cpsr             @ 284 (4  B)
-    //    uint32_t* spsr             @ 288 (4  B)
-    //    uint32_t  spsrFiq          @ 292 (4  B)
-    //    uint32_t  spsrSvc          @ 296 (4  B)
-    //    uint32_t  spsrAbt          @ 300 (4  B)
-    //    uint32_t  spsrIrq          @ 304 (4  B)
-    //    uint32_t  spsrUnd          @ 308 (4  B)
-    //    uint32_t  cycles           @ 312 (4  B)
-    //    bool      dsiCycle         @ 316 (1  B) + 3 pad
-    //
-    // IMPORTANT: verify these offsets against the actual build with:
-    //   powerpc-eabi-objdump -d interpreter.o  (or add static_asserts via a helper method)
-    off_halted       = 8;
-    off_pcData       = 20;
-    off_pipeline     = 24;
-    off_registersUsr = 160;
-    off_cpsr         = 284;
-    off_cycles       = 312;
+    off_halted       = Interpreter::offset_halted();
+    off_pcData       = Interpreter::offset_pcData();
+    off_pipeline     = Interpreter::offset_pipeline();
+    off_registersUsr = Interpreter::offset_registersUsr();
+    off_cpsr         = Interpreter::offset_cpsr();
+    off_cycles       = Interpreter::offset_cycles();
+
+    printf("[JIT] Struct offsets:\n");
+    printf("[JIT]   halted       = %zu\n", off_halted);
+    printf("[JIT]   pcData       = %zu\n", off_pcData);
+    printf("[JIT]   pipeline     = %zu\n", off_pipeline);
+    printf("[JIT]   registersUsr = %zu\n", off_registersUsr);
+    printf("[JIT]   cpsr         = %zu\n", off_cpsr);
+    printf("[JIT]   cycles       = %zu\n", off_cycles);
 }
 
 // ============================================================
@@ -2924,7 +2866,6 @@ static void computeOffsets() {
 bool initJit() {
     computeOffsets();
 
-    // memalign is in <malloc.h> on Wii GCC
     codeBuffer = (uint32_t*)memalign(32, JIT_CODE_SIZE);
     if (!codeBuffer) {
         printf("[JIT] Failed to allocate %zu KB code buffer\n",
