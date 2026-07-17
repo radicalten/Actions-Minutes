@@ -2,13 +2,21 @@
 #pragma once
 #include <cstdint>
 #include <cstdlib>
-#include "core.h"
+
+class Core;
 
 namespace JitPpc {
-    bool initJit(Core* core);   // takes Core* so it can hook runFunc
+    // Core* overloads (preferred — hook runFunc automatically)
+    bool initJit(Core* core);
     void shutdownJit(Core* core);
+
+    // No-argument overloads for call sites that don't have a Core* handy.
+    // These skip the runFunc hook; caller must call core->setRunFunc() separately.
+    inline bool initJit()      { return initJit(nullptr); }
+    inline void shutdownJit()  { shutdownJit(nullptr);    }
+
     void runJitNds(Core& core);
-    void runJitGba(Core& core);  // separate GBA entry point
+    void runJitGba(Core& core);
     void invalidateJitRange(uint32_t start, uint32_t end);
     void flushJitCache();
 }
