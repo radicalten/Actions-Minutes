@@ -33,7 +33,7 @@ $(TARGET).elf: $(OBJECTS)
 %.o: %.cpp
 	$(CC) -c $< -o $@ $(CXXFLAGS)
 %.o: %.S
-	$(AS) -o $@ $(CXXFLAGS)
+	$(AS) -o $@
 clean:
 	rm -f $(TARGET).elf $(TARGET).dol $(TARGET).map $(OBJECTS)
 .PHONY: clean test
