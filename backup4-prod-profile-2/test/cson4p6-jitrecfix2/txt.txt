@@ -1,2 +1,15 @@
 Using the ppc_jit-v1.cpp as that was the best one from recfix1 as the base here. as nds games actually launch without crashing will gba games auto crash, I believe that will be the best option. 
 new interpreter.h from recfix1 with ppc_jit-v1.cpp as the base 
+
+==
+new crash behavior: almost identical to before but no thrd is 80356AA0 on gba emerald.
+instead of Thrd 803568E0
+
+My code compiles but when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356AA0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
