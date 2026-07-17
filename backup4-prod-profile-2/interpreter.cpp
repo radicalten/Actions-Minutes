@@ -522,3 +522,8 @@ void Interpreter::writePostFlg(uint8_t value) {
  int Interpreter::jitRunOpcode() {     
      return runOpcode(); 
  }
+
+void Interpreter::setPC(uint32_t newPC) {
+    *registers[15] = newPC;
+    flushPipeline();
+}
