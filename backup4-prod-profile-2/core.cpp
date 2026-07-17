@@ -14,9 +14,6 @@ extern "C" {
 extern void* Noods_MEM2_Alloc(size_t size);
 extern void  Noods_MEM2_Free(void* ptr);
 
-// ---------------------------------------------------------------------------
-// Custom allocators
-// ---------------------------------------------------------------------------
 void* Core::operator new(size_t size) {
     void* p = Noods_MEM2_Alloc(size);
     if (!p) throw std::bad_alloc();
@@ -30,9 +27,6 @@ void* Core::operator new[](size_t size) {
 }
 void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
 
-// ---------------------------------------------------------------------------
-// Constructor
-// ---------------------------------------------------------------------------
 Core::Core(std::string ndsRom, std::string gbaRom, int id,
            int ndsRomFd,  int gbaRomFd,
            int ndsSaveFd, int gbaSaveFd,
@@ -58,55 +52,39 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
       lastFpsTimeTicks(0),
       fpsCount(0)
 {
-    // ------------------------------------------------------------------
-    // Bind task table
-    // ------------------------------------------------------------------
     tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
     tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
-
     tasks[CART9_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 0);
     tasks[CART7_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 1);
-
     tasks[DMA9_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[0], 0);
     tasks[DMA9_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[0], 1);
     tasks[DMA9_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[0], 2);
     tasks[DMA9_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[0], 3);
-
     tasks[DMA7_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[1], 0);
     tasks[DMA7_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[1], 1);
     tasks[DMA7_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[1], 2);
     tasks[DMA7_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[1], 3);
-
     tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,    &gpu);
     tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,    &gpu);
     tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
     tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
-
     tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
-
     tasks[ARM9_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[0]);
     tasks[ARM7_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[1]);
-
     tasks[NDS_SPU_SAMPLE]   = SchedCallback(shim_spuSample,    &spu);
     tasks[GBA_SPU_SAMPLE]   = SchedCallback(shim_spuGbaSample, &spu);
-
     tasks[TIMER9_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[0], 0);
     tasks[TIMER9_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[0], 1);
     tasks[TIMER9_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[0], 2);
     tasks[TIMER9_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[0], 3);
-
     tasks[TIMER7_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[1], 0);
     tasks[TIMER7_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[1], 1);
     tasks[TIMER7_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[1], 2);
     tasks[TIMER7_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[1], 3);
-
     tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs,  &wifi);
     tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
     tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
 
-    // ------------------------------------------------------------------
-    // BIOS / firmware loading
-    // ------------------------------------------------------------------
     bool required = !Settings::directBoot ||
                     (ndsRom == "" && gbaRom == "" &&
                      ndsRomFd == -1 && gbaRomFd == -1);
@@ -116,9 +94,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     if (!spi.loadFirmware()  && required) throw ERROR_FIRM;
     realGbaBios = memory.loadGbaBios();
 
-    // ------------------------------------------------------------------
-    // Initial scheduling
-    // ------------------------------------------------------------------
     schedule(RESET_CYCLES,    0x7FFFFFFF);
     schedule(NDS_SCANLINE256, 256 * 6);
     schedule(NDS_SCANLINE355, 355 * 6);
@@ -126,23 +101,13 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
 
     dsiMode = Settings::dsiMode;
 
-    // ------------------------------------------------------------------
-    // JIT initialisation
-    //
-    // Pass `this` so initJit can immediately hook runFunc.
-    // initJit() must be called before updateRun() so that the first
-    // call to updateRun() already sees jitAvailable == true and can
-    // select the JIT run function.
-    // ------------------------------------------------------------------
-    jitAvailable = JitPpc::initJit(this);   // FIX: was initJit()
+    jitAvailable = JitPpc::initJit(this);
 
     if (jitAvailable)
         printf("[Core %d] JIT recompiler active\n", id);
     else
         printf("[Core %d] JIT unavailable — interpreter only\n", id);
 
-    // updateRun() reads jitAvailable; called after initJit() so the
-    // JIT path is selected immediately.
     updateRun();
 
     memory.updateMap9(0x00000000, 0xFFFFFFFF);
@@ -150,9 +115,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     interpreter[0].init();
     interpreter[1].init();
 
-    // ------------------------------------------------------------------
-    // GBA ROM
-    // ------------------------------------------------------------------
     if (gbaRom != "" || gbaRomFd != -1) {
         if (!cartridgeGba.setRom(gbaRom, gbaRomFd, gbaSaveFd, gbaStateFd, -1))
             throw ERROR_ROM;
@@ -163,9 +125,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         }
     }
 
-    // ------------------------------------------------------------------
-    // NDS ROM
-    // ------------------------------------------------------------------
     if (ndsRom != "" || ndsRomFd != -1) {
         if (!cartridgeNds.setRom(ndsRom, ndsRomFd, ndsSaveFd, ndsStateFd, ndsCheatFd))
             throw ERROR_ROM;
@@ -197,9 +156,6 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
         }
     }
 
-    // ------------------------------------------------------------------
-    // HLE ARM7
-    // ------------------------------------------------------------------
     if (!gbaMode && Settings::arm7Hle) {
         arm7Hle = true;
         hleArm7.init();
@@ -212,20 +168,13 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
     PPCIrqUnlockByMsr(st);
 }
 
-// ---------------------------------------------------------------------------
-// Destructor
-// ---------------------------------------------------------------------------
-Core::~Core()
-{
+Core::~Core() {
     if (jitAvailable) {
-        JitPpc::shutdownJit(this);   // FIX: was shutdownJit()
+        JitPpc::shutdownJit(this);
         jitAvailable = false;
     }
 }
 
-// ---------------------------------------------------------------------------
-// State save / load
-// ---------------------------------------------------------------------------
 void Core::saveState(FILE* file) {
     fwrite(&arm7Hle,      sizeof(arm7Hle),      1, file);
     fwrite(&dsiMode,      sizeof(dsiMode),      1, file);
@@ -259,27 +208,15 @@ void Core::loadState(FILE* file) {
     updateRun();
 }
 
-// ---------------------------------------------------------------------------
-// updateRun
-// ---------------------------------------------------------------------------
-void Core::updateRun()
-{
+void Core::updateRun() {
     void (*newFunc)(Core&) = nullptr;
 
     if (interpreter[0].halted && interpreter[1].halted) {
-        // Both halted: use the no-op loop regardless of JIT availability.
         newFunc = &Interpreter::runCoreNone;
     } else if (jitAvailable) {
-        // JIT is available: select JIT wrapper based on current mode.
-        // The JIT wrappers (runJitNds, runJitGba) internally check the
-        // halted flags per-CPU so we don't need per-halted-state variants.
-        if (gbaMode)
-            newFunc = &JitPpc::runJitGba;
-        else
-            newFunc = &JitPpc::runJitNds;
+        newFunc = gbaMode ? &JitPpc::runJitGba : &JitPpc::runJitNds;
     }
 
-    // Fallback to interpreter if JIT not available or not applicable.
     if (!newFunc) {
         if (gbaMode)
             newFunc = &Interpreter::runCoreSingle<true, 0>;
@@ -300,9 +237,6 @@ void Core::updateRun()
     PPCIrqUnlockByMsr(st);
 }
 
-// ---------------------------------------------------------------------------
-// resetCycles
-// ---------------------------------------------------------------------------
 void Core::resetCycles() {
     const size_t n = events.size();
     for (size_t i = 0; i < n; i++)
@@ -317,21 +251,14 @@ void Core::resetCycles() {
     schedule(RESET_CYCLES, 0x7FFFFFFF);
 }
 
-// ---------------------------------------------------------------------------
-// schedule
-// ---------------------------------------------------------------------------
 void Core::schedule(SchedTask task, uint32_t cycles) {
     SchedEvent event(task, globalCycles + cycles);
     auto it = std::upper_bound(events.cbegin(), events.cend(), event);
     events.insert(it, event);
 }
 
-// ---------------------------------------------------------------------------
-// enterGbaMode
-// ---------------------------------------------------------------------------
 void Core::enterGbaMode() {
     gbaMode = true;
-
     interpreter[0].halt(2);
     interpreter[1].unhalt(2);
 
@@ -363,9 +290,6 @@ void Core::enterGbaMode() {
     memory.write<uint16_t>(1, 0x4000088, 0x200);
 }
 
-// ---------------------------------------------------------------------------
-// endFrame
-// ---------------------------------------------------------------------------
 void Core::endFrame() {
     PPCIrqState st = PPCIrqLockByMsr();
     running = 0;
@@ -388,11 +312,7 @@ void Core::endFrame() {
         wifi.scheduleInit();
 }
 
-// ---------------------------------------------------------------------------
-// invalidateJitPage
-// ---------------------------------------------------------------------------
-void Core::invalidateJitPage(uint32_t addr)
-{
+void Core::invalidateJitPage(uint32_t addr) {
     if (!jitAvailable) return;
     uint32_t pageStart = addr & ~0xFFFu;
     JitPpc::invalidateJitRange(pageStart, pageStart + 0x1000u);
