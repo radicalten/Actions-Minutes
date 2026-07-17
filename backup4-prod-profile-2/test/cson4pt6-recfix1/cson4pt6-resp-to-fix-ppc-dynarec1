@@ -1,0 +1,363 @@
+# ARM→PPC JIT Recompiler: Diagnosis & Fixes
+
+## Root Cause Analysis
+
+The crash symptoms tell a clear story:
+
+```
+Invalid read from 0x000000e3, PC = 0x800ceaf8   ← reading near-zero address
+Invalid read from 0x000000df, PC = 0x800ceb08   ← same pattern
+Exception (ISI) occurred!                         ← instruction fetch fault
+PC = 0x02000A5c  (ARM address being executed as PPC)
+```
+
+The PC landed at `0x02000A5c` — an ARM DS RAM address — meaning the JIT returned to **ARM code as if it were PPC code**. This points to several compounding bugs:
+
+---
+
+## Bug 1: `computeOffsets()` Uses Wrong Hard-Coded Values
+
+This is the **primary bug**. The offsets assume a specific memory layout that almost certainly doesn't match your actual build.
+
+```cpp
+// BROKEN: assumes exact padding, ignores vtable, alignment, etc.
+off_halted       = 8;
+off_registersUsr = 160;
+off_cpsr         = 284;
+off_cycles       = 312;
+```
+
+**Fix:** Use `offsetof()` — but since the fields are private, add a helper:
+
+```cpp
+// Add to interpreter.h (public section):
+public:
+    static size_t offset_registersUsr() {
+        return offsetof(Interpreter, registersUsr);
+    }
+    static size_t offset_cpsr() {
+        return offsetof(Interpreter, cpsr);
+    }
+    static size_t offset_cycles() {
+        return offsetof(Interpreter, cycles);
+    }
+    static size_t offset_halted() {
+        return offsetof(Interpreter, halted);
+    }
+    static size_t offset_pcData() {
+        return offsetof(Interpreter, pcData);
+    }
+    static size_t offset_pipeline() {
+        return offsetof(Interpreter, pipeline);
+    }
+```
+
+```cpp
+// jit_ppc.cpp — fix computeOffsets():
+static void computeOffsets() {
+    off_halted       = Interpreter::offset_halted();
+    off_pcData       = Interpreter::offset_pcData();
+    off_pipeline     = Interpreter::offset_pipeline();
+    off_registersUsr = Interpreter::offset_registersUsr();
+    off_cpsr         = Interpreter::offset_cpsr();
+    off_cycles       = Interpreter::offset_cycles();
+
+    // Debug: print so you can verify
+    printf("[JIT] Offsets: halted=%zu pcData=%zu pipeline=%zu "
+           "registersUsr=%zu cpsr=%zu cycles=%zu\n",
+           off_halted, off_pcData, off_pipeline,
+           off_registersUsr, off_cpsr, off_cycles);
+}
+```
+
+---
+
+## Bug 2: `JitPpc_syncToInterp` / `JitPpc_syncFromInterp` Use Wrong Field
+
+The sync functions write to `registersUsr[]` directly, but `Interpreter` accesses registers through the **pointer array** `registers[32]`. In banked modes (IRQ, SVC, etc.) `registers[15]` points somewhere other than `registersUsr[15]`.
+
+```cpp
+// BROKEN: ignores banked register indirection
+void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t* usr = (uint32_t*)((uint8_t*)interp + off_registersUsr);
+    for (int i = 0; i < 16; i++)
+        usr[i] = regs[i];   // ← wrong in banked modes
+}
+```
+
+**Fix:** Access through the `registers[]` pointer array:
+
+```cpp
+// Add to interpreter.h public section:
+    uint32_t** getRegisters() { return registers; }
+    uint32_t&  getCpsrRef()   { return cpsr; }
+```
+
+```cpp
+// jit_ppc.cpp:
+void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 16; i++)
+        *regPtrs[i] = regs[i];
+    interp->getCpsrRef() = regs[16];
+}
+
+void JitPpc_syncFromInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 16; i++)
+        regs[i] = *regPtrs[i];
+    regs[16] = interp->getCpsrRef();
+}
+```
+
+---
+
+## Bug 3: Stack Frame Overflow
+
+```cpp
+static const int FRAME_SIZE    = 128;
+static const int FRAME_LR      = 124;   // LR at byte 124
+static const int FRAME_R14     = 8;     // r14-r26 = 13 regs × 4 = 52 bytes: [8..59]
+static const int FRAME_REGSYNC = 64;    // 17 words × 4 = 68 bytes: [64..131]
+```
+
+`FRAME_REGSYNC + 17*4 = 64 + 68 = 132 > 128` — **overflow corrupts the caller's frame**.
+
+Additionally, PPC ABI requires the back-chain word at `[r1+0]` and the caller's LR save area at `[r1+4]`. Your frame layout violates this.
+
+**Fix:**
+
+```cpp
+// Corrected frame layout (must be 16-byte aligned on Wii):
+// [r1+0]   = back-chain (written by stwu automatically)
+// [r1+4]   = (ABI: caller LR save — leave for OS/debugger)
+// [r1+8]   = our saved LR
+// [r1+12]  = padding
+// [r1+16]  = saved r14..r26 (13 regs × 4 = 52 bytes) → [16..67]
+// [r1+68]  = padding to align
+// [r1+72]  = ARM regs sync area (17 × 4 = 68 bytes)  → [72..139]
+// [r1+140] = padding
+// Total needed: 140 → round up to 160 (16-byte aligned)
+
+static const int FRAME_SIZE    = 160;
+static const int FRAME_LR      = 8;
+static const int FRAME_R14     = 16;
+static const int FRAME_REGSYNC = 72;
+```
+
+Update all uses of these constants in `emit_prologue`, `emit_epilogue`, `emit_syncToInterp`, `emit_syncFromInterp`, and `emit_loadStore`.
+
+---
+
+## Bug 4: `emit_li32` Generates Wrong Code for High-Half-Only Values
+
+```cpp
+static int emit_li32(uint32_t* out, uint8_t rt, uint32_t imm) {
+    uint16_t lo = (uint16_t)(imm & 0xFFFF);
+    uint16_t hi = (uint16_t)(imm >> 16);
+    if (hi == 0) {
+        out[0] = ppc_addi(rt, 0, (int16_t)lo);   // ← if lo >= 0x8000, sign-extends!
+        return 1;
+    } else if (lo == 0) {
+        out[0] = ppc_addis(rt, 0, (int16_t)hi);
+        return 1;
+    } else {
+        out[0] = ppc_addis(rt, 0, (int16_t)hi);  // ← if lo >= 0x8000, addis loads hi+1!
+        out[1] = ppc_ori(rt, rt, lo);
+        return 2;
+    }
+}
+```
+
+`addis` then `ori` is correct only if you account for `ori`'s zero-extension. But `addi` sign-extends, so loading e.g. `0x0000E3xx` (your crash address!) with `addi r3, 0, 0xE3xx` produces `0xFFFFE3xx`. **This is why you get reads from `0x000000e3`** — a truncated/corrupted address.
+
+**Fix:**
+
+```cpp
+static int emit_li32(uint32_t* out, uint8_t rt, uint32_t imm) {
+    uint16_t lo = (uint16_t)(imm & 0xFFFF);
+    uint16_t hi = (uint16_t)(imm >> 16);
+
+    if (imm == 0) {
+        out[0] = ppc_addi(rt, 0, 0);   // li rt, 0
+        return 1;
+    }
+
+    // If lo has bit15 set, addis must load hi+1 to compensate for
+    // addi's sign extension — but we use ori (zero-extend), so
+    // we only need addis when hi != 0.
+    if (hi == 0) {
+        // lo fits in 16 bits unsigned; use ori r0,r0 then ori
+        // Actually: addi r,0,lo sign-extends — WRONG for lo >= 0x8000
+        // Use: addis rt,0,0 then ori rt,rt,lo
+        out[0] = ppc_addi(rt, 0, 0);
+        out[1] = ppc_ori(rt, rt, lo);
+        return (lo == 0) ? 1 : 2;
+    } else if (lo == 0) {
+        out[0] = ppc_addis(rt, 0, (int16_t)hi);
+        return 1;
+    } else {
+        out[0] = ppc_addis(rt, 0, (int16_t)hi);
+        out[1] = ppc_ori(rt, rt, lo);
+        return 2;
+    }
+}
+```
+
+---
+
+## Bug 5: Conditional Branch Offset Patching Is Wrong
+
+```cpp
+// Patches only the BD field (bits 2-15), but uses raw byte offset:
+ctx.base[condBranchIdx] = (ctx.base[condBranchIdx] & ~0xFFFC) |
+                          (uint32_t)(off & 0xFFFC);
+```
+
+`off` is already in bytes (`endIdx - condBranchIdx` × 4), and `0xFFFC` masks bits 2-15 correctly for the BD field. **However**, the branch is relative to the branch instruction itself, not the base:
+
+```cpp
+// WRONG:
+int32_t off = (int32_t)(endIdx - condBranchIdx) * 4;
+
+// CORRECT: offset is from the branch instruction's address:
+int32_t off = (int32_t)((endIdx - condBranchIdx)) * 4;
+// This is actually the same thing — but verify the sign.
+// The branch skips FORWARD, so off must be POSITIVE.
+// You want to jump to endIdx when condition is NOT met.
+```
+
+The real bug is the **inverted condition**: you emit `skipBO` (the negation) to *skip* the body, but you patch the offset to point to the *end*. Let's trace through:
+
+```cpp
+// You emit: bc skipBO, bi, 0   ← skip body if cond NOT met
+// Body executes if cond IS met
+// At end you patch offset to point past body
+
+// This is correct in structure, but check: does the patch
+// account for the fact that BC offset is relative to itself?
+// endIdx - condBranchIdx gives the number of words between
+// the bc instruction and the target. Multiply by 4 for bytes. ✓
+```
+
+The offset math is okay, but verify `0xFFFC` is the right mask. BC format:
+
+```
+[31:27]=BO [26:22]=BI [21:18]=offset_hi [17:2]=offset_lo [1]=AA [0]=LK
+```
+
+Bits 2-17 hold the 14-bit signed offset in words×4. Mask `0xFFFC` covers bits 2-15 — **only 14 bits**, which limits range to ±32KB. For generated blocks this should be fine, but the mask should be:
+
+```cpp
+// More explicit and correct:
+uint32_t bd = (uint32_t)(off & 0xFFFC);  // bits[15:2], offset in bytes, 4-aligned
+ctx.base[condBranchIdx] = (ctx.base[condBranchIdx] & 0xFFFF0003u) | bd;
+```
+
+---
+
+## Bug 6: `executeBlock` Violates PPC ABI — Missing Stack Frame for Caller
+
+```cpp
+static void executeBlock(const JitBlock* block) {
+    typedef void (*BlockFn)();
+    ((BlockFn)block->ppcCode)();
+}
+```
+
+When `executeBlock` calls into JIT code, the JIT prologue does `stwu r1, -FRAME_SIZE(r1)` which requires `r1` to point to a valid stack frame. The C++ caller already has a frame, so this works — **but** the JIT code calls C functions (`JitPpc_memRead32` etc.) which expect the **ABI back-chain** at `[r1+0]` to be valid. Your `stwu` writes the old SP there, which is correct, but you must ensure `r1` is 16-byte aligned before the `stwu`.
+
+**Fix:** Ensure `FRAME_SIZE` keeps the stack 16-byte aligned:
+
+```cpp
+// FRAME_SIZE must be divisible by 16
+static_assert(FRAME_SIZE % 16 == 0, "Frame must be 16-byte aligned");
+```
+
+With `FRAME_SIZE = 160`, `160 % 16 == 0` ✓
+
+---
+
+## Bug 7: `emit_loadStore` Saves/Restores Volatile Regs Incorrectly
+
+```cpp
+// After the call, you do:
+if (isLoad)
+    ctx.emit(ppc_stw(3, VSAVE + 0 * 4, 1)); // overwrite slot 0 with result
+
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_lwz(3 + i, VSAVE + i * 4, 1));  // ← OVERWRITES r3 with old value!
+
+if (isLoad) {
+    if (ppcRd != 3)
+        ctx.emit(ppc_mr(ppcRd, 3));  // ← r3 now has OLD value, not result!
+}
+```
+
+**Fix:**
+
+```cpp
+if (isLoad) {
+    // Save result before restoring volatiles
+    ctx.emit(ppc_mr(PPC_TMP0, 3));  // PPC_TMP0 = r25, non-volatile, safe
+}
+
+// Restore volatile ARM regs
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_lwz(3 + i, VSAVE + i * 4, 1));
+
+if (isLoad) {
+    ctx.emit(ppc_mr(ppcRd, PPC_TMP0));  // now set destination from saved result
+}
+```
+
+---
+
+## Bug 8: ARM R15 (PC) Value in JIT Is Wrong
+
+In ARM, PC reads return `PC + 8` (ARM) or `PC + 4` (Thumb). Your prologue loads the architectural PC from `registersUsr[15]`, which the interpreter stores as the *actual next-fetch address* (already advanced). But then you do:
+
+```cpp
+// In the block compiler loop:
+int n = emit_li32(ctx.cur, PPC_ARM_R15, pc + (isThumb ? 4u : 8u));
+```
+
+This overwrites `PPC_ARM_R15` at the start of every instruction with the pipeline value. But `emit_syncFromInterp` already loaded `PPC_ARM_R15` from the interpreter state. These two sources conflict.
+
+**Fix:** Don't load ARM R15 from interpreter state — compute it from `armPC`:
+
+```cpp
+// In emit_syncFromInterp, skip R15:
+void JitPpc_syncFromInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 15; i++)   // stop before R15
+        regs[i] = *regPtrs[i];
+    regs[16] = interp->getCpsrRef();
+    // R15 (regs[15]) intentionally NOT loaded here; set per-instruction
+}
+
+// In emit_syncToInterp, write back R15 from register:
+void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 16; i++)
+        *regPtrs[i] = regs[i];     // include R15
+    interp->getCpsrRef() = regs[16];
+}
+```
+
+---
+
+## Summary of All Fixes
+
+| # | Bug | Impact |
+|---|-----|--------|
+| 1 | Hard-coded wrong struct offsets | **Critical** — reads wrong memory |
+| 2 | Sync bypasses register bank indirection | **Critical** — wrong register values in banked modes |
+| 3 | Stack frame too small (overflow) | **Critical** — corrupts caller frame |
+| 4 | `emit_li32` sign-extends 16-bit values | **Critical** — generates wrong addresses (your `0xe3` crash) |
+| 5 | Condition patch mask too narrow | Minor — wrong branch targets |
+| 6 | Frame size not 16-byte aligned | ABI violation — intermittent crashes |
+| 7 | Load result overwritten by volatile restore | **High** — loads garbage values |
+| 8 | R15 loaded from interp then immediately overwritten | Medium — wastes cycles, potential conflict |
+
+Fix these in order — bugs 1, 2, 3, and 4 alone explain all the symptoms in your crash log.
