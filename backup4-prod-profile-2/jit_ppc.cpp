@@ -5,6 +5,7 @@
 #include "interpreter.h"
 #include "memory.h"
 #include "defines.h"
+#include "debug_log.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -296,6 +297,8 @@ int JitHelp_commit(Interpreter* interp, int cpu,
                    uint32_t pc, int reason) {
     if (!interp || !regs || cpu < 0 || cpu > 1) return -1;
     if (pc >= 0x80000000u) {
+        DebugLog("[JIT] BAD-PC commit cpu=%d pc=%08X cpsr=%08X reason=%d\n",
+                  cpu, pc, cpsr, reason);
         g_exitReason[cpu] = EXIT_FALLBACK;
         return -1;
     }
@@ -1127,7 +1130,7 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
     // result < 0 → FALLBACK at curPC
     ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
     ctx.E(ppc_cmpi(0, TA, 0));
-    ctx.E(ppc_bc(12, 0, 8)); // blt +8 — jump into fallback block only when TA < 0
+    ctx.E(ppc_bc(4, 0, 8)); // bge +8
     size_t bOk = ctx.sz();
     ctx.E(ppc_b(0));
     emitReload(ctx);
@@ -1142,7 +1145,7 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
     if (loadPC) {
         ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
         ctx.E(ppc_cmpi(0, TA, 1));
-        ctx.E(ppc_bc(12, 2, 8)); // beq +8 — jump into commitExitDyn only when TA == 1
+        ctx.E(ppc_bc(4, 2, 8)); // bne +8
         size_t b = ctx.sz();
         ctx.E(ppc_b(0));
         emitCommitExitDyn(ctx, EXIT_NORMAL);
@@ -1467,7 +1470,7 @@ static bool emitT_pushPop(Ctx& ctx, uint16_t op, uint32_t curPC) {
     if (((op >> 11) & 1) && ((op >> 8) & 1)) {
         ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
         ctx.E(ppc_cmpi(0, TA, 1));
-        ctx.E(ppc_bc(12, 2, 8)); // beq +8 — jump into commitExitDyn only when TA == 1
+        ctx.E(ppc_bc(4, 2, 8));
         size_t b = ctx.sz();
         ctx.E(ppc_b(0));
         emitCommitExitDyn(ctx, EXIT_NORMAL);
@@ -1664,25 +1667,25 @@ static JitBlock* compile(Interpreter* interp, Core* core,
                 }
             }
             if (!dispThumb(ctx, op, curPC)) {
-                if (g_dbgFB < 32) {
-                    printf("[JIT] thumb FB pc=%08X op=%04X\n", curPC, op);
-                    g_dbgFB++;
-                }
-                emitCommitExit(ctx, curPC, EXIT_FALLBACK);
-                ctx.done = true;
+            if (g_dbgFB < 4000) {
+            DebugLog("[JIT] thumb FB pc=%08X op=%04X\n", curPC, op);
+            g_dbgFB++;
+            }
+            emitCommitExit(ctx, curPC, EXIT_FALLBACK);
+            ctx.done = true;
             } else {
-                curPC += 2;
-                n++;
+            curPC += 2;
+            n++;
             }
         } else {
             uint32_t op = core->memory.read<uint32_t>(arm7, curPC);
-            if (!dispARM(ctx, op, curPC)) {
-                if (g_dbgFB < 32) {
-                    printf("[JIT] arm FB pc=%08X op=%08X\n", curPC, op);
-                    g_dbgFB++;
-                }
-                emitCommitExit(ctx, curPC, EXIT_FALLBACK);
-                ctx.done = true;
+            iif (!dispARM(ctx, op, curPC)) {
+            if (g_dbgFB < 4000) {
+            DebugLog("[JIT] arm FB pc=%08X op=%08X\n", curPC, op);
+            g_dbgFB++;
+            }
+            emitCommitExit(ctx, curPC, EXIT_FALLBACK);
+            ctx.done = true;
             } else {
                 curPC += 4;
                 n++;
@@ -1721,6 +1724,11 @@ static void runCpu(Core& core, int cpu, bool gba) {
     Interpreter& interp = core.interpreter[cpu];
     if (interp.halted) return;
     if (!interp.isReady()) {
+        static int notReadyLogs = 0;
+        if (notReadyLogs < 50) {
+            DebugLog("[JIT] cpu%d not ready, interpreter step\n", cpu);
+            notReadyLogs++;
+        }
         interp.jitRunOpcode();
         return;
     }
@@ -1747,21 +1755,18 @@ static void runCpu(Core& core, int cpu, bool gba) {
     const int reason = g_exitReason[cpu];
     const uint32_t expc = g_exitPC[cpu];
 
-    if ((g_trace++ & 63u) == 0u) {
-        printf("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
-               cpu, pc, expc, reason, interp.getCpsrRef());
-    }
+    DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
+          cpu, pc, expc, reason, interp.getCpsrRef());
 
     if (reason == EXIT_FALLBACK) {
-        // Commit wrote r0-r14+cpsr only. Set PC once, then one interpreter insn.
-        if (validPC(expc, gba))
-            interp.setPC(expc);
-        interp.jitRunOpcode();
-        return;
+    if (validPC(expc, gba))
+        interp.setPC(expc);
+    interp.jitRunOpcode();
+    return;
     }
 
     // NORMAL: commit already called setPC(expc).
-}
+    }
 
 void runJitNds(Core& core) {
     if (!g_jitLive || !codeBuf) {
