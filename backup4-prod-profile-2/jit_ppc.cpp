@@ -1,4 +1,4 @@
-// jit_ppc.cpp - Complete rewrite fixing all sync and encoding bugs
+// jit_ppc.cpp - Fixed: fallback execution, scheduler, PC sync
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -17,143 +17,106 @@ extern "C" {
 }
 
 // ============================================================
-// ARCHITECTURE DECISION: Minimal sync, interpreter does the work
-//
-// Previous bug: JitHelp_syncTo called setPC() which called
-// flushPipeline() which read from ARM memory via pcData pointer.
-// If pcData pointed to Wii RAM overlapping our JIT buffer,
-// ARM instruction bytes got mixed into JIT output.
-//
-// NEW APPROACH:
-// - JIT block only updates: r0-r14, CPSR
-// - JIT block does NOT update r15 (PC) at all
-// - At block exit, JIT stores the "next PC to execute" in a
-//   dedicated frame slot (FRAME_NEXTPC)
-// - JitHelp_exitBlock reads FRAME_NEXTPC and calls setPC()
-//   AFTER the JIT frame is fully unwound (no more JIT stack)
-//   Actually: we still need to call setPC. The issue is WHEN.
-//
-// REAL FIX: Use a separate small trampoline for each exit that:
-// 1. Restores JIT frame (epilogue)
-// 2. Returns to runJitXxx with the next PC in a register
-// 3. runJitXxx calls setPC outside the JIT frame
-//
-// SIMPLEST CORRECT FIX:
-// - syncTo does NOT call setPC()
-// - syncTo directly writes *registers[15] = actualPC + pipeOff
-//   (this is what setPC does minus flushPipeline)
-// - After executeBlock_asm returns, runJitXxx calls
-//   interp->resetCycles() or similar to trigger pcData refresh
-//   on next interpreter step
-//
-// ACTUALLY: The interpreter's runOpcode() calls flushPipeline
-// at the start if pipeline is stale. We just need to mark it
-// stale. The halted/unhalt mechanism or a dedicated "pipelineDirty"
-// flag would work. But we don't have that flag exposed.
-//
-// PRAGMATIC FIX: Call setPC() but from OUTSIDE the JIT code,
-// after executeBlock_asm() returns. Store the exit PC in a
-// global/thread-local variable.
+// Exit codes communicated from JIT block to run loop
 // ============================================================
+static uint32_t g_exitPC  [2] = {};
+static uint32_t g_exitCPSR[2] = {};
+// Exit reason: 0=normal, 1=fallback(run interpreter for one opcode at exitPC)
+static int      g_exitReason[2] = {};
+static const int EXIT_NORMAL   = 0;
+static const int EXIT_FALLBACK = 1;
 
-// Exit PC communicated from JIT block to run loop
-// One per CPU (arm9=0, arm7=1)
-static uint32_t jitExitPC[2]   = {0, 0};
-static uint32_t jitExitCPSR[2] = {0, 0};
-
+// ============================================================
+// Frame layout
+// ============================================================
 static const int FRAME_SIZE    = 208;
 static const int FRAME_LR      = 8;
-static const int FRAME_R14     = 16;    // r14..r31 = 18*4 = 72
+static const int FRAME_R14     = 16;   // r14..r31 (18*4=72 bytes)
 static const int FRAME_CORE    = 88;
 static const int FRAME_SCR0    = 92;
 static const int FRAME_SCR1    = 96;
 static const int FRAME_SCR2    = 100;
-static const int FRAME_CPUIDX  = 104;   // cpu index (0 or 1)
-static const int FRAME_PAD     = 108;
-static const int FRAME_REGSYNC = 112;   // ARM r0-r14 (15 regs = 60 bytes)
-// FRAME_REGSYNC + 60 = 172, pad to 208
-// NOTE: r15 (PC) NOT synced through FRAME_REGSYNC.
-//       It is communicated via jitExitPC[cpuIdx].
+static const int FRAME_SCR3    = 104;
+static const int FRAME_REGSYNC = 112;  // ARM r0-r14 (15*4=60 bytes) -> ends at 172
+// 172..207 = pad (36 bytes)
 
-static_assert(FRAME_SIZE % 16 == 0, "frame align");
-static_assert(FRAME_R14 + 18*4 == FRAME_CORE, "layout");
-static_assert(FRAME_REGSYNC + 15*4 <= FRAME_SIZE, "regsync fits");
+static_assert(FRAME_SIZE % 16 == 0,              "frame align");
+static_assert(FRAME_R14 + 18*4 == FRAME_CORE,    "r14-r31 layout");
+static_assert(FRAME_REGSYNC + 15*4 <= FRAME_SIZE,"regsync fits");
 
 namespace JitPpc {
 
-// ============================================================
-// PPC encoders (same as before, omitting for brevity -- include all)
-// ============================================================
+// PPC encoders (identical to previous version - included in full)
 static inline uint32_t ppc_nop()  { return 0x60000000u; }
 static inline uint32_t ppc_blr()  { return 0x4E800020u; }
 static inline uint32_t ppc_bctr(bool lk=false)
-    {return(19u<<26)|(20u<<21)|(528u<<1)|(lk?1u:0u);}
+    { return(19u<<26)|(20u<<21)|(528u<<1)|(lk?1u:0u); }
 static inline uint32_t ppc_bclr(uint8_t bo,uint8_t bi,bool lk=false)
-    {return(19u<<26)|((bo&31u)<<21)|((bi&31u)<<16)|(16u<<1)|(lk?1u:0u);}
+    { return(19u<<26)|((bo&31u)<<21)|((bi&31u)<<16)|(16u<<1)|(lk?1u:0u); }
 static inline uint32_t ppc_bc(uint8_t bo,uint8_t bi,int16_t off,bool lk=false)
-    {return(16u<<26)|((bo&31u)<<21)|((bi&31u)<<16)|((uint32_t)(off&0xFFFC))|(lk?1u:0u);}
+    { return(16u<<26)|((bo&31u)<<21)|((bi&31u)<<16)|((uint32_t)(off&0xFFFC))|(lk?1u:0u); }
 static inline uint32_t ppc_addi(uint8_t rt,uint8_t ra,int16_t i)
-    {return(14u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;}
+    { return(14u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i; }
 static inline uint32_t ppc_addis(uint8_t rt,uint8_t ra,int16_t i)
-    {return(15u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;}
+    { return(15u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i; }
 static inline uint32_t ppc_ori(uint8_t ra,uint8_t rs,uint16_t i)
-    {return(24u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i;}
+    { return(24u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i; }
 static inline uint32_t ppc_oris(uint8_t ra,uint8_t rs,uint16_t i)
-    {return(25u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i;}
+    { return(25u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i; }
 static inline uint32_t ppc_stwu(uint8_t rs,int16_t d,uint8_t ra)
-    {return(37u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(37u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_stw(uint8_t rs,int16_t d,uint8_t ra)
-    {return(36u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(36u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_lwz(uint8_t rt,int16_t d,uint8_t ra)
-    {return(32u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(32u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_lbz(uint8_t rt,int16_t d,uint8_t ra)
-    {return(34u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(34u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_lhz(uint8_t rt,int16_t d,uint8_t ra)
-    {return(40u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(40u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_lha(uint8_t rt,int16_t d,uint8_t ra)
-    {return(42u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(42u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_stb(uint8_t rs,int16_t d,uint8_t ra)
-    {return(38u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(38u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_sth(uint8_t rs,int16_t d,uint8_t ra)
-    {return(44u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d;}
+    { return(44u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t ppc_cmpi(uint8_t cr,uint8_t ra,int16_t i)
-    {return(11u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|(uint16_t)i;}
+    { return(11u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|(uint16_t)i; }
 static inline uint32_t ppc_cmpli(uint8_t cr,uint8_t ra,uint16_t i)
-    {return(10u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|i;}
+    { return(10u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|i; }
 static inline uint32_t ppc_subfic(uint8_t rt,uint8_t ra,int16_t i)
-    {return(8u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;}
+    { return(8u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i; }
 static inline uint32_t Xf(uint8_t rt,uint8_t ra,uint8_t rb,uint32_t x,bool rc=false)
-    {return(31u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|((uint32_t)rb<<11)|(x<<1)|(rc?1u:0u);}
+    { return(31u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|((uint32_t)rb<<11)|(x<<1)|(rc?1u:0u); }
 static inline uint32_t XOf(uint8_t rt,uint8_t ra,uint8_t rb,bool oe,uint32_t x,bool rc=false)
-    {return(31u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|((uint32_t)rb<<11)|(oe?0x400u:0u)|(x<<1)|(rc?1u:0u);}
-static inline uint32_t ppc_add(uint8_t d,uint8_t a,uint8_t b)   {return XOf(d,a,b,false,266);}
-static inline uint32_t ppc_addc(uint8_t d,uint8_t a,uint8_t b)  {return XOf(d,a,b,false,10);}
-static inline uint32_t ppc_adde(uint8_t d,uint8_t a,uint8_t b)  {return XOf(d,a,b,false,138);}
-static inline uint32_t ppc_subf(uint8_t d,uint8_t a,uint8_t b)  {return XOf(d,a,b,false,40);}
-static inline uint32_t ppc_subfc(uint8_t d,uint8_t a,uint8_t b) {return XOf(d,a,b,false,8);}
-static inline uint32_t ppc_subfe(uint8_t d,uint8_t a,uint8_t b) {return XOf(d,a,b,false,136);}
-static inline uint32_t ppc_neg(uint8_t d,uint8_t a)              {return XOf(d,a,0,false,104);}
-static inline uint32_t ppc_mullw(uint8_t d,uint8_t a,uint8_t b) {return XOf(d,a,b,false,235);}
-static inline uint32_t ppc_mulhw(uint8_t d,uint8_t a,uint8_t b) {return XOf(d,a,b,false,75);}
-static inline uint32_t ppc_mulhwu(uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,11);}
-static inline uint32_t ppc_and(uint8_t a,uint8_t s,uint8_t b)   {return Xf(s,a,b,28);}
-static inline uint32_t ppc_or(uint8_t a,uint8_t s,uint8_t b)    {return Xf(s,a,b,444);}
-static inline uint32_t ppc_xor(uint8_t a,uint8_t s,uint8_t b)   {return Xf(s,a,b,316);}
-static inline uint32_t ppc_andc(uint8_t a,uint8_t s,uint8_t b)  {return Xf(s,a,b,60);}
-static inline uint32_t ppc_nor(uint8_t a,uint8_t s,uint8_t b)   {return Xf(s,a,b,124);}
-static inline uint32_t ppc_mr(uint8_t a,uint8_t s)               {return ppc_or(a,s,s);}
-static inline uint32_t ppc_slw(uint8_t a,uint8_t s,uint8_t b)   {return Xf(s,a,b,24);}
-static inline uint32_t ppc_srw(uint8_t a,uint8_t s,uint8_t b)   {return Xf(s,a,b,536);}
-static inline uint32_t ppc_sraw(uint8_t a,uint8_t s,uint8_t b)  {return Xf(s,a,b,792);}
-static inline uint32_t ppc_cntlzw(uint8_t a,uint8_t s)          {return Xf(s,a,0,26);}
-static inline uint32_t ppc_extsb(uint8_t a,uint8_t s)           {return Xf(s,a,0,954);}
-static inline uint32_t ppc_extsh(uint8_t a,uint8_t s)           {return Xf(s,a,0,922);}
-static inline uint32_t ppc_lwzx(uint8_t t,uint8_t a,uint8_t b)  {return Xf(t,a,b,23);}
-static inline uint32_t ppc_lbzx(uint8_t t,uint8_t a,uint8_t b)  {return Xf(t,a,b,87);}
-static inline uint32_t ppc_lhzx(uint8_t t,uint8_t a,uint8_t b)  {return Xf(t,a,b,279);}
-static inline uint32_t ppc_stwx(uint8_t s,uint8_t a,uint8_t b)  {return Xf(s,a,b,151);}
-static inline uint32_t ppc_stbx(uint8_t s,uint8_t a,uint8_t b)  {return Xf(s,a,b,215);}
-static inline uint32_t ppc_sthx(uint8_t s,uint8_t a,uint8_t b)  {return Xf(s,a,b,407);}
+    { return(31u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|((uint32_t)rb<<11)|(oe?0x400u:0u)|(x<<1)|(rc?1u:0u); }
+static inline uint32_t ppc_add(uint8_t d,uint8_t a,uint8_t b)    {return XOf(d,a,b,false,266);}
+static inline uint32_t ppc_addc(uint8_t d,uint8_t a,uint8_t b)   {return XOf(d,a,b,false,10);}
+static inline uint32_t ppc_adde(uint8_t d,uint8_t a,uint8_t b)   {return XOf(d,a,b,false,138);}
+static inline uint32_t ppc_subf(uint8_t d,uint8_t a,uint8_t b)   {return XOf(d,a,b,false,40);}
+static inline uint32_t ppc_subfc(uint8_t d,uint8_t a,uint8_t b)  {return XOf(d,a,b,false,8);}
+static inline uint32_t ppc_subfe(uint8_t d,uint8_t a,uint8_t b)  {return XOf(d,a,b,false,136);}
+static inline uint32_t ppc_neg(uint8_t d,uint8_t a)               {return XOf(d,a,0,false,104);}
+static inline uint32_t ppc_mullw(uint8_t d,uint8_t a,uint8_t b)  {return XOf(d,a,b,false,235);}
+static inline uint32_t ppc_mulhw(uint8_t d,uint8_t a,uint8_t b)  {return XOf(d,a,b,false,75);}
+static inline uint32_t ppc_mulhwu(uint8_t d,uint8_t a,uint8_t b) {return XOf(d,a,b,false,11);}
+static inline uint32_t ppc_and(uint8_t a,uint8_t s,uint8_t b)    {return Xf(s,a,b,28);}
+static inline uint32_t ppc_or(uint8_t a,uint8_t s,uint8_t b)     {return Xf(s,a,b,444);}
+static inline uint32_t ppc_xor(uint8_t a,uint8_t s,uint8_t b)    {return Xf(s,a,b,316);}
+static inline uint32_t ppc_andc(uint8_t a,uint8_t s,uint8_t b)   {return Xf(s,a,b,60);}
+static inline uint32_t ppc_nor(uint8_t a,uint8_t s,uint8_t b)    {return Xf(s,a,b,124);}
+static inline uint32_t ppc_mr(uint8_t a,uint8_t s)                {return ppc_or(a,s,s);}
+static inline uint32_t ppc_slw(uint8_t a,uint8_t s,uint8_t b)    {return Xf(s,a,b,24);}
+static inline uint32_t ppc_srw(uint8_t a,uint8_t s,uint8_t b)    {return Xf(s,a,b,536);}
+static inline uint32_t ppc_sraw(uint8_t a,uint8_t s,uint8_t b)   {return Xf(s,a,b,792);}
+static inline uint32_t ppc_cntlzw(uint8_t a,uint8_t s)           {return Xf(s,a,0,26);}
+static inline uint32_t ppc_extsb(uint8_t a,uint8_t s)            {return Xf(s,a,0,954);}
+static inline uint32_t ppc_extsh(uint8_t a,uint8_t s)            {return Xf(s,a,0,922);}
+static inline uint32_t ppc_lwzx(uint8_t t,uint8_t a,uint8_t b)   {return Xf(t,a,b,23);}
+static inline uint32_t ppc_lbzx(uint8_t t,uint8_t a,uint8_t b)   {return Xf(t,a,b,87);}
+static inline uint32_t ppc_lhzx(uint8_t t,uint8_t a,uint8_t b)   {return Xf(t,a,b,279);}
+static inline uint32_t ppc_stwx(uint8_t s,uint8_t a,uint8_t b)   {return Xf(s,a,b,151);}
+static inline uint32_t ppc_stbx(uint8_t s,uint8_t a,uint8_t b)   {return Xf(s,a,b,215);}
+static inline uint32_t ppc_sthx(uint8_t s,uint8_t a,uint8_t b)   {return Xf(s,a,b,407);}
 static inline uint32_t ppc_cmp(uint8_t cr,uint8_t a,uint8_t b)
     {return(31u<<26)|((cr&7u)<<23)|((uint32_t)a<<16)|((uint32_t)b<<11);}
 static inline uint32_t ppc_cmpl(uint8_t cr,uint8_t a,uint8_t b)
@@ -172,17 +135,16 @@ static inline uint32_t ppc_mtspr(uint16_t spr,uint8_t rs)
 static inline uint32_t ppc_mfspr(uint8_t rt,uint16_t spr)
     {uint8_t lo=spr&31,hi=(spr>>5)&31;
      return(31u<<26)|((uint32_t)rt<<21)|((uint32_t)lo<<16)|((uint32_t)hi<<11)|(339u<<1);}
-static inline uint32_t ppc_mtctr(uint8_t s){return ppc_mtspr(9,s);}
-static inline uint32_t ppc_mtlr(uint8_t s) {return ppc_mtspr(8,s);}
-static inline uint32_t ppc_mflr(uint8_t t) {return ppc_mfspr(t,8);}
-static inline uint32_t ppc_mtxer(uint8_t s){return ppc_mtspr(1,s);}
-static inline uint32_t ppc_mfxer(uint8_t t){return ppc_mfspr(t,1);}
-static inline uint32_t ppc_mfcr(uint8_t t)
-    {return(31u<<26)|((uint32_t)t<<21)|(19u<<1);}
+static inline uint32_t ppc_mtctr(uint8_t s) {return ppc_mtspr(9,s);}
+static inline uint32_t ppc_mtlr(uint8_t s)  {return ppc_mtspr(8,s);}
+static inline uint32_t ppc_mflr(uint8_t t)  {return ppc_mfspr(t,8);}
+static inline uint32_t ppc_mtxer(uint8_t s) {return ppc_mtspr(1,s);}
+static inline uint32_t ppc_mfxer(uint8_t t) {return ppc_mfspr(t,1);}
+static inline uint32_t ppc_mfcr(uint8_t t)  {return(31u<<26)|((uint32_t)t<<21)|(19u<<1);}
 static inline uint32_t ppc_mtcrf(uint8_t fxm,uint8_t s)
     {return(31u<<26)|((uint32_t)s<<21)|((uint32_t)(fxm&0xFF)<<12)|(144u<<1);}
-static inline uint32_t ppc_isync(){return(19u<<26)|(150u<<1);}
-static inline uint32_t ppc_sync() {return(31u<<26)|(598u<<1);}
+static inline uint32_t ppc_isync() {return(19u<<26)|(150u<<1);}
+static inline uint32_t ppc_sync()  {return(31u<<26)|(598u<<1);}
 
 static int emit_li32(uint32_t* out,uint8_t rt,uint32_t v){
     uint16_t hi=v>>16,lo=v&0xFFFF;
@@ -196,28 +158,28 @@ static int emit_li32(uint32_t* out,uint8_t rt,uint32_t v){
 }
 
 // ============================================================
-// Register mapping
-// r14-r28: ARM r0-r14  (callee-saved)
-// r29:     CPSR        (callee-saved) -- NOTE: not ARM r15
-// r30:     INTERP*     (callee-saved)
-// r31:     cpuIdx      (callee-saved, 0=arm9, 1=arm7)
-// ARM r15 (PC) is NOT kept in a register.
-// It is stored in jitExitPC[cpuIdx] at block exit.
+// Registers
+// r14-r28: ARM r0-r14   (callee-saved)
+// r29:     CPSR         (callee-saved)
+// r30:     Interpreter* (callee-saved)
+// r31:     cpuIdx       (callee-saved)
+// Core* in frame at FRAME_CORE
+// Volatile: r3(TA),r4(TB),r5(TC),r6(TD),r11(RCALL)
 // ============================================================
 static const uint8_t RA[15]={14,15,16,17,18,19,20,21,22,23,24,25,26,27,28};
-static const uint8_t RCPSR=29, RINTERP=30, RCPUIDX=31;
+static const uint8_t RCPSR=29,RINTERP=30,RCPUIDX=31;
 static const uint8_t TA=3,TB=4,TC=5,TD=6,RCALL=11;
 
 // ============================================================
 // Code buffer & cache
 // ============================================================
-static const size_t JIT_BYTES = 4u*1024u*1024u;
-static const size_t JIT_WORDS = JIT_BYTES/4;
-static const size_t BLK_ARMS  = 64;
-static const size_t BLK_WDS   = BLK_ARMS*128+256;
+static const size_t JIT_BYTES=4u*1024u*1024u;
+static const size_t JIT_WORDS=JIT_BYTES/4;
+static const size_t BLK_ARMS=64;
+static const size_t BLK_WDS=BLK_ARMS*160+512;
 
-static uint32_t* codeBuf = nullptr;
-static size_t    codePos = 0;
+static uint32_t* codeBuf=nullptr;
+static size_t    codePos=0;
 
 struct JitBlock{uint32_t armPC;uint32_t* code;uint32_t nW;bool thumb,valid;};
 static const size_t CSIZ=1u<<13;
@@ -233,8 +195,7 @@ static void dcbst(uint32_t* p,size_t n){DCFlushRange(p,n*4);ICInvalidateRange(p,
 struct Ctx{
     uint32_t *base,*cur; size_t cap;
     bool thumb,arm7,done;
-    uint32_t blockPC;
-    int cpuIdx;
+    uint32_t blockPC; int cpuIdx;
     Interpreter* interp; Core* core;
 
     void E(uint32_t w){if((size_t)(cur-base)<cap)*cur++=w;}
@@ -258,29 +219,30 @@ struct Ctx{
 // ============================================================
 extern "C" {
 
-// Sync r0-r14 from interpreter to frame (does NOT touch PC)
-void JitHelp_syncFrom(Interpreter* interp, uint32_t* regs, uint32_t* outCPSR) {
-    uint32_t** p = interp->getRegisters();
-    for(int i=0;i<15;i++) regs[i] = *p[i];
-    *outCPSR = interp->getCpsrRef();
+// Sync r0-r14 FROM interpreter to JIT frame
+// Also outputs CPSR to *outCPSR
+void JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
+    uint32_t** p=interp->getRegisters();
+    for(int i=0;i<15;i++) regs[i]=*p[i];
+    *outCPSR=interp->getCpsrRef();
 }
 
-// Sync r0-r14 and CPSR from frame to interpreter (does NOT touch PC)
-// PC is set separately via JitHelp_setPC
-void JitHelp_syncTo(Interpreter* interp, uint32_t* regs, uint32_t cpsr) {
-    uint32_t** p = interp->getRegisters();
-    for(int i=0;i<15;i++) *p[i] = regs[i];
-    interp->getCpsrRef() = cpsr;
+// Sync r0-r14 TO interpreter from JIT frame, update CPSR
+// Does NOT touch PC (*registers[15])
+void JitHelp_syncTo(Interpreter* interp,uint32_t* regs,uint32_t cpsr){
+    uint32_t** p=interp->getRegisters();
+    for(int i=0;i<15;i++) *p[i]=regs[i];
+    interp->getCpsrRef()=cpsr;
 }
 
-// Set PC via interpreter's setPC (which calls flushPipeline)
-// Called AFTER JIT frame is fully unwound, from runJitXxx
-void JitHelp_setPC(Interpreter* interp, uint32_t actualPC) {
-    interp->setPC(actualPC);
+// Store exit info — called just before block epilogue
+void JitHelp_storeExit(int cpuIdx,uint32_t nextPC,uint32_t cpsr,int reason){
+    g_exitPC    [cpuIdx]=nextPC;
+    g_exitCPSR  [cpuIdx]=cpsr;
+    g_exitReason[cpuIdx]=reason;
 }
 
-int JitHelp_fallback(Interpreter* interp){return interp->jitRunOpcode();}
-
+// Memory helpers
 uint32_t JitHelp_r32(Core* c,int a,uint32_t ad){return c->memory.read<uint32_t>((bool)a,ad);}
 uint16_t JitHelp_r16(Core* c,int a,uint32_t ad){return c->memory.read<uint16_t>((bool)a,ad);}
 uint8_t  JitHelp_r8 (Core* c,int a,uint32_t ad){return c->memory.read<uint8_t> ((bool)a,ad);}
@@ -288,16 +250,11 @@ void JitHelp_w32(Core* c,int a,uint32_t ad,uint32_t v){c->memory.write<uint32_t>
 void JitHelp_w16(Core* c,int a,uint32_t ad,uint16_t v){c->memory.write<uint16_t>((bool)a,ad,v);}
 void JitHelp_w8 (Core* c,int a,uint32_t ad,uint8_t  v){c->memory.write<uint8_t> ((bool)a,ad,v);}
 
-// Store exit PC and CPSR into global slots indexed by cpuIdx
-// Called from JIT block epilogue to communicate next PC
-void JitHelp_storeExit(int cpuIdx, uint32_t nextPC, uint32_t cpsr) {
-    jitExitPC[cpuIdx]   = nextPC;
-    jitExitCPSR[cpuIdx] = cpsr;
-}
-
+// Tick scheduler
 void JitHelp_tick(Core* core){
     core->globalCycles+=64;
-    while(!core->events.empty()&&core->globalCycles>=core->events.front().cycles){
+    while(!core->events.empty()&&
+          core->globalCycles>=core->events.front().cycles){
         SchedEvent e=core->events.front();
         core->events.erase(core->events.begin());
         core->tasks[e.task]();
@@ -313,15 +270,16 @@ static void emitPrologue(Ctx& ctx){
     ctx.E(ppc_mflr(0));
     ctx.E(ppc_stwu(1,-(int16_t)FRAME_SIZE,1));
     ctx.E(ppc_stw(0,FRAME_LR,1));
-    for(int r=14;r<=31;r++) ctx.E(ppc_stw(r,FRAME_R14+(r-14)*4,1));
+    for(int r=14;r<=31;r++)
+        ctx.E(ppc_stw(r,FRAME_R14+(r-14)*4,1));
     ctx.li(RINTERP,(uint32_t)(uintptr_t)ctx.interp);
     ctx.li(TA,(uint32_t)(uintptr_t)ctx.core);
     ctx.E(ppc_stw(TA,FRAME_CORE,1));
     ctx.E(ppc_addi(RCPUIDX,0,(int16_t)ctx.cpuIdx));
 }
-
 static void emitEpilogue(Ctx& ctx){
-    for(int r=14;r<=31;r++) ctx.E(ppc_lwz(r,FRAME_R14+(r-14)*4,1));
+    for(int r=14;r<=31;r++)
+        ctx.E(ppc_lwz(r,FRAME_R14+(r-14)*4,1));
     ctx.E(ppc_lwz(0,FRAME_LR,1));
     ctx.E(ppc_mtlr(0));
     ctx.E(ppc_addi(1,1,(int16_t)FRAME_SIZE));
@@ -329,114 +287,64 @@ static void emitEpilogue(Ctx& ctx){
 }
 
 // ============================================================
-// Block exit sequence
-//
-// At a block exit point, we need to:
-// 1. Sync r0-r14 and CPSR to interpreter
-// 2. Store the exit PC and CPSR into jitExitPC/jitExitCPSR
-// 3. Return to executeBlock_asm caller
-//
-// The exit PC is provided as a compile-time constant (nextPC).
-// The CPSR at exit time is in RCPSR (r29).
-//
-// We do NOT call setPC() here - that happens in runJitXxx
-// AFTER executeBlock_asm() returns.
+// Sync from interpreter at block entry
 // ============================================================
-static void emitBlockExit(Ctx& ctx, uint32_t nextPC){
-    // 1. Store r0-r14 to sync area
-    for(int i=0;i<15;i++) ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
-
-    // 2. Call JitHelp_syncTo(interp, regs, cpsr)
+static void emitSyncFrom(Ctx& ctx){
+    // JitHelp_syncFrom(interp, &regsync, &scratchCPSR)
     ctx.E(ppc_mr(TA,RINTERP));
     ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_mr(TC,RCPSR));
-    ctx.call((void*)JitHelp_syncTo);
-    // After call: callee-saved regs (RCPSR=r29, RINTERP=r30, RCPUIDX=r31,
-    //             RA[0-14]=r14-r28) are all preserved.
-
-    // 3. Store exit PC to jitExitPC[cpuIdx]
-    //    and CPSR to jitExitCPSR[cpuIdx]
-    //    Call JitHelp_storeExit(cpuIdx, nextPC, cpsr)
-    ctx.E(ppc_mr(TA,RCPUIDX));          // r3 = cpuIdx
-    ctx.li(TB,nextPC);                   // r4 = nextPC
-    ctx.E(ppc_mr(TC,RCPSR));            // r5 = CPSR
-    ctx.call((void*)JitHelp_storeExit);
-
-    // 4. Return
-    emitEpilogue(ctx);
-}
-
-// ============================================================
-// Fallback: sync everything, run one interpreter step, re-sync
-// ============================================================
-static void emitFallbackExit(Ctx& ctx, uint32_t nextPC){
-    // Full sync including PC so interpreter can run correctly
-    for(int i=0;i<15;i++) ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
-    ctx.E(ppc_mr(TA,RINTERP));
-    ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_mr(TC,RCPSR));
-    ctx.call((void*)JitHelp_syncTo);
-
-    // Set PC so interpreter runs from the right place
-    ctx.E(ppc_mr(TA,RINTERP));
-    ctx.li(TB,nextPC);
-    ctx.call((void*)JitHelp_setPC);
-
-    // Run one opcode
-    ctx.E(ppc_mr(TA,RINTERP));
-    ctx.call((void*)JitHelp_fallback);
-
-    // Sync back: r0-r14 and CPSR
-    uint32_t** dummy = nullptr; (void)dummy; // suppress warning
-    // Re-sync from interpreter after fallback
-    ctx.E(ppc_mr(TA,RINTERP));
-    ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_addi(TC,1,(int16_t)(FRAME_REGSYNC+15*4))); // temp CPSR slot
+    ctx.E(ppc_addi(TC,1,(int16_t)FRAME_SCR0));
     ctx.call((void*)JitHelp_syncFrom);
-    for(int i=0;i<15;i++) ctx.E(ppc_lwz(RA[i],FRAME_REGSYNC+i*4,1));
-    // CPSR needs a dedicated slot - use FRAME_SCR2
-    // Actually JitHelp_syncFrom signature has outCPSR as third arg
-    // We need to adjust: store CPSR to FRAME_SCR2 then load to RCPSR
-}
-
-// Simpler fallback: just exit the block, let run loop use interpreter
-static void emitFallback(Ctx& ctx, uint32_t curPC){
-    // Exit with curPC so interpreter runs from there
-    emitBlockExit(ctx, curPC);
-    ctx.done = true;
-}
-
-// ============================================================
-// SyncFrom at block start
-// ============================================================
-static void emitSyncFromBlock(Ctx& ctx){
-    // Call JitHelp_syncFrom(interp, regs, &cpsr_slot)
-    // Store r0-r14 into FRAME_REGSYNC
-    // Store CPSR into RCPSR (r29)
-    ctx.E(ppc_mr(TA,RINTERP));
-    ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_addi(TC,1,(int16_t)FRAME_SCR0));  // cpsr output slot
-    ctx.call((void*)JitHelp_syncFrom);
-    for(int i=0;i<15;i++) ctx.E(ppc_lwz(RA[i],FRAME_REGSYNC+i*4,1));
+    for(int i=0;i<15;i++)
+        ctx.E(ppc_lwz(RA[i],FRAME_REGSYNC+i*4,1));
     ctx.E(ppc_lwz(RCPSR,FRAME_SCR0,1));
 }
 
 // ============================================================
-// Condition flags  (CR7)
+// Block exit: sync state out, store exit info, return
+//
+// nextPC  = actual ARM instruction address to jump to next
+// reason  = EXIT_NORMAL or EXIT_FALLBACK
+// ============================================================
+static void emitExit(Ctx& ctx,uint32_t nextPC,int reason){
+    // 1. Store ARM r0-r14 to sync area
+    for(int i=0;i<15;i++)
+        ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
+
+    // 2. JitHelp_syncTo(interp, &regsync, cpsr)
+    ctx.E(ppc_mr(TA,RINTERP));
+    ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
+    ctx.E(ppc_mr(TC,RCPSR));
+    ctx.call((void*)JitHelp_syncTo);
+
+    // 3. JitHelp_storeExit(cpuIdx, nextPC, cpsr, reason)
+    ctx.E(ppc_mr(TA,RCPUIDX));
+    ctx.li(TB,nextPC);
+    ctx.E(ppc_mr(TC,RCPSR));
+    ctx.E(ppc_addi(TD,0,(int16_t)reason));
+    ctx.call((void*)JitHelp_storeExit);
+
+    // 4. Return to executeBlock_asm caller
+    emitEpilogue(ctx);
+}
+
+// ============================================================
+// Condition flags (CR7)
+// CR7: LT=bit28(N), GT=bit29(Z), EQ=bit30(C), SO=bit31(V)
 // ============================================================
 static void emitLoadCR7(Ctx& ctx){ctx.E(ppc_mtcrf(0x01,RCPSR));}
 struct CB{uint8_t bo,bi;bool ok;};
 static CB condPpc(uint8_t c){
     switch(c){
-        case 0: return{12,29,true};
-        case 1: return{ 4,29,true};
-        case 2: return{12,30,true};
-        case 3: return{ 4,30,true};
-        case 4: return{12,28,true};
-        case 5: return{ 4,28,true};
-        case 6: return{12,31,true};
-        case 7: return{ 4,31,true};
-        case 14:return{20, 0,true};
+        case 0: return{12,29,true};  // EQ: Z=CR7_GT
+        case 1: return{ 4,29,true};  // NE
+        case 2: return{12,30,true};  // CS: C=CR7_EQ
+        case 3: return{ 4,30,true};  // CC
+        case 4: return{12,28,true};  // MI: N=CR7_LT
+        case 5: return{ 4,28,true};  // PL
+        case 6: return{12,31,true};  // VS: V=CR7_SO
+        case 7: return{ 4,31,true};  // VC
+        case 14:return{20, 0,true};  // AL
         default:return{ 0, 0,false};
     }
 }
@@ -473,14 +381,14 @@ static void setC_xer(Ctx& ctx){
     ctx.E(ppc_or(RCPSR,RCPSR,TA));
 }
 static void setV_add(Ctx& ctx,uint8_t res,uint8_t a,uint8_t b){
-    ctx.E(ppc_xor(TA,res,a)); ctx.E(ppc_xor(TB,res,b));
+    ctx.E(ppc_xor(TA,res,a));ctx.E(ppc_xor(TB,res,b));
     ctx.E(ppc_and(TA,TA,TB));
     ctx.E(ppc_rlwinm(TA,TA,4,28,28));
     ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));
     ctx.E(ppc_or(RCPSR,RCPSR,TA));
 }
 static void setV_sub(Ctx& ctx,uint8_t res,uint8_t a,uint8_t b){
-    ctx.E(ppc_xor(TA,a,b)); ctx.E(ppc_xor(TB,a,res));
+    ctx.E(ppc_xor(TA,a,b));ctx.E(ppc_xor(TB,a,res));
     ctx.E(ppc_and(TA,TA,TB));
     ctx.E(ppc_rlwinm(TA,TA,4,28,28));
     ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));
@@ -493,29 +401,22 @@ static void setC_bit0(Ctx& ctx,uint8_t cr){
 }
 
 // ============================================================
-// Shifter (carry in TC bit0 when sc=true)
+// Shifter (carry output in TC bit0 when sc=true)
 // ============================================================
 static void sLslI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i==0){if(d!=s)ctx.E(ppc_mr(d,s));
-              if(sc)ctx.E(ppc_rlwinm(TC,RCPSR,3,31,31));}
-    else if(i<32){if(sc)ctx.E(ppc_rlwinm(TC,s,i,31,31));
-                   ctx.E(ppc_rlwinm(d,s,(uint8_t)i,0,(uint8_t)(31-i)));}
-    else if(i==32){if(sc)ctx.E(ppc_rlwinm(TC,s,0,31,31));
-                    ctx.E(ppc_addi(d,0,0));}
+    if(i==0){if(d!=s)ctx.E(ppc_mr(d,s));if(sc)ctx.E(ppc_rlwinm(TC,RCPSR,3,31,31));}
+    else if(i<32){if(sc)ctx.E(ppc_rlwinm(TC,s,i,31,31));ctx.E(ppc_rlwinm(d,s,(uint8_t)i,0,(uint8_t)(31-i)));}
+    else if(i==32){if(sc)ctx.E(ppc_rlwinm(TC,s,0,31,31));ctx.E(ppc_addi(d,0,0));}
     else{if(sc)ctx.E(ppc_addi(TC,0,0));ctx.E(ppc_addi(d,0,0));}
 }
 static void sLsrI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i==0||i==32){if(sc)ctx.E(ppc_rlwinm(TC,s,1,31,31));
-                     ctx.E(ppc_addi(d,0,0));}
-    else if(i<32){if(sc)ctx.E(ppc_rlwinm(TC,s,(uint8_t)(33-i),31,31));
-                   ctx.E(ppc_rlwinm(d,s,(uint8_t)(32-i),(uint8_t)i,31));}
+    if(i==0||i==32){if(sc)ctx.E(ppc_rlwinm(TC,s,1,31,31));ctx.E(ppc_addi(d,0,0));}
+    else if(i<32){if(sc)ctx.E(ppc_rlwinm(TC,s,(uint8_t)(33-i),31,31));ctx.E(ppc_rlwinm(d,s,(uint8_t)(32-i),(uint8_t)i,31));}
     else{if(sc)ctx.E(ppc_addi(TC,0,0));ctx.E(ppc_addi(d,0,0));}
 }
 static void sAsrI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i<=0||i>=32){if(sc)ctx.E(ppc_rlwinm(TC,s,1,31,31));
-                     ctx.E(ppc_srawi(d,s,31));}
-    else{if(sc)ctx.E(ppc_rlwinm(TC,s,(uint8_t)(33-i),31,31));
-          ctx.E(ppc_srawi(d,s,(uint8_t)i));}
+    if(i<=0||i>=32){if(sc)ctx.E(ppc_rlwinm(TC,s,1,31,31));ctx.E(ppc_srawi(d,s,31));}
+    else{if(sc)ctx.E(ppc_rlwinm(TC,s,(uint8_t)(33-i),31,31));ctx.E(ppc_srawi(d,s,(uint8_t)i));}
 }
 static void sRorI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
     if(i==0){
@@ -525,10 +426,8 @@ static void sRorI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
         ctx.E(ppc_rlwimi(d,TA,31,0,0));
     }else{
         i&=31;if(!i)i=32;
-        if(i<32){if(sc)ctx.E(ppc_rlwinm(TC,s,(uint8_t)(33-i),31,31));
-                  ctx.E(ppc_rlwinm(d,s,(uint8_t)(32-i),0,31));}
-        else{if(d!=s)ctx.E(ppc_mr(d,s));
-              if(sc)ctx.E(ppc_rlwinm(TC,s,1,31,31));}
+        if(i<32){if(sc)ctx.E(ppc_rlwinm(TC,s,(uint8_t)(33-i),31,31));ctx.E(ppc_rlwinm(d,s,(uint8_t)(32-i),0,31));}
+        else{if(d!=s)ctx.E(ppc_mr(d,s));if(sc)ctx.E(ppc_rlwinm(TC,s,1,31,31));}
     }
 }
 static bool emitShifter(Ctx& ctx,uint32_t op,uint8_t dst,bool sc){
@@ -569,7 +468,6 @@ static bool emitShifter(Ctx& ctx,uint32_t op,uint8_t dst,bool sc){
 // Data processing
 // ============================================================
 enum DP{AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN};
-
 static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF,dop=(op>>21)&0xF;
     bool    s=(op>>20)&1;
@@ -577,12 +475,13 @@ static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
     if(rd==15)return false;
     uint8_t pRd=RA[rd];
 
-    // rn==15: ARM reads PC+8 (ARM) or PC+4 (Thumb)
-    uint8_t srcRn;
-    bool    rnIsPC=(rn==15);
+    // Handle rn==15: PC operand = curPC + pipeline offset
+    uint8_t srcRn; bool rnIsPC=(rn==15);
     if(rnIsPC){
         uint32_t pcVal=curPC+(ctx.thumb?4u:8u);
+        // Save to SCR3 in case shifter clobbers TD
         ctx.li(TD,pcVal);
+        ctx.E(ppc_stw(TD,FRAME_SCR3,1));
         srcRn=TD;
     }else{
         srcRn=RA[rn];
@@ -597,27 +496,16 @@ static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
 
     if(needCin){ctx.E(ppc_rlwinm(TA,RCPSR,0,29,29));ctx.E(ppc_mtxer(TA));}
 
-    // Shifter into TA (TA is volatile, safe to clobber)
-    // srcRn may be TD (volatile) - shifter uses TD for reg shifts too
-    // If srcRn=TD and shifter needs TD: problem.
-    // emitShifter with reg shift uses TD for shift amount.
-    // So if rnIsPC, save TD to FRAME_SCR2 first.
-    if(rnIsPC) ctx.E(ppc_stw(TD,FRAME_SCR2,1));
-
+    // If rnIsPC, reload from SCR3 after shifter (shifter may use TD)
     bool carrySet=emitShifter(ctx,op,TA,logCarry);
+    if(rnIsPC)ctx.E(ppc_lwz(TD,FRAME_SCR3,1));
+    if(rnIsPC)srcRn=TD;
 
-    if(rnIsPC) ctx.E(ppc_lwz(TD,FRAME_SCR2,1));
-
-    // Save inputs for V calculation if needed
     bool needV=s&&(dop==ADD||dop==SUB||dop==RSB||dop==CMN||dop==CMP||
                     dop==ADC||dop==SBC||dop==RSC);
-    uint8_t savedA=srcRn, savedB=TA;
     if(needV){
-        // srcRn: callee-saved if !rnIsPC, or TD (volatile) if rnIsPC
-        // TA: volatile, will be clobbered by operation
-        // Save both to frame
-        ctx.E(ppc_stw(TA,FRAME_SCR0,1));    // save shifter op
-        ctx.E(ppc_stw(srcRn,FRAME_SCR1,1)); // save rn value
+        ctx.E(ppc_stw(TA,FRAME_SCR0,1));
+        ctx.E(ppc_stw(srcRn,FRAME_SCR1,1));
     }
 
     bool isTest=(dop==TST||dop==TEQ||dop==CMP||dop==CMN);
@@ -639,11 +527,11 @@ static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
     }
 
     if(s){
-        uint8_t opA=srcRn,opB=TA;
+        uint8_t opA,opB;
         if(needV){
-            ctx.E(ppc_lwz(TA,FRAME_SCR0,1)); opB=TA;
-            ctx.E(ppc_lwz(TD,FRAME_SCR1,1)); opA=TD;
-        }
+            ctx.E(ppc_lwz(TA,FRAME_SCR0,1));opB=TA;
+            ctx.E(ppc_lwz(TD,FRAME_SCR1,1));opA=TD;
+        }else{opA=srcRn;opB=TA;}
         switch((DP)dop){
             case ADD:case CMN:setNZ(ctx,res);setC_xer(ctx);setV_add(ctx,res,opA,opB);break;
             case ADC:         setNZ(ctx,res);setC_xer(ctx);setV_add(ctx,res,opA,opB);break;
@@ -661,55 +549,68 @@ static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
 // ============================================================
 // Branch
 // ============================================================
+// Helper: emit BX exit sequence (T-bit update + exit)
+static void emitBXexit(Ctx& ctx, uint8_t pRm_or_scratch, bool fromScratch, uint32_t fallPC){
+    // pRm_or_scratch: if !fromScratch, this is the ARM register holding Rm.
+    //                 if fromScratch, Rm value is in FRAME_SCR2.
+    uint8_t rmReg;
+    if(!fromScratch){
+        ctx.E(ppc_stw(pRm_or_scratch,FRAME_SCR2,1));
+        rmReg=pRm_or_scratch; // still valid before call
+    }
+    // Update T bit in RCPSR from Rm[0]
+    ctx.E(ppc_rlwinm(TA,RCPSR,0,0,25));   // keep [31..27] from MSB
+    ctx.E(ppc_rlwinm(TB,RCPSR,0,27,31));  // keep [25..0] from MSB
+    ctx.E(ppc_or(RCPSR,TA,TB));            // T(bit26)=0
+    ctx.E(ppc_lwz(TA,FRAME_SCR2,1));      // TA=Rm
+    ctx.E(ppc_rlwinm(TB,TA,5,26,26));     // TB=Rm[0]<<5->bit26
+    ctx.E(ppc_or(RCPSR,RCPSR,TB));        // set T
+
+    // New PC = Rm & ~1
+    ctx.E(ppc_rlwinm(TA,TA,0,0,30));      // TA = Rm&~1
+    ctx.E(ppc_stw(TA,FRAME_SCR2,1));      // save new PC
+
+    // Exit
+    for(int i=0;i<15;i++) ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
+    ctx.E(ppc_mr(TA,RINTERP));
+    ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
+    ctx.E(ppc_mr(TC,RCPSR));
+    ctx.call((void*)JitHelp_syncTo);
+    ctx.E(ppc_mr(TA,RCPUIDX));
+    ctx.E(ppc_lwz(TB,FRAME_SCR2,1));
+    ctx.E(ppc_mr(TC,RCPSR));
+    ctx.E(ppc_addi(TD,0,EXIT_NORMAL));
+    ctx.call((void*)JitHelp_storeExit);
+    emitEpilogue(ctx);
+}
+
+static bool emitBX(Ctx& ctx,uint32_t op,uint32_t curPC){
+    uint8_t cond=(op>>28)&0xF;
+    uint8_t rm=op&0xF;
+    if(rm==15)return false;
+    uint8_t pRm=RA[rm];
+
+    size_t si=emitCondSkip(ctx,cond);
+    if(si==SIZE_MAX&&cond!=14)return false;
+
+    // Save Rm before we start clobbering registers
+    ctx.E(ppc_stw(pRm,FRAME_SCR2,1));
+    emitBXexit(ctx,pRm,true,curPC+4);
+
+    if(si!=SIZE_MAX){
+        patchSkip(ctx,si);
+        // Condition not met: exit with curPC+4, unchanged CPSR
+        emitExit(ctx,curPC+4,EXIT_NORMAL);
+    }
+    ctx.done=true;
+    return true;
+}
+
 static bool emitBranch(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;
+    if((op&0x0FFFFFF0)==0x012FFF10)return emitBX(ctx,op,curPC);
+    if((op&0x0FFFFFF0)==0x012FFF30)return false; // BLX reg: interpreter
 
-    // BX Rm
-    if((op&0x0FFFFFF0)==0x012FFF10){
-        uint8_t rm=op&0xF; if(rm==15)return false;
-        // rm index: if rm==15 it would be PC, already handled above
-        // rm is in RA[rm] (r0-r14 mapped)
-        uint8_t pRm=RA[rm];
-        size_t si=emitCondSkip(ctx,cond);
-        if(si==SIZE_MAX&&cond!=14)return false;
-
-        // Compute new CPSR with T bit from Rm[0]
-        // Store new PC = Rm & ~1 to TA (temp)
-        ctx.E(ppc_mr(TA,pRm));           // TA = Rm
-
-        // Update T bit in RCPSR
-        // Clear T (bit 26 from MSB = bit 5 from LSB)
-        ctx.E(ppc_rlwinm(TB,RCPSR,0,0,25));  // keep bits [31..27] MSB side
-        ctx.E(ppc_rlwinm(TC,RCPSR,0,27,31)); // keep bits [25..0] MSB side
-        ctx.E(ppc_or(RCPSR,TB,TC));           // T = 0
-        // T = Rm[0]: rotate left 5, isolate bit 26 from MSB
-        ctx.E(ppc_rlwinm(TB,TA,5,26,26));
-        ctx.E(ppc_or(RCPSR,RCPSR,TB));
-
-        // New PC = Rm & ~1
-        ctx.E(ppc_rlwinm(TA,TA,0,0,30));
-
-        // Exit block with new PC
-        // Sync r0-r14 and CPSR, then store exit PC
-        for(int i=0;i<15;i++) ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
-        ctx.E(ppc_mr(TA,RINTERP)); // Note: TA was Rm&~1, now overwritten for call
-        // BUG: we overwrote TA (which held Rm&~1) with RINTERP above!
-        // FIX: save Rm&~1 to a scratch slot first
-        // Actually we need to restructure this exit.
-        // Let's save the new PC to FRAME_SCR0 before the sync calls.
-        // Restart this:
-        ctx.cur = ctx.base + ctx.sz(); // continue from current position
-        // The above generated wrong code. Let me restart the BX emit:
-        // (In actual code, structure this properly from the start)
-
-        // PROPER BX EMIT (ignore the above partial emit, restructure):
-        // This illustrates why the function needs proper structure.
-        // The fix is to save the computed new PC before calling helpers.
-        // Since we're generating code, we need to emit the right sequence.
-        return false; // Fall back to interpreter for BX for now
-    }
-
-    // B / BL
     if((op&0x0E000000)==0x0A000000){
         bool lk=(op>>24)&1;
         int32_t off=(int32_t)(op<<8)>>6;
@@ -718,80 +619,17 @@ static bool emitBranch(Ctx& ctx,uint32_t op,uint32_t curPC){
         size_t si=emitCondSkip(ctx,cond);
         if(si==SIZE_MAX&&cond!=14)return false;
 
-        if(lk){
-            // LR = curPC + 4 (r14 = ARM r14)
-            ctx.li(RA[14],curPC+4);
-        }
-        // Target PC goes into exit
-        emitBlockExit(ctx,tgt);
+        if(lk)ctx.li(RA[14],curPC+4);
+        emitExit(ctx,tgt,EXIT_NORMAL);
 
         if(si!=SIZE_MAX){
             patchSkip(ctx,si);
-            // Fall-through: PC = curPC + 4
-            emitBlockExit(ctx,curPC+4);
+            emitExit(ctx,curPC+4,EXIT_NORMAL);
         }
         ctx.done=true;
         return true;
     }
     return false;
-}
-
-// Proper BX emit (separated for clarity)
-static bool emitBX(Ctx& ctx,uint32_t op,uint32_t curPC){
-    uint8_t cond=(op>>28)&0xF;
-    uint8_t rm=op&0xF;
-    if(rm==15)return false; // PC BX: complex
-
-    uint8_t pRm=RA[rm];
-    size_t si=emitCondSkip(ctx,cond);
-    if(si==SIZE_MAX&&cond!=14)return false;
-
-    // Save Rm to scratch before we start modifying registers
-    ctx.E(ppc_stw(pRm,FRAME_SCR2,1));  // SCR2 = Rm value
-
-    // Update T bit in RCPSR from Rm[0]
-    ctx.E(ppc_rlwinm(TB,RCPSR,0,0,25));   // keep bits above T
-    ctx.E(ppc_rlwinm(TC,RCPSR,0,27,31));  // keep bits below T
-    ctx.E(ppc_or(RCPSR,TB,TC));            // T = 0
-    ctx.E(ppc_lwz(TA,FRAME_SCR2,1));      // TA = Rm
-    ctx.E(ppc_rlwinm(TB,TA,5,26,26));     // TB = Rm[0]<<5 -> bit26
-    ctx.E(ppc_or(RCPSR,RCPSR,TB));        // set T
-
-    // New actual PC = Rm & ~1
-    ctx.E(ppc_rlwinm(TA,TA,0,0,30));     // TA = Rm & ~1
-    ctx.E(ppc_stw(TA,FRAME_SCR2,1));     // SCR2 = new PC
-
-    // Sync r0-r14
-    for(int i=0;i<15;i++) ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
-    ctx.E(ppc_mr(TA,RINTERP));
-    ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_mr(TC,RCPSR));
-    ctx.call((void*)JitHelp_syncTo);
-
-    // Store exit: JitHelp_storeExit(cpuIdx, newPC, cpsr)
-    ctx.E(ppc_mr(TA,RCPUIDX));
-    ctx.E(ppc_lwz(TB,FRAME_SCR2,1));
-    ctx.E(ppc_mr(TC,RCPSR));
-    ctx.call((void*)JitHelp_storeExit);
-
-    emitEpilogue(ctx);
-
-    if(si!=SIZE_MAX){
-        patchSkip(ctx,si);
-        // Fall-through (condition not met): exit with curPC+4
-        for(int i=0;i<15;i++) ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
-        ctx.E(ppc_mr(TA,RINTERP));
-        ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-        ctx.E(ppc_mr(TC,RCPSR));
-        ctx.call((void*)JitHelp_syncTo);
-        ctx.E(ppc_mr(TA,RCPUIDX));
-        ctx.li(TB,curPC+4);
-        ctx.E(ppc_mr(TC,RCPSR));
-        ctx.call((void*)JitHelp_storeExit);
-        emitEpilogue(ctx);
-    }
-    ctx.done=true;
-    return true;
 }
 
 // ============================================================
@@ -811,8 +649,7 @@ static bool emitLS(Ctx& ctx,uint32_t op,uint32_t curPC){
     if(immO)ctx.li(TA,op&0xFFF);
     else    ctx.E(ppc_mr(TA,RA[op&0xF]));
 
-    if(pre){if(up)ctx.E(ppc_add(TB,pRn,TA));
-             else ctx.E(ppc_subf(TB,TA,pRn));}
+    if(pre){if(up)ctx.E(ppc_add(TB,pRn,TA));else ctx.E(ppc_subf(TB,TA,pRn));}
     else   ctx.E(ppc_mr(TB,pRn));
 
     ctx.E(ppc_stw(TA,FRAME_SCR0,1));
@@ -830,8 +667,7 @@ static bool emitLS(Ctx& ctx,uint32_t op,uint32_t curPC){
     if(ld)ctx.E(ppc_mr(pRd,TA));
 
     ctx.E(ppc_lwz(TA,FRAME_SCR0,1));
-    if(!pre){if(up)ctx.E(ppc_add(pRn,pRn,TA));
-              else ctx.E(ppc_subf(pRn,TA,pRn));}
+    if(!pre){if(up)ctx.E(ppc_add(pRn,pRn,TA));else ctx.E(ppc_subf(pRn,TA,pRn));}
     else if(wb&&rn!=rd)ctx.E(ppc_lwz(pRn,FRAME_SCR1,1));
 
     patchSkip(ctx,si);
@@ -862,26 +698,23 @@ static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint32_t it=(op>>25)&7;
     switch(it){
         case 0:case 1:
-            // Multiply: bits[7:4] = 1001, bits[27:24] = 0000
             if((op&0x0FC000F0)==0x00000090)return emitMul(ctx,op);
-            // BX / BLX register
-            if((op&0x0FFFFFF0)==0x012FFF10)return emitBX(ctx,op,curPC);
-            if((op&0x0FFFFFF0)==0x012FFF30)return false; // BLX reg: complex
-            // Exclude: MRS/MSR/SWP/halfword loads
+            if((op&0x0FFFFFF0)==0x012FFF10||
+               (op&0x0FFFFFF0)==0x012FFF30)return emitBranch(ctx,op,curPC);
             if((op&0x0FB00FF0)==0x01000000||
                (op&0x0FB00000)==0x03200000||
                (op&0x0DB0F000)==0x010F0000||
                (op&0x0E000090)==0x00000090)return false;
             return emitDP(ctx,op,curPC);
         case 2:case 3:return emitLS(ctx,op,curPC);
-        case 4:return false;   // LDM/STM
+        case 4:return false;
         case 5:return emitBranch(ctx,op,curPC);
         default:return false;
     }
 }
 
 // ============================================================
-// Thumb emitters
+// Thumb emitters (all updated to use emitExit)
 // ============================================================
 static bool emitT_shifts(Ctx& ctx,uint16_t op){
     uint8_t ty=(op>>11)&3,rd=op&7,rs=(op>>3)&7;
@@ -938,8 +771,7 @@ static bool emitT_alu(Ctx& ctx,uint16_t op){
         case 6: {ctx.E(ppc_rlwinm(TA,RCPSR,0,29,29));ctx.E(ppc_mtxer(TA));
                  ctx.E(ppc_mr(TB,pRd));ctx.E(ppc_subfe(pRd,pRs,TB));
                  setNZ(ctx,pRd);setC_xer(ctx);setV_sub(ctx,pRd,TB,pRs);break;}
-        case 7: {ctx.E(ppc_subfic(TA,pRs,32));ctx.E(ppc_rlwnm(pRd,pRd,TA,0,31));
-                 setNZ(ctx,pRd);break;}
+        case 7: {ctx.E(ppc_subfic(TA,pRs,32));ctx.E(ppc_rlwnm(pRd,pRd,TA,0,31));setNZ(ctx,pRd);break;}
         case 8: {ctx.E(ppc_and(TA,pRd,pRs));setNZ(ctx,TA);break;}
         case 9: {ctx.E(ppc_mr(TB,pRd));ctx.E(ppc_addi(TA,0,0));
                  ctx.E(ppc_subfc(pRd,TB,TA));
@@ -968,30 +800,9 @@ static bool emitT_hiReg(Ctx& ctx,uint16_t op,uint32_t curPC){
         case 2:ctx.E(ppc_mr(pRd,pRs));break;
         case 3:{ // BX Rs
             ctx.E(ppc_stw(pRs,FRAME_SCR2,1));
-            // Update T
-            ctx.E(ppc_rlwinm(TB,RCPSR,0,0,25));
-            ctx.E(ppc_rlwinm(TC,RCPSR,0,27,31));
-            ctx.E(ppc_or(RCPSR,TB,TC));
-            ctx.E(ppc_lwz(TA,FRAME_SCR2,1));
-            ctx.E(ppc_rlwinm(TB,TA,5,26,26));
-            ctx.E(ppc_or(RCPSR,RCPSR,TB));
-            // New PC = Rs & ~1
-            ctx.E(ppc_rlwinm(TA,TA,0,0,30));
-            ctx.E(ppc_stw(TA,FRAME_SCR2,1));
-            // Exit
-            for(int i=0;i<15;i++) ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
-            ctx.E(ppc_mr(TA,RINTERP));
-            ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-            ctx.E(ppc_mr(TC,RCPSR));
-            ctx.call((void*)JitHelp_syncTo);
-            ctx.E(ppc_mr(TA,RCPUIDX));
-            ctx.E(ppc_lwz(TB,FRAME_SCR2,1));
-            ctx.E(ppc_mr(TC,RCPSR));
-            ctx.call((void*)JitHelp_storeExit);
-            emitEpilogue(ctx);
+            emitBXexit(ctx,pRs,true,curPC+2);
             ctx.done=true;
-            break;
-        }
+            break;}
     }
     return true;
 }
@@ -1028,7 +839,7 @@ static bool emitT_memReg(Ctx& ctx,uint16_t op){
     if(!ld)ctx.E(ppc_mr(TD,pRd));
     ctx.call(fn);
     if(ld){
-        if(op97==3) ctx.E(ppc_extsb(pRd,TA));
+        if(op97==3)ctx.E(ppc_extsb(pRd,TA));
         else if(op97==7)ctx.E(ppc_extsh(pRd,TA));
         else ctx.E(ppc_mr(pRd,TA));
     }
@@ -1070,7 +881,7 @@ static bool emitT_branch(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t h=(op>>12)&0xF;
     if(h==0xE){
         int32_t off=(int32_t)(op<<21)>>20;
-        emitBlockExit(ctx,(uint32_t)(curPC+4+off));
+        emitExit(ctx,(uint32_t)(curPC+4+off),EXIT_NORMAL);
         ctx.done=true;return true;
     }
     if(h==0xD){
@@ -1083,9 +894,9 @@ static bool emitT_branch(Ctx& ctx,uint16_t op,uint32_t curPC){
         uint8_t inv=(cb.bo==12)?4:(cb.bo==4?12:cb.bo);
         size_t si=ctx.sz();
         ctx.E(ppc_bc(inv,cb.bi,0));
-        emitBlockExit(ctx,tgt);
+        emitExit(ctx,tgt,EXIT_NORMAL);
         patchSkip(ctx,si);
-        emitBlockExit(ctx,fall);
+        emitExit(ctx,fall,EXIT_NORMAL);
         ctx.done=true;return true;
     }
     return false;
@@ -1098,12 +909,11 @@ static bool emitT_bl(Ctx& ctx,uint16_t op1,uint16_t op2,uint32_t curPC){
     ctx.li(RA[14],(curPC+4)|1u);
     if(blx){
         tgt&=~3u;
-        // Switch to ARM mode: clear T bit
-        ctx.E(ppc_rlwinm(TB,RCPSR,0,0,25));
-        ctx.E(ppc_rlwinm(TC,RCPSR,0,27,31));
-        ctx.E(ppc_or(RCPSR,TB,TC));
+        ctx.E(ppc_rlwinm(TA,RCPSR,0,0,25));
+        ctx.E(ppc_rlwinm(TB,RCPSR,0,27,31));
+        ctx.E(ppc_or(RCPSR,TA,TB));  // clear T
     }
-    emitBlockExit(ctx,tgt&~1u);
+    emitExit(ctx,tgt&~1u,EXIT_NORMAL);
     ctx.done=true;return true;
 }
 
@@ -1113,13 +923,11 @@ static bool emitT_bl(Ctx& ctx,uint16_t op1,uint16_t op2,uint32_t curPC){
 static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t h=(op>>12)&0xF;
     switch(h){
-        case 0x0:{uint8_t b11=(op>>11)&3;
-                   if(b11<3)return emitT_shifts(ctx,op);
-                   return emitT_addSub3(ctx,op);}
+        case 0x0:{uint8_t b=(op>>11)&3;if(b<3)return emitT_shifts(ctx,op);return emitT_addSub3(ctx,op);}
         case 0x1:return emitT_imm8(ctx,op);
-        case 0x2:{uint8_t b10=(op>>10)&3;
-                   if(b10==0)return emitT_alu(ctx,op);
-                   if(b10==1)return emitT_hiReg(ctx,op,curPC);
+        case 0x2:{uint8_t b=(op>>10)&3;
+                   if(b==0)return emitT_alu(ctx,op);
+                   if(b==1)return emitT_hiReg(ctx,op,curPC);
                    return emitT_ldrPc(ctx,op,curPC);}
         case 0x3:return emitT_memReg(ctx,op);
         case 0x4:return emitT_memReg(ctx,op);
@@ -1143,14 +951,10 @@ static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
 // ============================================================
 static bool validPC(uint32_t pc,bool gba){
     pc&=~1u;
-    if(gba)return pc<0x4000u||
-                  (pc>=0x02000000u&&pc<0x02040000u)||
-                  (pc>=0x03000000u&&pc<0x03008000u)||
-                  (pc>=0x08000000u&&pc<0x0E000000u);
-    return pc<0x4000u||
-           (pc>=0x02000000u&&pc<0x02400000u)||
-           (pc>=0x03000000u&&pc<0x03800000u)||
-           (pc>=0xFFFF0000u);
+    if(gba)return pc<0x4000u||(pc>=0x02000000u&&pc<0x02040000u)||
+                   (pc>=0x03000000u&&pc<0x03008000u)||(pc>=0x08000000u&&pc<0x0E000000u);
+    return pc<0x4000u||(pc>=0x02000000u&&pc<0x02400000u)||
+           (pc>=0x03000000u&&pc<0x03800000u)||(pc>=0xFFFF0000u);
 }
 
 // ============================================================
@@ -1173,7 +977,7 @@ static JitBlock* compile(Interpreter* interp,Core* core,
     ctx.interp=interp;ctx.core=core;
 
     emitPrologue(ctx);
-    emitSyncFromBlock(ctx);
+    emitSyncFrom(ctx);
 
     uint32_t curPC=armPC;int n=0;
 
@@ -1189,24 +993,32 @@ static JitBlock* compile(Interpreter* interp,Core* core,
                 }
             }
             bool ok=dispThumb(ctx,op,curPC);
-            if(!ok){emitFallback(ctx,curPC);break;}
-            curPC+=2;n++;
-            uint8_t h=(op>>12)&0xF;
-            if(h==0xD||h==0xE)ctx.done=true;
+            if(!ok){
+                // Fallback: exit and let interpreter run this opcode
+                emitExit(ctx,curPC,EXIT_FALLBACK);
+                ctx.done=true;
+            }else{
+                curPC+=2;n++;
+                uint8_t h=(op>>12)&0xF;
+                if(h==0xD||h==0xE)ctx.done=true;
+            }
         }else{
             uint32_t op=core->memory.read<uint32_t>(arm7,curPC);
             bool ok=dispARM(ctx,op,curPC);
-            if(!ok){emitFallback(ctx,curPC);break;}
-            curPC+=4;n++;
-            uint32_t it=(op>>25)&7;
-            if(it==5)ctx.done=true;
-            if((op&0x0FFFFFF0)==0x012FFF10)ctx.done=true;
+            if(!ok){
+                emitExit(ctx,curPC,EXIT_FALLBACK);
+                ctx.done=true;
+            }else{
+                curPC+=4;n++;
+                uint32_t it=(op>>25)&7;
+                if(it==5)ctx.done=true;
+                if((op&0x0FFFFFF0)==0x012FFF10)ctx.done=true;
+            }
         }
     }
 
     if(!ctx.done){
-        // Normal block end: exit with next sequential PC
-        emitBlockExit(ctx,curPC);
+        emitExit(ctx,curPC,EXIT_NORMAL);
     }
 
     size_t wds=ctx.sz();
@@ -1218,23 +1030,28 @@ static JitBlock* compile(Interpreter* interp,Core* core,
 
 // ============================================================
 // Run loops
+//
+// CRITICAL: setPC() is called AFTER executeBlock_asm() returns.
+// This ensures flushPipeline() doesn't run while inside JIT frame.
+// For EXIT_FALLBACK: setPC then run one interpreter opcode.
 // ============================================================
 void runJitNds(Core& core){
     for(int cpu=0;cpu<2;cpu++){
         Interpreter& interp=core.interpreter[cpu];
         if(interp.halted)continue;
+
         uint32_t pc=interp.getActualPC();
         JitBlock* b=compile(&interp,&core,pc,cpu==1,cpu);
         if(b){
             executeBlock_asm(b->code);
-            // After block returns: apply the exit PC via setPC
-            // This is the ONLY place setPC is called, safely outside JIT frame
-            interp.setPC(jitExitPC[cpu]);
-            // CPSR was already synced by JitHelp_syncTo inside the block
-            // but setPC may update CPSR T bit from the new PC mode.
-            // Actually setPC doesn't change CPSR. The T bit update for BX
-            // was done inside the block. So this is correct.
+            // Apply exit state (r0-r14, CPSR already synced by JitHelp_syncTo)
+            interp.setPC(g_exitPC[cpu]);
+            if(g_exitReason[cpu]==EXIT_FALLBACK){
+                // Interpreter runs the unhandled opcode from g_exitPC[cpu]
+                interp.jitRunOpcode();
+            }
         }else{
+            // PC is invalid or block compilation failed: run one opcode
             interp.jitRunOpcode();
         }
     }
@@ -1248,7 +1065,10 @@ void runJitGba(Core& core){
         JitBlock* b=compile(&interp,&core,pc,true,1);
         if(b){
             executeBlock_asm(b->code);
-            interp.setPC(jitExitPC[1]);
+            interp.setPC(g_exitPC[1]);
+            if(g_exitReason[1]==EXIT_FALLBACK){
+                interp.jitRunOpcode();
+            }
         }else{
             interp.jitRunOpcode();
         }
@@ -1264,20 +1084,19 @@ bool initJit(Core* core){
     if(!codeBuf){printf("[JIT] alloc fail\n");return false;}
     codePos=0;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
-    jitExitPC[0]=jitExitPC[1]=0;
-    jitExitCPSR[0]=jitExitCPSR[1]=0;
+    g_exitPC[0]=g_exitPC[1]=0;
+    g_exitCPSR[0]=g_exitCPSR[1]=0;
+    g_exitReason[0]=g_exitReason[1]=EXIT_NORMAL;
     printf("[JIT] buf=%p (%zuKB)\n",(void*)codeBuf,JIT_BYTES>>10);
     if(core)core->setRunFunc(core->gbaMode?runJitGba:runJitNds);
     return true;
 }
-
 void shutdownJit(Core* core){
     if(core)core->setRunFunc(core->gbaMode
         ?static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true,0>)
         :&Interpreter::runCoreNds);
     free(codeBuf);codeBuf=nullptr;
 }
-
 void invalidateJitRange(uint32_t start,uint32_t end){
     for(size_t i=0;i<CSIZ;i++)
         if(cache[i].valid&&cache[i].armPC>=start&&cache[i].armPC<end)
