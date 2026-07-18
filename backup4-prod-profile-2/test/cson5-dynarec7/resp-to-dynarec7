@@ -1,0 +1,71 @@
+Looking through your JIT emitter, I found a **concrete, high-impact bug** that fully explains the symptoms you're seeing (hangs after boot logo/white screen, and wild/garbage memory addresses being read).
+
+## The bug: inverted conditional branches in `emitBlockXfer` and `emitT_pushPop`
+
+You have a repeated code pattern that looks like this:
+
+```cpp
+cmpi ...
+bc(BO, BI, +8)      // "skip the next instruction if condition X"
+b <placeholder>      // patched later to jump PAST the block that follows
+<code block A>
+<patched target>:
+<code block B>
+```
+
+This idiom only works correctly if **block A is the "condition-false" path** and the `bc` skips forward into **block A only when the condition is true** (i.e. block A must be the very next instruction after the placeholder `b`, and the `bc` must jump straight into it). In `emitSyncFrom` you did this correctly. But in three other places, you emit the *opposite* code layout (the "success"/"true" case block is placed second, after the placeholder) while keeping a `bge`/`bne` condition that was written for the other layout. The result is that **the branch is exactly backwards** — it executes the wrong path every single time.
+
+### Where this bites you
+
+- In `emitBlockXfer`, the "did `JitHelp_armBlock` succeed?" check is inverted → every ARM `LDM`/`STM` instruction takes the fallback path when it *succeeded*, and vice versa. This causes ARM `LDMFD/STMFD` (extremely common for stack push/pop in function prologues/epilogues) to double-execute or use stale PC/registers.
+- The `loadPC` check right after it is *also* inverted → `LDM ..., {..., pc}` (a very common ARM function-return pattern) resumes at the wrong address instead of the popped one.
+- In `emitT_pushPop`, the exact same bug hits **Thumb `POP {..., pc}`** — i.e. essentially every Thumb function return. Since `pop {rX-rY, pc}` is the standard Thumb epilogue emitted by every compiler, this single bug corrupts control flow almost immediately after any compiled code starts running, which is exactly consistent with "boots logo appears, then hangs" and "white screen, stuck".
+
+Once control flow goes to the wrong address, registers used as base pointers get corrupted, and later LDR/STR/LDM instructions end up reading small garbage addresses like `0x7FFF`/`0x8000`-ish — matching the "Invalid read" addresses you're seeing (which look suspiciously like leftover register-list bitmasks / corrupted stack values, a classic symptom of this kind of return-address corruption).
+
+## The fix
+
+Change `BO=4` (branch-if-false) to `BO=12` (branch-if-true) in these three spots, keeping `BI` and the offset the same:
+
+**1. `emitBlockXfer` — result check:**
+```cpp
+// before
+ctx.E(ppc_bc(4, 0, 8)); // bge +8
+// after
+ctx.E(ppc_bc(12, 0, 8)); // blt +8  (jump into fallback block only when TA < 0)
+```
+
+**2. `emitBlockXfer` — loadPC check:**
+```cpp
+// before
+ctx.E(ppc_bc(4, 2, 8)); // bne +8
+// after
+ctx.E(ppc_bc(12, 2, 8)); // beq +8  (jump into commitExitDyn only when TA == 1)
+```
+
+**3. `emitT_pushPop` — pop-pc check:**
+```cpp
+// before
+ctx.E(ppc_bc(4, 2, 8));
+// after
+ctx.E(ppc_bc(12, 2, 8)); // beq +8  (jump into commitExitDyn only when TA == 1)
+```
+
+With these three changes:
+
+- ARM `LDM/STM` (including with `pc` in the register list) will correctly commit and, if it wrote `pc`, exit with the dynamically-loaded target instead of falling through to `curPC`/`curPC+4` incorrectly.
+- Thumb `POP {..., pc}` will correctly resume execution at the popped return address instead of blindly continuing at `curPC+2`.
+
+This should fix both the hangs and the invalid-address crashes, since they're really symptoms of the same underlying "function returns go to the wrong place" bug.
+
+## Secondary note (performance, not correctness)
+
+Once the above is fixed and you've confirmed correct behavior, you'll still want to raise:
+
+```cpp
+static const size_t BLK_ARMS = 1;
+```
+
+1 instruction per compiled block means every single guest instruction pays the full cost of a cache lookup, full prologue/epilogue (18-register save/restore), and a `syncFrom`/`commit` round trip through the interpreter. That's almost certainly the main cause of your very low fps even once games are running correctly. Once you've verified correctness with a handful of games at `BLK_ARMS = 1`, bump it to something like 16–32 (watching out for the `n < BLK_ARMS` / `ctx.done` early-exit interaction in the compile loop, e.g. in `emitT_bl`'s call site where `continue` doesn't check `ctx.done` — currently harmless only because `BLK_ARMS == 1` forces loop exit immediately after).
+
+I'd recommend applying the 3 branch fixes first, re-testing, and then separately tackling the `BLK_ARMS` performance tuning as its own step so you can isolate whether any remaining issues are correctness or performance related.
