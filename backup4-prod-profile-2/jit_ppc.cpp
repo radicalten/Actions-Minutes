@@ -225,11 +225,22 @@ struct Ctx {
 // ============================================================
 extern "C" {
 
-void JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
-    uint32_t** p=interp->getRegisters();
+extern "C" __attribute__((noinline))
+void JitHelp_syncFrom(Interpreter* interp, uint32_t* regs, uint32_t* outCPSR){
+    if(!interp || !regs || !outCPSR){
+        printf("[JIT] JitHelp_syncFrom: null pointer! interp=%p regs=%p cpsr=%p\n",
+               (void*)interp,(void*)regs,(void*)outCPSR);
+        return;
+    }
+    uint32_t** p = interp->getRegisters();
+    if(!p){
+        printf("[JIT] JitHelp_syncFrom: getRegisters() returned null!\n");
+        return;
+    }
     for(int i=0;i<15;i++) regs[i]=*p[i];
     *outCPSR=interp->getCpsrRef();
 }
+
 void JitHelp_syncTo(Interpreter* interp,uint32_t* regs,uint32_t cpsr){
     uint32_t** p=interp->getRegisters();
     for(int i=0;i<15;i++) *p[i]=regs[i];
