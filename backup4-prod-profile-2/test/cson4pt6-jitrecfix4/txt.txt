@@ -295,6 +295,7 @@ CR 22887494 CTR 00000000 XER 00000000
 STACK DUMP:
 0x000e2b04 --> 0x000e2b04 --> 00000000
 
-
+=====
+THis change appeared to be a regression as the gba logo no longer loads and emerald still crashes but with a new error code. nds still white screen.
 
 
