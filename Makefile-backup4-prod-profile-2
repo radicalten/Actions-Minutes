@@ -17,7 +17,7 @@ LDFLAGS += $(CXXFLAGS) \
 -L/opt/devkitpro/libogc/lib/wii \
 -lasnd -lwiikeyboard -lfat -lwiiuse -lbte -logc -lm
 TARGET  := myapp
-EXCLUDE :=
+EXCLUDE := backup4-prod-profile-2/jit_ppc.cpp 
 SRCDIR 	:= backup4-prod-profile-2
 C_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.cpp)))
 S_SOURCES = $(foreach dir, $(SRCDIR), $(filter-out $(EXCLUDE), $(wildcard $(dir)/*.S)))
