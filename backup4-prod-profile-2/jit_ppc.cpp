@@ -173,12 +173,16 @@ static const size_t JIT_WORDS = JIT_BYTES / 4;
 static const size_t BLK_ARMS = 1;
 static const size_t BLK_WDS  = BLK_ARMS * 280 + 128;
 
+static void*     codeBufRaw = nullptr;
 static uint32_t* codeBuf   = nullptr;
 static size_t    codePos   = 0;
 static uint32_t  cacheGen  = 0;
 static bool      g_jitLive = false;
 static uint32_t  g_dbgFB   = 0;
 static uint32_t  g_trace   = 0;
+
+static uint32_t g_dbgFallback = 0;
+static uint32_t g_dbgNormal   = 0;
 
 struct JitBlock {
     uint32_t  armPC;
@@ -294,11 +298,8 @@ int JitHelp_syncFrom(Interpreter* interp, uint32_t* regs, uint32_t* outCPSR) {
 int JitHelp_commit(Interpreter* interp, int cpu,
                    uint32_t* regs, uint32_t cpsr,
                    uint32_t pc, int reason) {
-    if (!interp || !regs || cpu < 0 || cpu > 1) return -1;
-    if (pc >= 0x80000000u) {
-        g_exitReason[cpu] = EXIT_FALLBACK;
+    if (!interp || !regs || cpu < 0 || cpu > 1)
         return -1;
-    }
 
     uint32_t** p = interp->getRegisters();
     if (!p) return -1;
@@ -1266,8 +1267,12 @@ static bool emitT_alu(Ctx& ctx, uint16_t op) {
             ctx.E(ppc_mr(TB, d)); ctx.E(ppc_subfe(d, s, TB));
             setNZ(ctx, d); setC_xer(ctx); setV_sub(ctx, d, TB, s); break;
         case 7:
-            ctx.E(ppc_subfic(TA, s, 32)); ctx.E(ppc_rlwnm(d, d, TA, 0, 31));
-            setNZ(ctx, d); break;
+            /*
+             * ROR Rd, Rs:
+             * Carry behavior depends on Rs[4:0], including the zero-shift case.
+             * Use the interpreter until this is implemented exactly.
+             */
+            return false;
         case 8: ctx.E(ppc_and(TA, d, s)); setNZ(ctx, TA); break;
         case 9:
             ctx.E(ppc_addi(TA, 0, 0)); ctx.E(ppc_subfc(d, s, TA));
@@ -1417,12 +1422,25 @@ static bool emitT_spLoad(Ctx& ctx, uint16_t op, uint32_t curPC) {
 }
 
 static bool emitT_addSpPc(Ctx& ctx, uint16_t op, uint32_t curPC) {
-    uint8_t h = (op >> 12) & 0xF;
-    if (h == 0xA) {
-        uint8_t rd = (op >> 8) & 7;
-        bool sp = (op >> 11) & 1;
-        uint32_t imm = (uint32_t)(op & 0xFF) << 2;
-        if (sp) {
+    /*
+     * 1010 Rd imm8:
+     *   ADD Rd, PC, #imm
+     *   ADD Rd, SP, #imm
+     *
+     * 1011 0000 0iiiiiii:
+     *   ADD SP, #imm
+     *
+     * 1011 0000 1iiiiiii:
+     *   SUB SP, #imm
+     */
+
+    /* ADD Rd, PC/SP, #imm */
+    if ((op & 0xF000) == 0xA000) {
+        const uint8_t rd = (op >> 8) & 7;
+        const bool fromSp = (op & 0x0800) != 0;
+        const uint32_t imm = (uint32_t)(op & 0xFF) << 2;
+
+        if (fromSp) {
             ctx.li(TA, imm);
             ctx.E(ppc_add(RA[rd], RA[13], TA));
         } else {
@@ -1430,19 +1448,23 @@ static bool emitT_addSpPc(Ctx& ctx, uint16_t op, uint32_t curPC) {
         }
         return true;
     }
-    if (h == 0xB) {
-        uint8_t s = (op >> 8) & 0xF;
-        if (s == 0) {
-            ctx.li(TA, (uint32_t)(op & 0x7F) << 2);
-            ctx.E(ppc_add(RA[13], RA[13], TA));
-            return true;
-        }
-        if (s == 1) {
-            ctx.li(TA, (uint32_t)(op & 0x7F) << 2);
+
+    /* ADD/SUB SP, #imm */
+    if ((op & 0xFF00) == 0xB000 ||
+        (op & 0xFF00) == 0xB080) {
+        const bool sub = (op & 0x0080) != 0;
+        const uint32_t imm = (uint32_t)(op & 0x7F) << 2;
+
+        ctx.li(TA, imm);
+
+        if (sub)
             ctx.E(ppc_subf(RA[13], TA, RA[13]));
-            return true;
-        }
+        else
+            ctx.E(ppc_add(RA[13], RA[13], TA));
+
+        return true;
     }
+
     return false;
 }
 
@@ -1538,39 +1560,128 @@ static bool emitT_bl(Ctx& ctx, uint16_t op1, uint16_t op2, uint32_t curPC) {
 }
 
 static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
-    uint8_t h = (op >> 12) & 0xF;
-    switch (h) {
-        case 0x0:
-            if (((op >> 11) & 3) < 3) return emitT_shifts(ctx, op);
-            return emitT_addSub3(ctx, op);
-        case 0x1:
-            return emitT_imm8(ctx, op);
-        case 0x2: {
-            uint8_t b = (op >> 10) & 3;
-            if (b == 0) return emitT_alu(ctx, op);
-            if (b == 1) return emitT_hiReg(ctx, op, curPC);
-            return emitT_ldrPc(ctx, op, curPC);
-        }
-        case 0x3: case 0x4: case 0x5:
-            return emitT_memReg(ctx, op);
-        case 0x6: case 0x7: case 0x8:
-            return emitT_memImm(ctx, op);
-        case 0x9:
-            return emitT_spLoad(ctx, op, curPC);
-        case 0xA:
-            return emitT_addSpPc(ctx, op, curPC);
-        case 0xB:
-            if (((op >> 8) & 0xF) <= 1) return emitT_addSpPc(ctx, op, curPC);
-            if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6)
-                return emitT_pushPop(ctx, op, curPC);
-            return false;
-        case 0xC:
-            return emitT_ldmStm(ctx, op);
-        case 0xD: case 0xE:
-            return emitT_branch(ctx, op, curPC);
-        default:
-            return false;
+    /*
+     * Thumb-1 instruction groups:
+     *
+     * 00000-00010 : move shifted register
+     * 00011       : add/subtract register/immediate3
+     * 001xx       : MOV/CMP/ADD/SUB immediate8
+     * 010000      : ALU operations
+     * 010001      : high-register operations / BX
+     * 01001       : LDR literal
+     * 0101        : register-offset load/store
+     * 0110        : word immediate load/store
+     * 0111        : byte immediate load/store
+     * 1000        : halfword immediate load/store
+     * 1001        : SP-relative load/store
+     * 1010        : ADD Rd, PC/SP, #imm
+     * 1011        : misc / stack operations
+     * 1100        : LDMIA / STMIA
+     * 1101        : conditional branch / SWI
+     * 11100       : unconditional branch
+     * 11110/11111 : BL prefix/suffix
+     * 11101       : BLX suffix
+     */
+
+    /* 000xxxxx xxxxxxxx: shifts and add/sub. */
+    if ((op & 0xE000) == 0x0000) {
+        /*
+         * 00000 / 00001 / 00010 = LSL/LSR/ASR immediate.
+         * 00011                    = ADD/SUB register/immediate3.
+         */
+        if ((op & 0x1800) != 0x1800)
+            return emitT_shifts(ctx, op);
+
+        return emitT_addSub3(ctx, op);
     }
+
+    /* 001xxxxx xxxxxxxx: MOV/CMP/ADD/SUB immediate8. */
+    if ((op & 0xE000) == 0x2000)
+        return emitT_imm8(ctx, op);
+
+    /* 010000xxxxxxxxxx: Thumb ALU operations. */
+    if ((op & 0xFC00) == 0x4000)
+        return emitT_alu(ctx, op);
+
+    /* 010001xxxxxxxxxx: high register operation / BX / BLX register. */
+    if ((op & 0xFC00) == 0x4400)
+        return emitT_hiReg(ctx, op, curPC);
+
+    /* 01001xxxxxxxxxxx: LDR Rd, [PC, #imm]. */
+    if ((op & 0xF800) == 0x4800)
+        return emitT_ldrPc(ctx, op, curPC);
+
+    /* 0101xxxxxxxxxxxx: register-offset load/store. */
+    if ((op & 0xF000) == 0x5000)
+        return emitT_memReg(ctx, op);
+
+    /*
+     * 0110: STR/LDR word immediate
+     * 0111: STRB/LDRB immediate
+     * 1000: STRH/LDRH immediate
+     */
+    if ((op & 0xE000) == 0x6000 ||
+        (op & 0xF000) == 0x8000)
+        return emitT_memImm(ctx, op);
+
+    /* 1001: STR/LDR SP-relative. */
+    if ((op & 0xF000) == 0x9000)
+        return emitT_spLoad(ctx, op, curPC);
+
+    /* 1010: ADD Rd, PC/SP, #imm. */
+    if ((op & 0xF000) == 0xA000)
+        return emitT_addSpPc(ctx, op, curPC);
+
+    if ((op & 0xF000) == 0xB000) {
+        /*
+         * 1011 0000: ADD/SUB Sp, #imm
+         * 1011 010x: PUSH
+         * 1011 110x: POP
+         */
+        if ((op & 0xFF00) == 0xB000 ||
+            (op & 0xFF00) == 0xB080)
+            return emitT_addSpPc(ctx, op, curPC);
+
+        if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6)
+            return emitT_pushPop(ctx, op, curPC);
+
+        /*
+         * Other 0xBxxx instructions include:
+         *   SXTH/SXTB/UXTH/UXTB
+         *   REV/REV16/REVSH
+         *   BKPT
+         *   CPS
+         *
+         * Let the interpreter handle those for now.
+         */
+        return false;
+    }
+
+    /* 1100: STMIA/LDMIA. */
+    if ((op & 0xF000) == 0xC000)
+        return emitT_ldmStm(ctx, op);
+
+    /* 1101: conditional branch / SWI. */
+    if ((op & 0xF000) == 0xD000)
+        return emitT_branch(ctx, op, curPC);
+
+    /*
+     * 1110:
+     *   11100 = unconditional B
+     *   11101 = BLX suffix
+     *
+     * emitT_branch deliberately rejects BLX suffixes, which is correct:
+     * compile() consumes a BL/BLX pair together.
+     */
+    if ((op & 0xF000) == 0xE000)
+        return emitT_branch(ctx, op, curPC);
+
+    /*
+     * 1111:
+     * BL prefix / suffix.  compile() recognizes a complete pair before
+     * calling dispThumb().  A lone half must fall back to the interpreter.
+     */
+    return false;
 }
 
 // ========================= compile / run =========================
@@ -1753,14 +1864,29 @@ static void runCpu(Core& core, int cpu, bool gba) {
     }
 
     if (reason == EXIT_FALLBACK) {
-        // Commit wrote r0-r14+cpsr only. Set PC once, then one interpreter insn.
+        if (g_dbgFallback++ < 128) {
+            printf("[JIT] fallback cpu=%d mode=%s pc=%08X next=%08X cpsr=%08X\n",
+                   cpu,
+                   gba ? "gba" : "nds",
+                   pc,
+                   expc,
+                   interp.getCpsrRef());
+        }
+
         if (validPC(expc, gba))
             interp.setPC(expc);
+
         interp.jitRunOpcode();
         return;
     }
 
-    // NORMAL: commit already called setPC(expc).
+    if (g_dbgNormal++ < 32) {
+        printf("[JIT] normal cpu=%d mode=%s pc=%08X -> %08X\n",
+               cpu,
+               gba ? "gba" : "nds",
+               pc,
+               expc);
+    }
 }
 
 void runJitNds(Core& core) {
@@ -1791,6 +1917,7 @@ void runJitGba(Core& core) {
 bool initJit(Core* core) {
     g_jitLive = false;
     codeBuf = nullptr;
+    codeBufRaw = nullptr;
 
     void* raw = memalign(32, JIT_BYTES);
     if (!raw) {
@@ -1799,7 +1926,10 @@ bool initJit(Core* core) {
     }
 
     uintptr_t addr = (uintptr_t)raw;
-    bool ok = (addr >= 0x80000000u && addr + JIT_BYTES <= 0x81800000u);
+
+    bool ok = (addr >= 0x80000000u &&
+               addr + JIT_BYTES <= 0x81800000u);
+
     if (!ok && addr < 0x01800000u) {
         addr |= 0x80000000u;
         ok = (addr + JIT_BYTES <= 0x81800000u);
@@ -1807,6 +1937,7 @@ bool initJit(Core* core) {
         addr -= 0x40000000u;
         ok = (addr + JIT_BYTES <= 0x81800000u);
     }
+
     if (!ok) {
         printf("[JIT] not in MEM1: %p\n", raw);
         free(raw);
@@ -1820,40 +1951,64 @@ bool initJit(Core* core) {
         return false;
     }
 
-    codeBuf = (uint32_t*)addr;
+    codeBufRaw = raw;
+    codeBuf = reinterpret_cast<uint32_t*>(addr);
+
     codePos = 0;
-    cacheGen = 0;
+    cacheGen = 1;
     g_dbgFB = 0;
     g_trace = 0;
-    for (size_t i = 0; i < CSIZ; i++) cache[i].valid = false;
-    memset(g_exitPC, 0, sizeof g_exitPC);
-    memset(g_exitCPSR, 0, sizeof g_exitCPSR);
-    g_exitReason[0] = g_exitReason[1] = EXIT_NORMAL;
+
+    for (size_t i = 0; i < CSIZ; i++)
+        cache[i].valid = false;
+
+    memset(g_exitPC, 0, sizeof(g_exitPC));
+    memset(g_exitCPSR, 0, sizeof(g_exitCPSR));
+
+    g_exitReason[0] = EXIT_NORMAL;
+    g_exitReason[1] = EXIT_NORMAL;
 
     memset(codeBuf, 0, JIT_BYTES);
     DCFlushRange(codeBuf, JIT_BYTES);
     ICInvalidateRange(codeBuf, JIT_BYTES);
 
     g_jitLive = true;
-    printf("[JIT] ready buf=%p (%zuKB) tramp=%p BLK_ARMS=%zu\n",
-           (void*)codeBuf, JIT_BYTES >> 10, (void*)tr, BLK_ARMS);
-    printf("[JIT] FALLBACK: commit regs only; runner setPC+jitRunOpcode once\n");
+
+    printf("[JIT] ready buf=%p raw=%p (%zuKB) tramp=%p BLK_ARMS=%zu\n",
+           (void*)codeBuf,
+           codeBufRaw,
+           JIT_BYTES >> 10,
+           (void*)tr,
+           BLK_ARMS);
 
     if (core)
         core->setRunFunc(core->gbaMode ? runJitGba : runJitNds);
+
     return true;
 }
 
 void shutdownJit(Core* core) {
     g_jitLive = false;
+
     if (core) {
-        core->setRunFunc(core->gbaMode
-            ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
-            : &Interpreter::runCoreNds);
+        core->setRunFunc(
+            core->gbaMode
+                ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
+                : &Interpreter::runCoreNds
+        );
     }
-    codeBuf = nullptr;
+
+    for (size_t i = 0; i < CSIZ; i++)
+        cache[i].valid = false;
+
     codePos = 0;
-    for (size_t i = 0; i < CSIZ; i++) cache[i].valid = false;
+
+    if (codeBufRaw) {
+        free(codeBufRaw);
+        codeBufRaw = nullptr;
+    }
+
+    codeBuf = nullptr;
 }
 
 void invalidateJitRange(uint32_t start, uint32_t end) {
