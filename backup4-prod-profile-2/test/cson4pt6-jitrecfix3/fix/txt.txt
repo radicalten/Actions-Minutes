@@ -186,4 +186,29 @@ CR 99000929 CTR 80064148 XER 000000000
 STACK DUMP:
 0x805493f8 --? 0x80549398 --> 00000000 --> 0x80069b30 --> 0x8006ac34 --> 0x800b7934
 
+===
+Ok it looks like we have circled back to the start of fix3 info in that once again nds starts white with 30-60fps, gba starts black with 60fps, except for emerald which still crashes. However, this is better than before because even contra4 and others are the full 30-60fps (although they are stuck on the white screen) intead of 1-10fps stuck. 
+
+here is the next set of changes after the above update:
+Most nds games launch and go to the white screen but get stuck there (internal fps display 30-60fps)
+When launching a gba game I get a black screen but it gets stuck there (internal fps display 30-60fps)
+Invalid read from 0x00000000, PC = 0x800e73f4
+Invalid read from 0x00000004, PC = 0x800e73fc
+Invalid read from 0x00000008, PC = 0x800e7404
+Invalid read from 0x0000000c, PC = 0x800e7408
+Invalid read from 0x00000010, PC = 0x800e745c
+Invalid read from 0x00000014, PC = 0x800e745c
+Invalid read from 0x00000018, PC = 0x800e7494
+Invalid read from 0x0000001a, PC = 0x800e73a4
+Invalid read from 0x00000019, PC = 0x800e73a8
+And emerald gba crashes with: 
+And when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+GPR07 80527720 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80350860
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
 
