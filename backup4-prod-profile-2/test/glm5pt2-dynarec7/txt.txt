@@ -20,3 +20,43 @@ Invalid read from 0x00008002, PC = 0x800ec2a8
 Invalid read from 0x00008005, PC = 0x800ec2a4
 Invalid read from 0x00008004, PC = 0x800ec2a8
 ...
+
+====
+This next fix did not change anything either. here are the new error codes:
+ACWW NDS:
+Invalid read from 0xffffffff, PC = 0x800ec3b4
+Invalid read from 0x00000001, PC = 0x800ec2c4
+Invalid read from 0x00000000, PC = 0x800ec2c8
+Invalid read from 0x00000003, PC = 0x800ec2c4
+Invalid read from 0x00000002, PC = 0x800ec2c8
+Invalid read from 0x00000005, PC = 0x800ec2c4
+Invalid read from 0x00000004, PC = 0x800ec2c8
+...
+gbaEmerald:
+Attempted to load a discarded value
+Invalid read from 0x00007fff, PC = 0x800ec3b4
+Invalid read from 0x00008001, PC = 0x800ec2c4
+Invalid read from 0x00008000, PC = 0x800ec2c8
+Invalid read from 0x00008003, PC = 0x800ec2c4
+Invalid read from 0x00008002, PC = 0x800ec2c8
+Invalid read from 0x00008002, PC = 0x800ec2c8
+Invalid read from 0x00008005, PC = 0x800ec2c4
+
+====
+the next fix didn't change anything either. it seems clear that glm5.2 is not up to the task at this point. as is clear from the invalid reads not even changing. 
+ACWW NDS:
+Invalid read from 0xffffffff, PC = 0x800ec3b4
+Invalid read from 0x00000001, PC = 0x800ec2c4
+Invalid read from 0x00000000, PC = 0x800ec2c8
+Invalid read from 0x00000003, PC = 0x800ec2c4
+Invalid read from 0x00000002, PC = 0x800ec2c8
+...
+gbaEmerald:
+Attempted to load a discarded value
+Invalid read from 0x00007fff, PC = 0x800ec3b4
+Invalid read from 0x00008001, PC = 0x800ec2c4
+Invalid read from 0x00008000, PC = 0x800ec2c8
+Invalid read from 0x00008003, PC = 0x800ec2c4
+Invalid read from 0x00008002, PC = 0x800ec2c8
+
+
