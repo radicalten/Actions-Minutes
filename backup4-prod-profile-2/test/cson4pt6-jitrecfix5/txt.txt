@@ -366,3 +366,4 @@ STACK DUMP:
 0x000e2b04 --> 0x000e2b04 --> 00000000
 
 ##hit the token limit here, will need to make jit6
+##for jit6 used the error from fix4 jit5 thrd 80358600 as the base since it wasn't obvious that this latest update helped. so used the 2nd to last update instead. will try out grok 4.5 glm 5.2 and others to see if they have any success. 
