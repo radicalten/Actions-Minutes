@@ -1,0 +1,1213 @@
+Can you write an ARMv4/5 to PPC JIT recompiler for translating ARMv4 and ARMv5 opcode instructions for DS to Native PowerPC PPC/Gekko instructions for Wii. 
+You may use http://imrannazar.com/ARM-Opcode-Map for ARMv4/5 instructions and https://fenixfox-studios.com/manual/powerpc/index.html for Wii PowerPC gekko instructions, as well as any other reference material you require.
+The goal is to create a .cpp file to drop into the NooDS DS emulator https://github.com/Hydr8gon/NooDS that uses the current interpreter inplemenatation as a fallback.
+Here is core.h interpreter.h and memory.h:
+
+//core.h
+#pragma once
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/tick.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#include "action_replay.h"
+#include "cartridge.h"
+#include "cp15.h"
+#include "defines.h"
+#include "div_sqrt.h"
+#include "dldi.h"
+#include "dma.h"
+#include "gpu.h"
+#include "gpu_2d.h"
+#include "gpu_3d.h"
+#include "gpu_3d_renderer.h"
+#include "hle_arm7.h"
+#include "hle_bios.h"
+#include "input.h"
+#include "interpreter.h"
+#include "ipc.h"
+#include "memory.h"
+#include "rtc.h"
+#include "save_states.h"
+#include "settings.h"
+#include "spi.h"
+#include "spu.h"
+#include "timers.h"
+#include "wifi.h"
+
+enum CoreError {
+    ERROR_BIOS,
+    ERROR_FIRM,
+    ERROR_ROM
+};
+
+enum SchedTask {
+    UPDATE_RUN,
+    RESET_CYCLES,
+    CART9_WORD_READY,
+    CART7_WORD_READY,
+    DMA9_TRANSFER0,
+    DMA9_TRANSFER1,
+    DMA9_TRANSFER2,
+    DMA9_TRANSFER3,
+    DMA7_TRANSFER0,
+    DMA7_TRANSFER1,
+    DMA7_TRANSFER2,
+    DMA7_TRANSFER3,
+    NDS_SCANLINE256,
+    NDS_SCANLINE355,
+    GBA_SCANLINE240,
+    GBA_SCANLINE308,
+    GPU3D_COMMANDS,
+    ARM9_INTERRUPT,
+    ARM7_INTERRUPT,
+    NDS_SPU_SAMPLE,
+    GBA_SPU_SAMPLE,
+    TIMER9_OVERFLOW0,
+    TIMER9_OVERFLOW1,
+    TIMER9_OVERFLOW2,
+    TIMER9_OVERFLOW3,
+    TIMER7_OVERFLOW0,
+    TIMER7_OVERFLOW1,
+    TIMER7_OVERFLOW2,
+    TIMER7_OVERFLOW3,
+    WIFI_COUNT_MS,
+    WIFI_TRANS_REPLY,
+    WIFI_TRANS_ACK,
+    MAX_TASKS
+};
+
+// ---------------------------------------------------------------------------
+// SchedCallback — a zero-overhead two-word closure.
+//
+//   fn  : plain function pointer, signature void(void*, int)
+//   obj : opaque pointer forwarded as the first argument (the "this")
+//   arg : small integer second argument (channel/index, 0 when unused)
+//
+// For tasks that carry no integer argument (arg == 0 always) the compiler
+// will constant-fold the second parameter away after inlining the trampoline,
+// leaving a single indirect branch — identical cost to a raw method pointer
+// on PowerPC where member-function pointers are two words anyway.
+// ---------------------------------------------------------------------------
+struct SchedCallback {
+    void (*fn)(void* obj, int arg);  // trampoline function
+    void*  obj;                      // receiver object
+    int    arg;                      // channel / index (0 if unused)
+
+    // Default-construct to a safe no-op so the array is always callable.
+    SchedCallback() : fn(nullptr), obj(nullptr), arg(0) {}
+
+    SchedCallback(void (*f)(void*, int), void* o, int a = 0)
+        : fn(f), obj(o), arg(a) {}
+
+    // Invoke — inlined at every call site, single indirect branch on PPC.
+    inline void operator()() const {
+        fn(obj, arg);
+    }
+};
+
+struct SchedEvent {
+    SchedTask task;
+    uint32_t  cycles;
+
+    SchedEvent(SchedTask task, uint32_t cycles): task(task), cycles(cycles) {}
+    bool operator<(const SchedEvent& e) const { return cycles < e.cycles; }
+};
+
+class Core {
+public:
+    void* operator new  (size_t size);
+    void  operator delete  (void* p) noexcept;
+    void* operator new[](size_t size);
+    void  operator delete[](void* p) noexcept;
+
+    int  id      = 0;
+    int  fps     = 0;
+    bool arm7Hle = false;
+    bool dsiMode = false;
+    bool gbaMode = false;
+
+    ActionReplay    actionReplay;
+    CartridgeGba    cartridgeGba;
+    CartridgeNds    cartridgeNds;
+    Cp15            cp15;
+    DivSqrt         divSqrt;
+    Dldi            dldi;
+    Dma             dma[2];
+    Gpu             gpu;
+    Gpu2D           gpu2D[2];
+    Gpu3D           gpu3D;
+    Gpu3DRenderer   gpu3DRenderer;
+    HleArm7         hleArm7;
+    HleBios         hleBios[3];
+    Input           input;
+    Interpreter     interpreter[2];
+    Ipc             ipc;
+    Memory          memory;
+    Rtc             rtc;
+    SaveStates      saveStates;
+    Spi             spi;
+    Spu             spu;
+    Timers          timers[2];
+    Wifi            wifi;
+
+    volatile uint8_t running;
+
+    std::vector<SchedEvent> events;
+
+    // Flat array of two-word callbacks — fits in two cache lines (32 tasks).
+    // Each entry is 12 bytes on 32-bit PPC: fn(4) + obj(4) + arg(4).
+    SchedCallback tasks[MAX_TASKS];
+
+    uint32_t globalCycles = 0;
+
+    Core(std::string ndsRom = "", std::string gbaRom = "", int id = 0,
+         int ndsRomFd  = -1, int gbaRomFd  = -1,
+         int ndsSaveFd = -1, int gbaSaveFd = -1,
+         int ndsStateFd = -1, int gbaStateFd = -1,
+         int ndsCheatFd = -1);
+
+    void saveState(FILE* file);
+    void loadState(FILE* file);
+
+    // Hot path: single load + indirect branch, no virtual dispatch.
+    inline void runCore() { (*runFunc)(*this); }
+
+    void schedule(SchedTask task, uint32_t cycles);
+    void enterGbaMode();
+    void endFrame();
+
+private:
+    bool realGbaBios;
+    void (*runFunc)(Core&) = &Interpreter::runCoreNds;
+
+    uint64_t lastFpsTimeTicks = 0;
+    int      fpsCount         = 0;
+
+    void updateRun();
+    void resetCycles();
+
+    // -----------------------------------------------------------------------
+    // Static trampoline shims.
+    //
+    // Each shim is a plain function that recovers the typed pointer from the
+    // opaque void* and calls the real member function.  Because they are
+    // static and their bodies are trivial the compiler inlines them at the
+    // SchedCallback::operator() call site, so the generated code is:
+    //
+    //   lwz   r3, obj(callback)      ; load receiver
+    //   lwz   r4, arg(callback)      ; load channel (often optimised away)
+    //   lwz   r12, fn(callback)      ; load trampoline address
+    //   mtctr r12
+    //   bctrl                        ; single indirect branch
+    //
+    // That is the minimum possible cost for a runtime-dispatched call on PPC.
+    // -----------------------------------------------------------------------
+
+    // Core self-tasks (arg ignored)
+    static void shim_updateRun   (void* o, int) { static_cast<Core*>(o)->updateRun();    }
+    static void shim_resetCycles (void* o, int) { static_cast<Core*>(o)->resetCycles();  }
+
+    // CartridgeNds::wordReady(int cpu)  — arg = cpu index
+    static void shim_cartWordReady(void* o, int a) {
+        static_cast<CartridgeNds*>(o)->wordReady(a);
+    }
+
+    // Dma::transfer(int channel)  — arg = channel
+    static void shim_dmaTransfer(void* o, int a) {
+        static_cast<Dma*>(o)->transfer(a);
+    }
+
+    // Gpu scanlines (arg ignored)
+    static void shim_gpuScanline256  (void* o, int) { static_cast<Gpu*>(o)->scanline256();     }
+    static void shim_gpuScanline355  (void* o, int) { static_cast<Gpu*>(o)->scanline355();     }
+    static void shim_gpuGbaScanline240(void* o, int) { static_cast<Gpu*>(o)->gbaScanline240(); }
+    static void shim_gpuGbaScanline308(void* o, int) { static_cast<Gpu*>(o)->gbaScanline308(); }
+
+    // Gpu3D (arg ignored)
+    static void shim_gpu3dCommands(void* o, int) { static_cast<Gpu3D*>(o)->runCommands(); }
+
+    // Interpreter::interrupt (arg ignored)
+    static void shim_interpreterInterrupt(void* o, int) {
+        static_cast<Interpreter*>(o)->interrupt();
+    }
+
+    // Spu (arg ignored)
+    static void shim_spuSample   (void* o, int) { static_cast<Spu*>(o)->runSample();    }
+    static void shim_spuGbaSample(void* o, int) { static_cast<Spu*>(o)->runGbaSample(); }
+
+    // Timers::overflow(int timer)  — arg = timer index
+    static void shim_timersOverflow(void* o, int a) {
+        static_cast<Timers*>(o)->overflow(a);
+    }
+
+    // Wifi (arg ignored / arg = cmd)
+    static void shim_wifiCountMs    (void* o, int)  { static_cast<Wifi*>(o)->countMs();          }
+    static void shim_wifiTransmit(void* o, int a) {
+    static_cast<Wifi*>(o)->transmitPacket(static_cast<PacketType>(a));
+}
+};
+
+//interpreter.h
+#pragma once
+
+#include <cstdint>
+#include "defines.h"
+
+class Core;
+class HleBios;
+
+class Interpreter {
+public:
+    HleBios *bios = nullptr;
+    uint32_t entryAddr = 0;
+    uint8_t halted = 0;
+
+    Interpreter(Core *core, bool arm7);
+    void saveState(FILE *file);
+    void loadState(FILE *file);
+
+    void init();
+    void directBoot();
+    void resetCycles();
+
+    static void runCoreNone(Core &core);
+    template <bool, int> static void runCoreSingle(Core &core);
+    static void runCoreNds(Core &core);
+    static void runCoreDsi(Core &core);
+
+    uint16_t getOpcode16();
+    uint32_t getOpcode32();
+
+    void halt(int bit);
+    void unhalt(int bit);
+    void sendInterrupt(int bit);
+    void interrupt();
+
+    bool isThumb() { return cpsr & BIT(5); }
+    uint32_t getPC() { return *registers[15]; }
+    int handleHleIrq();
+
+    uint8_t readIme() { return ime; }
+    uint32_t readIe() { return ie; }
+    uint32_t readIrf() { return irf; }
+    uint8_t readPostFlg() { return postFlg; }
+
+    void writeIme(uint8_t value);
+    void writeIe(uint32_t mask, uint32_t value);
+    void writeIrf(uint32_t mask, uint32_t value);
+    void writePostFlg(uint8_t value);
+
+private:
+    Core *core;
+    bool arm7;
+
+    uint8_t *pcData = nullptr;
+    uint32_t pipeline[2] = {};
+
+    uint32_t *registers[32] = {};
+    uint32_t registersUsr[16] = {};
+    uint32_t registersFiq[7] = {};
+    uint32_t registersSvc[2] = {};
+    uint32_t registersAbt[2] = {};
+    uint32_t registersIrq[2] = {};
+    uint32_t registersUnd[2] = {};
+
+    uint32_t cpsr = 0, *spsr = nullptr;
+    uint32_t spsrFiq = 0, spsrSvc = 0, spsrAbt = 0, spsrIrq = 0, spsrUnd = 0;
+
+    uint32_t cycles = 0;
+    bool dsiCycle = false;
+
+    uint8_t ime = 0;
+    uint32_t ie = 0, irf = 0;
+    uint8_t postFlg = 0;
+
+    static int (Interpreter::*armInstrs[0x1000])(uint32_t);
+    static int (Interpreter::*thumbInstrs[0x400])(uint16_t);
+
+    static const uint8_t condition[0x100];
+    static const uint8_t bitCount[0x100];
+
+    int runOpcode();
+    int exception(uint8_t vector);
+    void flushPipeline();
+    void swapRegisters(uint32_t value);
+    void setCpsr(uint32_t value, bool save = false);
+    int handleReserved(uint32_t opcode);
+    int finishHleIrq();
+
+    int unkArm(uint32_t opcode);
+    int unkThumb(uint16_t opcode);
+
+    int32_t clampQ(int64_t value);
+
+    uint32_t lli(uint32_t opcode);
+    uint32_t llr(uint32_t opcode);
+    uint32_t lri(uint32_t opcode);
+    uint32_t lrr(uint32_t opcode);
+    uint32_t ari(uint32_t opcode);
+    uint32_t arr(uint32_t opcode);
+    uint32_t rri(uint32_t opcode);
+    uint32_t rrr(uint32_t opcode);
+    uint32_t imm(uint32_t opcode);
+    uint32_t lliS(uint32_t opcode);
+    uint32_t llrS(uint32_t opcode);
+    uint32_t lriS(uint32_t opcode);
+    uint32_t lrrS(uint32_t opcode);
+    uint32_t ariS(uint32_t opcode);
+    uint32_t arrS(uint32_t opcode);
+    uint32_t rriS(uint32_t opcode);
+    uint32_t rrrS(uint32_t opcode);
+    uint32_t immS(uint32_t opcode);
+
+    int _and(uint32_t opcode, uint32_t op2);
+    int eor(uint32_t opcode, uint32_t op2);
+    int sub(uint32_t opcode, uint32_t op2);
+    int rsb(uint32_t opcode, uint32_t op2);
+    int add(uint32_t opcode, uint32_t op2);
+    int adc(uint32_t opcode, uint32_t op2);
+    int sbc(uint32_t opcode, uint32_t op2);
+    int rsc(uint32_t opcode, uint32_t op2);
+    int tst(uint32_t opcode, uint32_t op2);
+    int teq(uint32_t opcode, uint32_t op2);
+    int cmp(uint32_t opcode, uint32_t op2);
+    int cmn(uint32_t opcode, uint32_t op2);
+    int orr(uint32_t opcode, uint32_t op2);
+    int mov(uint32_t opcode, uint32_t op2);
+    int bic(uint32_t opcode, uint32_t op2);
+    int mvn(uint32_t opcode, uint32_t op2);
+    int ands(uint32_t opcode, uint32_t op2);
+    int eors(uint32_t opcode, uint32_t op2);
+    int subs(uint32_t opcode, uint32_t op2);
+    int rsbs(uint32_t opcode, uint32_t op2);
+    int adds(uint32_t opcode, uint32_t op2);
+    int adcs(uint32_t opcode, uint32_t op2);
+    int sbcs(uint32_t opcode, uint32_t op2);
+    int rscs(uint32_t opcode, uint32_t op2);
+    int orrs(uint32_t opcode, uint32_t op2);
+    int movs(uint32_t opcode, uint32_t op2);
+    int bics(uint32_t opcode, uint32_t op2);
+    int mvns(uint32_t opcode, uint32_t op2);
+
+    int _andLli(uint32_t opcode);
+    int _andLlr(uint32_t opcode);
+    int _andLri(uint32_t opcode);
+    int _andLrr(uint32_t opcode);
+    int _andAri(uint32_t opcode);
+    int _andArr(uint32_t opcode);
+    int _andRri(uint32_t opcode);
+    int _andRrr(uint32_t opcode);
+    int _andImm(uint32_t opcode);
+    int andsLli(uint32_t opcode);
+    int andsLlr(uint32_t opcode);
+    int andsLri(uint32_t opcode);
+    int andsLrr(uint32_t opcode);
+    int andsAri(uint32_t opcode);
+    int andsArr(uint32_t opcode);
+    int andsRri(uint32_t opcode);
+    int andsRrr(uint32_t opcode);
+    int andsImm(uint32_t opcode);
+
+    int eorLli(uint32_t opcode);
+    int eorLlr(uint32_t opcode);
+    int eorLri(uint32_t opcode);
+    int eorLrr(uint32_t opcode);
+    int eorAri(uint32_t opcode);
+    int eorArr(uint32_t opcode);
+    int eorRri(uint32_t opcode);
+    int eorRrr(uint32_t opcode);
+    int eorImm(uint32_t opcode);
+    int eorsLli(uint32_t opcode);
+    int eorsLlr(uint32_t opcode);
+    int eorsLri(uint32_t opcode);
+    int eorsLrr(uint32_t opcode);
+    int eorsAri(uint32_t opcode);
+    int eorsArr(uint32_t opcode);
+    int eorsRri(uint32_t opcode);
+    int eorsRrr(uint32_t opcode);
+    int eorsImm(uint32_t opcode);
+
+    int subLli(uint32_t opcode);
+    int subLlr(uint32_t opcode);
+    int subLri(uint32_t opcode);
+    int subLrr(uint32_t opcode);
+    int subAri(uint32_t opcode);
+    int subArr(uint32_t opcode);
+    int subRri(uint32_t opcode);
+    int subRrr(uint32_t opcode);
+    int subImm(uint32_t opcode);
+    int subsLli(uint32_t opcode);
+    int subsLlr(uint32_t opcode);
+    int subsLri(uint32_t opcode);
+    int subsLrr(uint32_t opcode);
+    int subsAri(uint32_t opcode);
+    int subsArr(uint32_t opcode);
+    int subsRri(uint32_t opcode);
+    int subsRrr(uint32_t opcode);
+    int subsImm(uint32_t opcode);
+
+    int rsbLli(uint32_t opcode);
+    int rsbLlr(uint32_t opcode);
+    int rsbLri(uint32_t opcode);
+    int rsbLrr(uint32_t opcode);
+    int rsbAri(uint32_t opcode);
+    int rsbArr(uint32_t opcode);
+    int rsbRri(uint32_t opcode);
+    int rsbRrr(uint32_t opcode);
+    int rsbImm(uint32_t opcode);
+    int rsbsLli(uint32_t opcode);
+    int rsbsLlr(uint32_t opcode);
+    int rsbsLri(uint32_t opcode);
+    int rsbsLrr(uint32_t opcode);
+    int rsbsAri(uint32_t opcode);
+    int rsbsArr(uint32_t opcode);
+    int rsbsRri(uint32_t opcode);
+    int rsbsRrr(uint32_t opcode);
+    int rsbsImm(uint32_t opcode);
+
+    int addLli(uint32_t opcode);
+    int addLlr(uint32_t opcode);
+    int addLri(uint32_t opcode);
+    int addLrr(uint32_t opcode);
+    int addAri(uint32_t opcode);
+    int addArr(uint32_t opcode);
+    int addRri(uint32_t opcode);
+    int addRrr(uint32_t opcode);
+    int addImm(uint32_t opcode);
+    int addsLli(uint32_t opcode);
+    int addsLlr(uint32_t opcode);
+    int addsLri(uint32_t opcode);
+    int addsLrr(uint32_t opcode);
+    int addsAri(uint32_t opcode);
+    int addsArr(uint32_t opcode);
+    int addsRri(uint32_t opcode);
+    int addsRrr(uint32_t opcode);
+    int addsImm(uint32_t opcode);
+
+    int adcLli(uint32_t opcode);
+    int adcLlr(uint32_t opcode);
+    int adcLri(uint32_t opcode);
+    int adcLrr(uint32_t opcode);
+    int adcAri(uint32_t opcode);
+    int adcArr(uint32_t opcode);
+    int adcRri(uint32_t opcode);
+    int adcRrr(uint32_t opcode);
+    int adcImm(uint32_t opcode);
+    int adcsLli(uint32_t opcode);
+    int adcsLlr(uint32_t opcode);
+    int adcsLri(uint32_t opcode);
+    int adcsLrr(uint32_t opcode);
+    int adcsAri(uint32_t opcode);
+    int adcsArr(uint32_t opcode);
+    int adcsRri(uint32_t opcode);
+    int adcsRrr(uint32_t opcode);
+    int adcsImm(uint32_t opcode);
+
+    int sbcLli(uint32_t opcode);
+    int sbcLlr(uint32_t opcode);
+    int sbcLri(uint32_t opcode);
+    int sbcLrr(uint32_t opcode);
+    int sbcAri(uint32_t opcode);
+    int sbcArr(uint32_t opcode);
+    int sbcRri(uint32_t opcode);
+    int sbcRrr(uint32_t opcode);
+    int sbcImm(uint32_t opcode);
+    int sbcsLli(uint32_t opcode);
+    int sbcsLlr(uint32_t opcode);
+    int sbcsLri(uint32_t opcode);
+    int sbcsLrr(uint32_t opcode);
+    int sbcsAri(uint32_t opcode);
+    int sbcsArr(uint32_t opcode);
+    int sbcsRri(uint32_t opcode);
+    int sbcsRrr(uint32_t opcode);
+    int sbcsImm(uint32_t opcode);
+
+    int rscLli(uint32_t opcode);
+    int rscLlr(uint32_t opcode);
+    int rscLri(uint32_t opcode);
+    int rscLrr(uint32_t opcode);
+    int rscAri(uint32_t opcode);
+    int rscArr(uint32_t opcode);
+    int rscRri(uint32_t opcode);
+    int rscRrr(uint32_t opcode);
+    int rscImm(uint32_t opcode);
+    int rscsLli(uint32_t opcode);
+    int rscsLlr(uint32_t opcode);
+    int rscsLri(uint32_t opcode);
+    int rscsLrr(uint32_t opcode);
+    int rscsAri(uint32_t opcode);
+    int rscsArr(uint32_t opcode);
+    int rscsRri(uint32_t opcode);
+    int rscsRrr(uint32_t opcode);
+    int rscsImm(uint32_t opcode);
+
+    int tstLli(uint32_t opcode);
+    int tstLlr(uint32_t opcode);
+    int tstLri(uint32_t opcode);
+    int tstLrr(uint32_t opcode);
+    int tstAri(uint32_t opcode);
+    int tstArr(uint32_t opcode);
+    int tstRri(uint32_t opcode);
+    int tstRrr(uint32_t opcode);
+    int tstImm(uint32_t opcode);
+    int teqLli(uint32_t opcode);
+    int teqLlr(uint32_t opcode);
+    int teqLri(uint32_t opcode);
+    int teqLrr(uint32_t opcode);
+    int teqAri(uint32_t opcode);
+    int teqArr(uint32_t opcode);
+    int teqRri(uint32_t opcode);
+    int teqRrr(uint32_t opcode);
+    int teqImm(uint32_t opcode);
+
+    int cmpLli(uint32_t opcode);
+    int cmpLlr(uint32_t opcode);
+    int cmpLri(uint32_t opcode);
+    int cmpLrr(uint32_t opcode);
+    int cmpAri(uint32_t opcode);
+    int cmpArr(uint32_t opcode);
+    int cmpRri(uint32_t opcode);
+    int cmpRrr(uint32_t opcode);
+    int cmpImm(uint32_t opcode);
+    int cmnLli(uint32_t opcode);
+    int cmnLlr(uint32_t opcode);
+    int cmnLri(uint32_t opcode);
+    int cmnLrr(uint32_t opcode);
+    int cmnAri(uint32_t opcode);
+    int cmnArr(uint32_t opcode);
+    int cmnRri(uint32_t opcode);
+    int cmnRrr(uint32_t opcode);
+    int cmnImm(uint32_t opcode);
+
+    int orrLli(uint32_t opcode);
+    int orrLlr(uint32_t opcode);
+    int orrLri(uint32_t opcode);
+    int orrLrr(uint32_t opcode);
+    int orrAri(uint32_t opcode);
+    int orrArr(uint32_t opcode);
+    int orrRri(uint32_t opcode);
+    int orrRrr(uint32_t opcode);
+    int orrImm(uint32_t opcode);
+    int orrsLli(uint32_t opcode);
+    int orrsLlr(uint32_t opcode);
+    int orrsLri(uint32_t opcode);
+    int orrsLrr(uint32_t opcode);
+    int orrsAri(uint32_t opcode);
+    int orrsArr(uint32_t opcode);
+    int orrsRri(uint32_t opcode);
+    int orrsRrr(uint32_t opcode);
+    int orrsImm(uint32_t opcode);
+
+    int movLli(uint32_t opcode);
+    int movLlr(uint32_t opcode);
+    int movLri(uint32_t opcode);
+    int movLrr(uint32_t opcode);
+    int movAri(uint32_t opcode);
+    int movArr(uint32_t opcode);
+    int movRri(uint32_t opcode);
+    int movRrr(uint32_t opcode);
+    int movImm(uint32_t opcode);
+    int movsLli(uint32_t opcode);
+    int movsLlr(uint32_t opcode);
+    int movsLri(uint32_t opcode);
+    int movsLrr(uint32_t opcode);
+    int movsAri(uint32_t opcode);
+    int movsArr(uint32_t opcode);
+    int movsRri(uint32_t opcode);
+    int movsRrr(uint32_t opcode);
+    int movsImm(uint32_t opcode);
+
+    int bicLli(uint32_t opcode);
+    int bicLlr(uint32_t opcode);
+    int bicLri(uint32_t opcode);
+    int bicLrr(uint32_t opcode);
+    int bicAri(uint32_t opcode);
+    int bicArr(uint32_t opcode);
+    int bicRri(uint32_t opcode);
+    int bicRrr(uint32_t opcode);
+    int bicImm(uint32_t opcode);
+    int bicsLli(uint32_t opcode);
+    int bicsLlr(uint32_t opcode);
+    int bicsLri(uint32_t opcode);
+    int bicsLrr(uint32_t opcode);
+    int bicsAri(uint32_t opcode);
+    int bicsArr(uint32_t opcode);
+    int bicsRri(uint32_t opcode);
+    int bicsRrr(uint32_t opcode);
+    int bicsImm(uint32_t opcode);
+
+    int mvnLli(uint32_t opcode);
+    int mvnLlr(uint32_t opcode);
+    int mvnLri(uint32_t opcode);
+    int mvnLrr(uint32_t opcode);
+    int mvnAri(uint32_t opcode);
+    int mvnArr(uint32_t opcode);
+    int mvnRri(uint32_t opcode);
+    int mvnRrr(uint32_t opcode);
+    int mvnImm(uint32_t opcode);
+    int mvnsLli(uint32_t opcode);
+    int mvnsLlr(uint32_t opcode);
+    int mvnsLri(uint32_t opcode);
+    int mvnsLrr(uint32_t opcode);
+    int mvnsAri(uint32_t opcode);
+    int mvnsArr(uint32_t opcode);
+    int mvnsRri(uint32_t opcode);
+    int mvnsRrr(uint32_t opcode);
+    int mvnsImm(uint32_t opcode);
+
+    int mul(uint32_t opcode);
+    int mla(uint32_t opcode);
+    int umull(uint32_t opcode);
+    int umlal(uint32_t opcode);
+    int smull(uint32_t opcode);
+    int smlal(uint32_t opcode);
+    int muls(uint32_t opcode);
+    int mlas(uint32_t opcode);
+    int umulls(uint32_t opcode);
+    int umlals(uint32_t opcode);
+    int smulls(uint32_t opcode);
+    int smlals(uint32_t opcode);
+    int smulbb(uint32_t opcode);
+    int smulbt(uint32_t opcode);
+    int smultb(uint32_t opcode);
+    int smultt(uint32_t opcode);
+    int smulwb(uint32_t opcode);
+    int smulwt(uint32_t opcode);
+    int smlabb(uint32_t opcode);
+    int smlabt(uint32_t opcode);
+    int smlatb(uint32_t opcode);
+    int smlatt(uint32_t opcode);
+    int smlawb(uint32_t opcode);
+    int smlawt(uint32_t opcode);
+    int smlalbb(uint32_t opcode);
+    int smlalbt(uint32_t opcode);
+    int smlaltb(uint32_t opcode);
+    int smlaltt(uint32_t opcode);
+    int qadd(uint32_t opcode);
+    int qsub(uint32_t opcode);
+    int qdadd(uint32_t opcode);
+    int qdsub(uint32_t opcode);
+    int clz(uint32_t opcode);
+
+    int addRegT(uint16_t opcode);
+    int subRegT(uint16_t opcode);
+    int addHT(uint16_t opcode);
+    int cmpHT(uint16_t opcode);
+    int movHT(uint16_t opcode);
+    int addPcT(uint16_t opcode);
+    int addSpT(uint16_t opcode);
+    int addSpImmT(uint16_t opcode);
+    int lslImmT(uint16_t opcode);
+    int lsrImmT(uint16_t opcode);
+    int asrImmT(uint16_t opcode);
+    int addImm3T(uint16_t opcode);
+    int subImm3T(uint16_t opcode);
+    int addImm8T(uint16_t opcode);
+    int subImm8T(uint16_t opcode);
+    int cmpImm8T(uint16_t opcode);
+    int movImm8T(uint16_t opcode);
+    int lslDpT(uint16_t opcode);
+    int lsrDpT(uint16_t opcode);
+    int asrDpT(uint16_t opcode);
+    int rorDpT(uint16_t opcode);
+    int andDpT(uint16_t opcode);
+    int eorDpT(uint16_t opcode);
+    int adcDpT(uint16_t opcode);
+    int sbcDpT(uint16_t opcode);
+    int tstDpT(uint16_t opcode);
+    int cmpDpT(uint16_t opcode);
+    int cmnDpT(uint16_t opcode);
+    int orrDpT(uint16_t opcode);
+    int bicDpT(uint16_t opcode);
+    int mvnDpT(uint16_t opcode);
+    int negDpT(uint16_t opcode);
+    int mulDpT(uint16_t opcode);
+
+    uint32_t ip(uint32_t opcode);
+    uint32_t ipH(uint32_t opcode);
+    uint32_t rp(uint32_t opcode);
+    uint32_t rpll(uint32_t opcode);
+    uint32_t rplr(uint32_t opcode);
+    uint32_t rpar(uint32_t opcode);
+    uint32_t rprr(uint32_t opcode);
+
+    int ldrsbOf(uint32_t opcode, uint32_t op2);
+    int ldrshOf(uint32_t opcode, uint32_t op2);
+    int ldrbOf(uint32_t opcode, uint32_t op2);
+    int strbOf(uint32_t opcode, uint32_t op2);
+    int ldrhOf(uint32_t opcode, uint32_t op2);
+    int strhOf(uint32_t opcode, uint32_t op2);
+    int ldrOf(uint32_t opcode, uint32_t op2);
+    int strOf(uint32_t opcode, uint32_t op2);
+    int ldrdOf(uint32_t opcode, uint32_t op2);
+    int strdOf(uint32_t opcode, uint32_t op2);
+    int ldrsbPr(uint32_t opcode, uint32_t op2);
+    int ldrshPr(uint32_t opcode, uint32_t op2);
+    int ldrbPr(uint32_t opcode, uint32_t op2);
+    int strbPr(uint32_t opcode, uint32_t op2);
+    int ldrhPr(uint32_t opcode, uint32_t op2);
+    int strhPr(uint32_t opcode, uint32_t op2);
+    int ldrPr(uint32_t opcode, uint32_t op2);
+    int strPr(uint32_t opcode, uint32_t op2);
+    int ldrdPr(uint32_t opcode, uint32_t op2);
+    int strdPr(uint32_t opcode, uint32_t op2);
+    int ldrsbPt(uint32_t opcode, uint32_t op2);
+    int ldrshPt(uint32_t opcode, uint32_t op2);
+    int ldrbPt(uint32_t opcode, uint32_t op2);
+    int strbPt(uint32_t opcode, uint32_t op2);
+    int ldrhPt(uint32_t opcode, uint32_t op2);
+    int strhPt(uint32_t opcode, uint32_t op2);
+    int ldrPt(uint32_t opcode, uint32_t op2);
+    int strPt(uint32_t opcode, uint32_t op2);
+    int ldrdPt(uint32_t opcode, uint32_t op2);
+    int strdPt(uint32_t opcode, uint32_t op2);
+
+    int ldrsbOfrm(uint32_t opcode);
+    int ldrsbOfim(uint32_t opcode);
+    int ldrsbOfrp(uint32_t opcode);
+    int ldrsbOfip(uint32_t opcode);
+    int ldrsbPrrm(uint32_t opcode);
+    int ldrsbPrim(uint32_t opcode);
+    int ldrsbPrrp(uint32_t opcode);
+    int ldrsbPrip(uint32_t opcode);
+    int ldrsbPtrm(uint32_t opcode);
+    int ldrsbPtim(uint32_t opcode);
+    int ldrsbPtrp(uint32_t opcode);
+    int ldrsbPtip(uint32_t opcode);
+    int ldrshOfrm(uint32_t opcode);
+    int ldrshOfim(uint32_t opcode);
+    int ldrshOfrp(uint32_t opcode);
+    int ldrshOfip(uint32_t opcode);
+    int ldrshPrrm(uint32_t opcode);
+    int ldrshPrim(uint32_t opcode);
+    int ldrshPrrp(uint32_t opcode);
+    int ldrshPrip(uint32_t opcode);
+    int ldrshPtrm(uint32_t opcode);
+    int ldrshPtim(uint32_t opcode);
+    int ldrshPtrp(uint32_t opcode);
+    int ldrshPtip(uint32_t opcode);
+
+    int ldrbOfim(uint32_t opcode);
+    int ldrbOfip(uint32_t opcode);
+    int ldrbOfrmll(uint32_t opcode);
+    int ldrbOfrmlr(uint32_t opcode);
+    int ldrbOfrmar(uint32_t opcode);
+    int ldrbOfrmrr(uint32_t opcode);
+    int ldrbOfrpll(uint32_t opcode);
+    int ldrbOfrplr(uint32_t opcode);
+    int ldrbOfrpar(uint32_t opcode);
+    int ldrbOfrprr(uint32_t opcode);
+    int ldrbPrim(uint32_t opcode);
+    int ldrbPrip(uint32_t opcode);
+    int ldrbPrrmll(uint32_t opcode);
+    int ldrbPrrmlr(uint32_t opcode);
+    int ldrbPrrmar(uint32_t opcode);
+    int ldrbPrrmrr(uint32_t opcode);
+    int ldrbPrrpll(uint32_t opcode);
+    int ldrbPrrplr(uint32_t opcode);
+    int ldrbPrrpar(uint32_t opcode);
+    int ldrbPrrprr(uint32_t opcode);
+    int ldrbPtim(uint32_t opcode);
+    int ldrbPtip(uint32_t opcode);
+    int ldrbPtrmll(uint32_t opcode);
+    int ldrbPtrmlr(uint32_t opcode);
+    int ldrbPtrmar(uint32_t opcode);
+    int ldrbPtrmrr(uint32_t opcode);
+    int ldrbPtrpll(uint32_t opcode);
+    int ldrbPtrplr(uint32_t opcode);
+    int ldrbPtrpar(uint32_t opcode);
+    int ldrbPtrprr(uint32_t opcode);
+
+    int strbOfim(uint32_t opcode);
+    int strbOfip(uint32_t opcode);
+    int strbOfrmll(uint32_t opcode);
+    int strbOfrmlr(uint32_t opcode);
+    int strbOfrmar(uint32_t opcode);
+    int strbOfrmrr(uint32_t opcode);
+    int strbOfrpll(uint32_t opcode);
+    int strbOfrplr(uint32_t opcode);
+    int strbOfrpar(uint32_t opcode);
+    int strbOfrprr(uint32_t opcode);
+    int strbPrim(uint32_t opcode);
+    int strbPrip(uint32_t opcode);
+    int strbPrrmll(uint32_t opcode);
+    int strbPrrmlr(uint32_t opcode);
+    int strbPrrmar(uint32_t opcode);
+    int strbPrrmrr(uint32_t opcode);
+    int strbPrrpll(uint32_t opcode);
+    int strbPrrplr(uint32_t opcode);
+    int strbPrrpar(uint32_t opcode);
+    int strbPrrprr(uint32_t opcode);
+    int strbPtim(uint32_t opcode);
+    int strbPtip(uint32_t opcode);
+    int strbPtrmll(uint32_t opcode);
+    int strbPtrmlr(uint32_t opcode);
+    int strbPtrmar(uint32_t opcode);
+    int strbPtrmrr(uint32_t opcode);
+    int strbPtrpll(uint32_t opcode);
+    int strbPtrplr(uint32_t opcode);
+    int strbPtrpar(uint32_t opcode);
+    int strbPtrprr(uint32_t opcode);
+
+    int ldrhOfrm(uint32_t opcode);
+    int ldrhOfim(uint32_t opcode);
+    int ldrhOfrp(uint32_t opcode);
+    int ldrhOfip(uint32_t opcode);
+    int ldrhPrrm(uint32_t opcode);
+    int ldrhPrim(uint32_t opcode);
+    int ldrhPrrp(uint32_t opcode);
+    int ldrhPrip(uint32_t opcode);
+    int ldrhPtrm(uint32_t opcode);
+    int ldrhPtim(uint32_t opcode);
+    int ldrhPtrp(uint32_t opcode);
+    int ldrhPtip(uint32_t opcode);
+    int strhOfrm(uint32_t opcode);
+    int strhOfim(uint32_t opcode);
+    int strhOfrp(uint32_t opcode);
+    int strhOfip(uint32_t opcode);
+    int strhPrrm(uint32_t opcode);
+    int strhPrim(uint32_t opcode);
+    int strhPrrp(uint32_t opcode);
+    int strhPrip(uint32_t opcode);
+    int strhPtrm(uint32_t opcode);
+    int strhPtim(uint32_t opcode);
+    int strhPtrp(uint32_t opcode);
+    int strhPtip(uint32_t opcode);
+
+    int ldrOfim(uint32_t opcode);
+    int ldrOfip(uint32_t opcode);
+    int ldrOfrmll(uint32_t opcode);
+    int ldrOfrmlr(uint32_t opcode);
+    int ldrOfrmar(uint32_t opcode);
+    int ldrOfrmrr(uint32_t opcode);
+    int ldrOfrpll(uint32_t opcode);
+    int ldrOfrplr(uint32_t opcode);
+    int ldrOfrpar(uint32_t opcode);
+    int ldrOfrprr(uint32_t opcode);
+    int ldrPrim(uint32_t opcode);
+    int ldrPrip(uint32_t opcode);
+    int ldrPrrmll(uint32_t opcode);
+    int ldrPrrmlr(uint32_t opcode);
+    int ldrPrrmar(uint32_t opcode);
+    int ldrPrrmrr(uint32_t opcode);
+    int ldrPrrpll(uint32_t opcode);
+    int ldrPrrplr(uint32_t opcode);
+    int ldrPrrpar(uint32_t opcode);
+    int ldrPrrprr(uint32_t opcode);
+    int ldrPtim(uint32_t opcode);
+    int ldrPtip(uint32_t opcode);
+    int ldrPtrmll(uint32_t opcode);
+    int ldrPtrmlr(uint32_t opcode);
+    int ldrPtrmar(uint32_t opcode);
+    int ldrPtrmrr(uint32_t opcode);
+    int ldrPtrpll(uint32_t opcode);
+    int ldrPtrplr(uint32_t opcode);
+    int ldrPtrpar(uint32_t opcode);
+    int ldrPtrprr(uint32_t opcode);
+
+    int strOfim(uint32_t opcode);
+    int strOfip(uint32_t opcode);
+    int strOfrmll(uint32_t opcode);
+    int strOfrmlr(uint32_t opcode);
+    int strOfrmar(uint32_t opcode);
+    int strOfrmrr(uint32_t opcode);
+    int strOfrpll(uint32_t opcode);
+    int strOfrplr(uint32_t opcode);
+    int strOfrpar(uint32_t opcode);
+    int strOfrprr(uint32_t opcode);
+    int strPrim(uint32_t opcode);
+    int strPrip(uint32_t opcode);
+    int strPrrmll(uint32_t opcode);
+    int strPrrmlr(uint32_t opcode);
+    int strPrrmar(uint32_t opcode);
+    int strPrrmrr(uint32_t opcode);
+    int strPrrpll(uint32_t opcode);
+    int strPrrplr(uint32_t opcode);
+    int strPrrpar(uint32_t opcode);
+    int strPrrprr(uint32_t opcode);
+    int strPtim(uint32_t opcode);
+    int strPtip(uint32_t opcode);
+    int strPtrmll(uint32_t opcode);
+    int strPtrmlr(uint32_t opcode);
+    int strPtrmar(uint32_t opcode);
+    int strPtrmrr(uint32_t opcode);
+    int strPtrpll(uint32_t opcode);
+    int strPtrplr(uint32_t opcode);
+    int strPtrpar(uint32_t opcode);
+    int strPtrprr(uint32_t opcode);
+
+    int ldrdOfrm(uint32_t opcode);
+    int ldrdOfim(uint32_t opcode);
+    int ldrdOfrp(uint32_t opcode);
+    int ldrdOfip(uint32_t opcode);
+    int ldrdPrrm(uint32_t opcode);
+    int ldrdPrim(uint32_t opcode);
+    int ldrdPrrp(uint32_t opcode);
+    int ldrdPrip(uint32_t opcode);
+    int ldrdPtrm(uint32_t opcode);
+    int ldrdPtim(uint32_t opcode);
+    int ldrdPtrp(uint32_t opcode);
+    int ldrdPtip(uint32_t opcode);
+    int strdOfrm(uint32_t opcode);
+    int strdOfim(uint32_t opcode);
+    int strdOfrp(uint32_t opcode);
+    int strdOfip(uint32_t opcode);
+    int strdPrrm(uint32_t opcode);
+    int strdPrim(uint32_t opcode);
+    int strdPrrp(uint32_t opcode);
+    int strdPrip(uint32_t opcode);
+    int strdPtrm(uint32_t opcode);
+    int strdPtim(uint32_t opcode);
+    int strdPtrp(uint32_t opcode);
+    int strdPtip(uint32_t opcode);
+
+    int swpb(uint32_t opcode);
+    int swp(uint32_t opcode);
+    int ldmda(uint32_t opcode);
+    int stmda(uint32_t opcode);
+    int ldmia(uint32_t opcode);
+    int stmia(uint32_t opcode);
+    int ldmdb(uint32_t opcode);
+    int stmdb(uint32_t opcode);
+    int ldmib(uint32_t opcode);
+    int stmib(uint32_t opcode);
+    int ldmdaW(uint32_t opcode);
+    int stmdaW(uint32_t opcode);
+    int ldmiaW(uint32_t opcode);
+    int stmiaW(uint32_t opcode);
+    int ldmdbW(uint32_t opcode);
+    int stmdbW(uint32_t opcode);
+    int ldmibW(uint32_t opcode);
+    int stmibW(uint32_t opcode);
+    int ldmdaU(uint32_t opcode);
+    int stmdaU(uint32_t opcode);
+    int ldmiaU(uint32_t opcode);
+    int stmiaU(uint32_t opcode);
+    int ldmdbU(uint32_t opcode);
+    int stmdbU(uint32_t opcode);
+    int ldmibU(uint32_t opcode);
+    int stmibU(uint32_t opcode);
+    int ldmdaUW(uint32_t opcode);
+    int stmdaUW(uint32_t opcode);
+    int ldmiaUW(uint32_t opcode);
+    int stmiaUW(uint32_t opcode);
+    int ldmdbUW(uint32_t opcode);
+    int stmdbUW(uint32_t opcode);
+    int ldmibUW(uint32_t opcode);
+    int stmibUW(uint32_t opcode);
+    int msrRc(uint32_t opcode);
+    int msrRs(uint32_t opcode);
+    int msrIc(uint32_t opcode);
+    int msrIs(uint32_t opcode);
+    int mrsRc(uint32_t opcode);
+    int mrsRs(uint32_t opcode);
+    int mrc(uint32_t opcode);
+    int mcr(uint32_t opcode);
+
+    int ldrsbRegT(uint16_t opcode);
+    int ldrshRegT(uint16_t opcode);
+    int ldrbRegT(uint16_t opcode);
+    int strbRegT(uint16_t opcode);
+    int ldrhRegT(uint16_t opcode);
+    int strhRegT(uint16_t opcode);
+    int ldrRegT(uint16_t opcode);
+    int strRegT(uint16_t opcode);
+    int ldrbImm5T(uint16_t opcode);
+    int strbImm5T(uint16_t opcode);
+    int ldrhImm5T(uint16_t opcode);
+    int strhImm5T(uint16_t opcode);
+    int ldrImm5T(uint16_t opcode);
+    int strImm5T(uint16_t opcode);
+    int ldrPcT(uint16_t opcode);
+    int ldrSpT(uint16_t opcode);
+    int strSpT(uint16_t opcode);
+    int ldmiaT(uint16_t opcode);
+    int stmiaT(uint16_t opcode);
+    int popT(uint16_t opcode);
+    int pushT(uint16_t opcode);
+    int popPcT(uint16_t opcode);
+    int pushLrT(uint16_t opcode);
+
+    int bx(uint32_t opcode);
+    int blxReg(uint32_t opcode);
+    int b(uint32_t opcode);
+    int bl(uint32_t opcode);
+    int blx(uint32_t opcode);
+    int swi(uint32_t opcode);
+
+    int bxRegT(uint16_t opcode);
+    int blxRegT(uint16_t opcode);
+    int bT(uint16_t opcode);
+    int beqT(uint16_t opcode);
+    int bneT(uint16_t opcode);
+    int bcsT(uint16_t opcode);
+    int bccT(uint16_t opcode);
+    int bmiT(uint16_t opcode);
+    int bplT(uint16_t opcode);
+    int bvsT(uint16_t opcode);
+    int bvcT(uint16_t opcode);
+    int bhiT(uint16_t opcode);
+    int blsT(uint16_t opcode);
+    int bgeT(uint16_t opcode);
+    int bltT(uint16_t opcode);
+    int bgtT(uint16_t opcode);
+    int bleT(uint16_t opcode);
+    int blSetupT(uint16_t opcode);
+    int blOffT(uint16_t opcode);
+    int blxOffT(uint16_t opcode);
+    int swiT(uint16_t opcode);
+};
+
+//memory.h
+#pragma once
+
+#include <cstdint>
+#include "defines.h"
+
+class Core;
+
+struct VramMapping {
+    uint8_t *mappings[7] = {};
+    uint8_t count = 0;
+
+    void add(uint8_t *mapping);
+    template <typename T> T read(uint32_t address);
+    template <typename T> void write(uint32_t address, T value);
+};
+
+class Memory {
+public:
+    // 32-bit address space, split into 4KB blocks
+    uint8_t *readMap9A[0x100000] = {};
+    uint8_t *readMap9B[0x100000] = {};
+    uint8_t *readMap7[0x100000] = {};
+    uint8_t *writeMap9A[0x100000] = {};
+    uint8_t *writeMap9B[0x100000] = {};
+    uint8_t *writeMap7[0x100000] = {};
+
+    uint8_t palette[0x800] = {}; // 2KB palette
+    uint8_t oam[0x800] = {}; // 2KB OAM
+    uint8_t *engAExtPal[5] = {};
+    uint8_t *engBExtPal[5] = {};
+    uint8_t *tex3D[4] = {};
+    uint8_t *pal3D[6] = {};
+
+    Memory(Core *core): core(core) {};
+    void saveState(FILE *file);
+    void loadState(FILE *file);
+
+    bool loadBios9();
+    bool loadBios7();
+    bool loadGbaBios();
+    void copyBiosLogo(uint8_t *logo);
+
+    void updateMap9(uint32_t start, uint32_t end, bool tcm = false);
+    void updateMap7(uint32_t start, uint32_t end);
+    void updateVram();
+
+    template <typename T> T read(bool arm7, uint32_t address, bool tcm = true);
+    template <typename T> void write(bool arm7, uint32_t address, T value, bool tcm = true);
+
+private:
+    Core *core;
+    uint32_t gbaBiosAddr = 0;
+
+    uint8_t bios9[0x8000] = {}; // 32KB ARM9 BIOS
+    uint8_t bios7[0x4000] = {}; // 16KB ARM7 BIOS
+    uint8_t gbaBios[0x4000] = {}; // 16KB GBA BIOS
+
+    uint8_t ram[0x1000000] = {}; // 16MB main RAM
+    uint8_t wram[0x8000] = {}; // 32KB shared WRAM
+    uint8_t instrTcm[0x8000] = {}; // 32KB instruction TCM
+    uint8_t dataTcm[0x4000] = {}; // 16KB data TCM
+    uint8_t wram7[0x10000] = {}; // 64KB ARM7 WRAM
+    uint8_t wifiRam[0x2000] {}; // 8KB WiFi RAM
+
+    uint8_t vramA[0x20000] = {}; // 128KB VRAM block A
+    uint8_t vramB[0x20000] = {}; // 128KB VRAM block B
+    uint8_t vramC[0x20000] = {}; // 128KB VRAM block C
+    uint8_t vramD[0x20000] = {}; // 128KB VRAM block D
+    uint8_t vramE[0x10000] = {}; // 64KB VRAM block E
+    uint8_t vramF[0x4000] = {}; // 16KB VRAM block F
+    uint8_t vramG[0x4000] = {}; // 16KB VRAM block G
+    uint8_t vramH[0x8000] = {}; // 32KB VRAM block H
+    uint8_t vramI[0x4000] = {}; // 16KB VRAM block I
+
+    VramMapping engABg[32];
+    VramMapping engBBg[8];
+    VramMapping engAObj[16];
+    VramMapping engBObj[8];
+    VramMapping lcdc[64];
+    VramMapping vram7[2];
+
+    uint32_t dmaFill[4] = {};
+    uint8_t vramCnt[9] = {};
+    uint8_t vramStat = 0;
+    uint8_t wramCnt = 0;
+    uint8_t haltCnt = 0;
+
+    template <typename T> T readFallback(bool arm7, uint32_t address);
+    template <typename T> void writeFallback(bool arm7, uint32_t address, T value);
+
+    template <typename T> T ioRead9(uint32_t address);
+    template <typename T> T ioRead7(uint32_t address);
+    template <typename T> T ioReadGba(uint32_t address);
+    template <typename T> void ioWrite9(uint32_t address, T value);
+    template <typename T> void ioWrite7(uint32_t address, T value);
+    template <typename T> void ioWriteGba(uint32_t address, T value);
+
+    uint32_t readDmaFill(int channel) { return dmaFill[channel]; }
+    uint8_t readVramCnt(int block) { return vramCnt[block]; }
+    uint8_t readVramStat() { return vramStat; }
+    uint8_t readWramCnt() { return wramCnt; }
+    uint8_t readHaltCnt() { return haltCnt; }
+
+    void writeDmaFill(int channel, uint32_t mask, uint32_t value);
+    void writeVramCnt(int index, uint8_t value);
+    void writeWramCnt(uint8_t value);
+    void writeHaltCnt(uint8_t value);
+    void writeGbaHaltCnt(uint8_t value);
+};
+
+template uint8_t Memory::read(bool arm7, uint32_t address, bool tcm);
+template uint16_t Memory::read(bool arm7, uint32_t address, bool tcm);
+template uint32_t Memory::read(bool arm7, uint32_t address, bool tcm);
+template <typename T> FORCE_INLINE T Memory::read(bool arm7, uint32_t address, bool tcm) {
+    // Look up a pointer to readable memory and read a value from it LSB-first
+    uint8_t **readMap = arm7 ? readMap7 : (tcm ? readMap9A : readMap9B);
+    if (uint8_t *data = readMap[address >> 12]) {
+        T value = 0;
+        data += address & (0x1000 - sizeof(T));
+        for (uint32_t i = 0; i < sizeof(T); i++)
+            value |= data[i] << (i * 8);
+        return value;
+    }
+
+    // Handle special read cases that can't be mapped
+    return readFallback<T>(arm7, address);
+}
+
+template void Memory::write(bool arm7, uint32_t address, uint8_t value, bool tcm);
+template void Memory::write(bool arm7, uint32_t address, uint16_t value, bool tcm);
+template void Memory::write(bool arm7, uint32_t address, uint32_t value, bool tcm);
+template <typename T> FORCE_INLINE void Memory::write(bool arm7, uint32_t address, T value, bool tcm) {
+    // Look up a pointer to writable memory and write a value to it LSB-first
+    uint8_t **writeMap = arm7 ? writeMap7 : (tcm ? writeMap9A : writeMap9B);
+    if (uint8_t *data = writeMap[address >> 12]) {
+        data += address & (0x1000 - sizeof(T));
+        for (uint32_t i = 0; i < sizeof(T); i++)
+            data[i] = value >> (i * 8);
+        return;
+    }
+
+    // Handle special write cases that can't be mapped
+    return writeFallback<T>(arm7, address, value);
+}

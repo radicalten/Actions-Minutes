@@ -1,0 +1,3 @@
+Can you write an ARMv4/5 to PPC JIT recompiler for translating ARMv4 and ARMv5 opcode instructions for DS to Native PowerPC PPC/Gekko instructions for Wii. 
+You may use http://imrannazar.com/ARM-Opcode-Map for ARMv4/5 instructions and https://fenixfox-studios.com/manual/powerpc/index.html for Wii PowerPC gekko instructions, as well as any other reference material you require.
+The goal is to create a .cpp file to drop into the NooDS DS emulator https://github.com/Hydr8gon/NooDS to replace the current interpreter_lookup.cpp implementation. 

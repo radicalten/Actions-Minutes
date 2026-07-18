@@ -1,0 +1,4368 @@
+# JIT Recompiler Debug Analysis
+
+## Root Cause: ISI Exception (Instruction Storage Interrupt)
+
+The `Exception (ISI) occurred!` with `PC 000E2B04` means the PowerPC tried to **execute code at an unmapped/non-executable address**. This is your JIT jumping to bad code.
+
+The address `0x000E2B04` is in a range that looks like it could be heap memory or an ARM address being treated as a PPC address. Several bugs are causing this.
+
+---
+
+## Bug 1: `executeBlock` Missing ABI Frame — Stack Corruption
+
+```cpp
+// BROKEN — no caller frame, LR clobbered immediately
+static void executeBlock(const JitBlock* block) {
+    typedef void (*BlockFn)();
+    ((BlockFn)block->ppcCode)();
+}
+```
+
+The JIT block's prologue does `stwu r1,-160(r1)` and `mflr r0; stw r0,8(r1)` — it saves LR relative to the *new* frame. But `executeBlock` is called from `runJitNds` which is called from the emulator loop. When the block does `blr`, it returns to `executeBlock`'s caller correctly **only if the block's LR save/restore is paired correctly**.
+
+The real problem: `executeBlock` calls the block as a plain function pointer, but the block uses `bctr` (branch-to-CTR) for internal calls via `emit_call`. The CTR is shared — any `emit_call` inside the block clobbers CTR, and then `ppc_bctr(true)` (BCTRL) is used, which is correct. But the **return from BCTRL goes to LR**, and LR is saved in the frame. This part is okay.
+
+**The actual ISI bug here**: `executeBlock` doesn't save/restore its own non-volatile registers before the block overwrites r14-r26. The block's epilogue restores them *from its own frame*, but if the block's prologue wrote garbage into the frame (due to r1 misalignment or wrong offset), you get corruption.
+
+---
+
+## Bug 2: Critical — `emit_call` Clobbers r12 Which is PPC_TMP3
+
+```cpp
+static const uint8_t PPC_TMP3 = 12;  // r12!
+
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    int n = emit_li32(ctx.cur, 12, addr);  // uses r12 = PPC_TMP3
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(12));
+    ctx.emit(ppc_bctr(true));  // BCTRL — also clobbers LR!
+}
+```
+
+`r12` is both `PPC_TMP3` and the scratch register for `emit_call`. Any `emit_call` destroys `PPC_TMP3`. Worse: **BCTRL clobbers LR**. The block saves LR at entry, but any `emit_call` mid-block overwrites LR. When the block later does `lwz r0,8(r1); mtlr r0; blr`, it returns to the right place — *but only if the frame is valid*.
+
+**Fix**: Use r0 as the call scratch (it's volatile and not mapped):
+
+```cpp
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    // r0 is volatile and not used as a mapped reg
+    // Load address into r11 (volatile, not PPC_TMP3)
+    int n = emit_li32(ctx.cur, 11, addr);
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(11));
+    ctx.emit(ppc_bctr(true));
+}
+```
+
+But wait — r11 is `PPC_TMP2`. Use a truly free volatile:
+
+```cpp
+// Add a dedicated call-scratch register that isn't mapped to anything
+static const uint8_t PPC_CALL_SCRATCH = 0;  // r0, safe for mtctr source
+
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    // r0 cannot be used as base in lwz/stw but CAN be used for mtctr
+    // However emit_li32 uses addi/addis which treat r0 as 0 when RA=0
+    // So we need a real register. Use r11 carefully, or restructure.
+    
+    // Safest: use r2 (not used by Wii/OGC in this context) or
+    // reserve a non-volatile scratch that isn't in ARM_TO_PPC map.
+    // r29, r30, r31 are free — let's use r29 as CALL_SCRATCH
+    uint32_t tmp[2];
+    int n = emit_li32(ctx.cur, 29, addr);
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(29));
+    ctx.emit(ppc_bctr(true));
+}
+```
+
+And remove r29/r30/r31 from the saved range or include them:
+
+```cpp
+// Change saved range to include r29
+// FRAME_R14 + (r - 14) * 4 for r14..r29 = 16 regs = 64 bytes
+// Update FRAME_SIZE accordingly
+static const int FRAME_SIZE    = 176;  // 16-byte aligned
+```
+
+---
+
+## Bug 3: `emit_prologue` Saves LR *Before* the `stwu`
+
+```cpp
+static void emit_prologue(EmitCtx& ctx, Interpreter* interp, Core* core) {
+    ctx.emit(ppc_stwu(1, -(int16_t)FRAME_SIZE, 1));  // r1 updated HERE
+    ctx.emit(ppc_mflr(0));
+    ctx.emit(ppc_stw(0, FRAME_LR, 1));               // stored at new r1+8
+```
+
+This looks correct. `stwu` stores old r1 at 0(new_r1) and updates r1. Then `mflr r0` gets LR (still valid), and `stw r0,8(r1)` stores at new r1+8. **This is correct ABI.**
+
+---
+
+## Bug 4: `emit_syncToInterp`/`emit_syncFromInterp` Corrupt the Frame During Load/Store
+
+In `emit_loadStore`, you save volatile regs to `FRAME_REGSYNC`:
+
+```cpp
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));
+```
+
+Then later `emit_syncToInterp` also uses `FRAME_REGSYNC`:
+
+```cpp
+static void emit_syncToInterp(EmitCtx& ctx) {
+    for (int i = 0; i < 16; i++)
+        ctx.emit(ppc_stw(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
+    ctx.emit(ppc_stw(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
+```
+
+`emit_syncToInterp` needs 17 words = 68 bytes. `emit_loadStore` saves 8 words = 32 bytes. **They overlap**. But the issue is: `emit_loadStore` saves r3-r10 at `FRAME_REGSYNC+0..28`, while `emit_syncToInterp` would store ARM r0-r7 (mapped to PPC r3-r10) at the same locations. This is fine as long as they're not interleaved — and they're not, since `emit_syncToInterp` is only called at block end. So this is **not a bug by itself**, but it's fragile.
+
+The **real problem** with the load/store emitter: after `emit_call`, r3-r10 are clobbered by the ABI. You save them before the call and restore after. But your save/restore code does:
+
+```cpp
+// Before call
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));  // saves r3..r10
+
+// Set up args (overwrites r3, r4, r5, possibly r6)
+ctx.emit(ppc_mr(3, PPC_CORE));
+ctx.emit(ppc_addi(4, 0, ctx.arm7 ? 1 : 0));
+ctx.emit(ppc_mr(5, PPC_TMP1));
+if (!isLoad) ctx.emit(ppc_mr(6, ppcRd));
+
+emit_call(ctx, memFn);
+
+// After call — restore
+for (int i = 0; i < 8; i++)
+    ctx.emit(ppc_lwz(3 + i, FRAME_REGSYNC + i * 4, 1));
+```
+
+**The values saved at `FRAME_REGSYNC+0..7` are the pre-call ARM register values in r3-r10. But `ppcRd` might be r14-r21 (non-volatile mapped regs), not r3-r10**. So saving/restoring r3-r10 around the call is actually *wrong* — you're restoring the *old* ARM register values (R0-R7) back to r3-r10, but those are non-volatile regs! The callee doesn't modify non-volatile regs. Only r3-r10 are volatile.
+
+Wait, ARM R0-R7 map to PPC r3-r10, which ARE volatile. So yes, you need to save them. But the save happens *after* the argument setup clobbers r3-r5. **The save happens before argument setup, so you're saving the ARM values first (correct), then setting up args (clobbers r3-r5), then calling, then restoring ARM R0-R7 from the saved values (correct).**
+
+This is actually correct. The bug is elsewhere.
+
+---
+
+## Bug 5: The Actual ISI Cause — Block Returns to Wrong Address
+
+Looking at the crash: `PC 000E2B04`, `LR 000E2B04`. LR equals PC, which means the CPU jumped to a bad address that was *in LR*. This happens when:
+
+```
+blr  →  PC = LR = 0x000E2B04 (bad address, causes ISI)
+```
+
+LR at the time of the bad `blr` = `0x000E2B04`, which looks like an **ARM address** (GBA ROM is typically at `0x08000000`, but internal RAM/ROM varies). 
+
+`0x000E2B04` could be the ARM PC value that got written into the PPC LR somehow.
+
+**The smoking gun**: In `emit_branch` for BX:
+
+```cpp
+ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRm, 0, 0, 30));
+emit_syncToInterp(ctx);
+```
+
+`emit_syncToInterp` calls `emit_call(ctx, JitPpc_syncToInterp)`. `emit_call` does `ppc_bctr(true)` — **BCTRL sets LR to the return address** (next PPC instruction). That's correct.
+
+But what if `ppcRm` is `PPC_ARM_R14` = r20, and the ARM register Rm contains `0x000E2B04`? After `emit_syncToInterp` writes it to the interpreter, we reach `emit_epilogue` which does:
+
+```cpp
+ctx.emit(ppc_lwz(0, FRAME_LR, 1));
+ctx.emit(ppc_mtlr(0));
+ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));
+ctx.emit(ppc_blr());
+```
+
+This restores LR from the frame and does `blr`. This should return to `executeBlock`'s call site, not to an ARM address.
+
+**UNLESS**: `FRAME_LR = 8` and something overwrote `r1+8` during the block execution.
+
+Let me check: In `emit_loadStore`, the volatile reg save uses `FRAME_REGSYNC + i*4` for i=0..7, i.e., offsets 72,76,80,84,88,92,96,100. That doesn't overlap with FRAME_LR=8. OK.
+
+**But**: r3-r10 correspond to offsets 72-100 in the save area. Meanwhile, ARM R0 maps to PPC r3. What if a store instruction stores a value via `JitPpc_memWrite32`, where r6 (ARM R3, `PPC_ARM_R3`) holds an ARM address `0x000E2B04`? The function call is fine. The restore puts the ARM value back in r3. Still fine.
+
+---
+
+## Bug 6: Frame Back-Chain Written to Wrong Place by `stwu`
+
+`ppc_stwu(1, -160, 1)` = `stwu r1,-160(r1)`:
+- Effective address = r1 - 160
+- Stores old r1 at EA (= old_r1 - 160 = new_r1)  
+- Updates r1 = EA
+
+So `0(new_r1)` = old_r1. That's the back-chain. ✓
+
+`ppc_stw(0, 8, 1)` = stores LR at `new_r1 + 8`. ✓
+
+`ppc_lwz(0, 8, 1)` in epilogue restores from same place. ✓
+
+This looks correct. **But wait** — check the epilogue:
+
+```cpp
+static void emit_epilogue(EmitCtx& ctx) {
+    for (int r = 14; r <= 26; r++)
+        ctx.emit(ppc_lwz(r, FRAME_R14 + (r - 14) * 4, 1));
+    
+    ctx.emit(ppc_lwz(0, FRAME_LR, 1));
+    ctx.emit(ppc_mtlr(0));
+    ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));  // r1 += 160
+    ctx.emit(ppc_blr());
+}
+```
+
+`ppc_addi(1, 1, 160)`: Since 160 < 32768, this is fine as `int16_t`. ✓
+
+---
+
+## Bug 7: `emit_syncToInterp` Called Mid-Block Without Restoring Non-Volatiles
+
+In `emit_branch` (BX, B/BL), after computing the new PC, you call:
+
+```cpp
+emit_syncToInterp(ctx);
+```
+
+`emit_syncToInterp` calls `emit_call` which uses `BCTRL`. The return address (LR) after BCTRL is the next PPC instruction — correct. But `JitPpc_syncToInterp` is a C function that **may clobber r3-r12 per ABI**. Since r14-r26 are non-volatile, they're preserved. But the `emit_call` itself uses r12 (`PPC_TMP3 = 12`) as the CTR load register:
+
+```cpp
+int n = emit_li32(ctx.cur, 12, addr);  // r12 = address
+ctx.cur += n;
+ctx.emit(ppc_mtctr(12));
+ctx.emit(ppc_bctr(true));
+```
+
+**r12 is not saved in the prologue** (only r14-r26 are saved). r12 is volatile. So `emit_li32(12, addr)` into r12, `mtctr r12`, `bctrl` — the bctrl saves LR (return addr after bctrl). The callee can trash r12. On return, r12 is undefined. But since the JIT never reads r12 as a meaningful value after a call (PPC_TMP3 is only a temporary), this is OK.
+
+The **real** issue with r12: `emit_li32(ctx.cur, 12, addr)` uses r12 = `PPC_TMP3`. What if there's a pending value in `PPC_TMP3` that's needed after the call? Looking at usage, `PPC_TMP3` is only used locally within individual emit functions, so this is OK.
+
+---
+
+## The Real ISI Bug — Identified
+
+Looking more carefully at the crash: **`PC = LR = 0x000E2B04`**.
+
+When LR = PC and both are bad, this is a `blr` executing where LR was not properly set. 
+
+The most likely scenario: **the block's `blr` at the end returns into an ARM address because `FRAME_LR` slot was corrupted**.
+
+Let me trace what can write to `r1+8` (FRAME_LR):
+
+1. Prologue: `stw r0, 8(r1)` — saves LR here. ✓
+2. `emit_call` via BCTRL — BCTRL **updates LR to return address** in the LR *register*, but does NOT write to the stack. The stack slot at r1+8 is untouched by BCTRL. ✓
+3. The callee (`JitPpc_syncToInterp`, etc.) creates its own frame with `stwu` and saves its LR there. When it returns (`blr`), it restores its own LR and pops its own frame. Our r1+8 slot is untouched. ✓
+
+**So the frame LR slot should be safe.** Unless...
+
+**The callee uses `stw r0, 8(r1)` before doing `stwu`**! Some GCC prologues for non-leaf functions do:
+
+```asm
+mflr r0
+stw  r0, 4(r1)   ; ABI: LR save at caller's frame + 4 (old PPC ABI)
+```
+
+**This is the bug!** The old PPC ABI (used by devkitPPC/Wii) saves LR at `4(r1)` in the *caller's* frame, not `8(r1)` in *its own* frame. Our JIT uses `8(r1)` as FRAME_LR in *its own* frame (after `stwu`). But C functions compiled by GCC for Wii/devkitPPC save LR at `old_r1 + 4` — which is **our frame's offset 4**, not offset 8!
+
+Wait, let me recheck: The Wii/OGC toolchain uses the **EABI** (Embedded ABI), not the old AIX ABI. In EABI:
+- LR is saved at `r1+4` of the *caller's* frame (i.e., before the callee's `stwu`)
+- Actually in PowerPC EABI: LR is saved at the *caller's* stack frame offset 4, but this means the callee writes `stw r0, 4(r1)` *before* updating r1
+
+Specifically: GCC for PPC EABI generates:
+```asm
+mflr r0
+stw  r0, 4(r1)    ; save LR at *current* r1+4 (= OLD frame's LR slot)
+stwu r1, -N(r1)   ; allocate new frame
+```
+
+This means the callee writes LR to `old_r1 + 4`. In our JIT prologue:
+- We do `stwu r1, -160(r1)` first → old_r1 is now stored at new_r1+0
+- Then `mflr r0; stw r0, 8(r1)` → saves LR at new_r1+8
+
+When `JitPpc_syncToInterp` is called via BCTRL:
+- LR = return address (next JIT instruction)
+- r1 = our JIT frame (new_r1)
+- GCC-generated prologue: `mflr r0; stw r0, 4(r1)` → writes return addr to **our frame's offset 4**!
+
+**This does NOT corrupt our FRAME_LR at offset 8.** The callee writes to offset 4, we use offset 8. So no collision.
+
+Actually wait — GCC EABI for Wii writes at `r1+4` (current r1, before stwu). Let me re-examine:
+
+```
+Call sequence:
+  JIT code: bctrl          ; LR = next_instr, PC = JitPpc_syncToInterp
+  JitPpc_syncToInterp:
+    mflr r0               ; r0 = LR (return to JIT)
+    stw  r0, 4(r1)        ; store at our_frame + 4  ← CLOBBERS our frame!
+    stwu r1, -N(r1)       ; allocate callee frame
+    ...
+    lwz  r0, N+4(r1)      ; restore LR from our frame
+    mtlr r0
+    addi r1, r1, N
+    blr
+```
+
+`stw r0, 4(r1)` writes to our JIT frame at offset +4. Our `FRAME_LR = 8` is at offset +8. **Offset 4 is different from offset 8, so no corruption.** ✓
+
+But: **offset 4 is within our frame**. What's at offset 4 in our frame? Looking at the layout:
+- `[r1+0]` = back-chain (written by `stwu`)
+- `[r1+4]` = **ABI LR save area** — this is reserved for exactly this purpose!
+- `[r1+8]` = our LR (FRAME_LR)
+
+The comment in your code says:
+```
+// [r1+ 4] (ABI: reserved for callee LR save area — not used by us)
+```
+
+So offset 4 is the **ABI-designated LR save slot**, used by callees. Our FRAME_LR is at offset 8 to avoid collision. This is correct design! The callee writes to `r1+4`, we use `r1+8`. ✓
+
+---
+
+## Bug Found: `getPC()` Returns Wrong Value for JIT Dispatch
+
+```cpp
+uint32_t getPC() { return *registers[15]; }
+```
+
+In the interpreter, `registers[15]` points into `registersUsr` and holds `pc + pipeline_depth`. When the JIT calls `arm9.getPC()` to decide which block to compile/execute, it gets the pipelined PC, not the actual fetch address.
+
+```cpp
+void runJitNds(Core& core) {
+    if (!arm9.halted) {
+        uint32_t pc9 = arm9.getPC();  // Returns pc+8 (ARM) or pc+4 (Thumb)!
+        JitBlock* b  = compileBlock(&arm9, &core, pc9, false);
+```
+
+Then in `compileBlock`:
+```cpp
+ctx.armPC = armPC;  // = pc+8, not actual fetch PC
+```
+
+And in `emit_prologue`:
+```cpp
+n = emit_li32(ctx.cur, PPC_ARM_R15, ctx.armPC);  // sets R15 = pc+8
+```
+
+And in the compile loop:
+```cpp
+n = emit_li32(ctx.cur, PPC_ARM_R15, pc + (isThumb ? 4u : 8u));
+// pc starts at armPC = actual_pc+8, so R15 = actual_pc+8+8 = actual_pc+16 !
+```
+
+**This is wrong.** The block starts executing from `armPC` (= pipelined PC = real_pc+8), but the code at that address is wrong — you should be reading from `real_pc`, not `real_pc+8`.
+
+**Fix**: Get the true fetch PC before calling `compileBlock`:
+
+```cpp
+// The interpreter's registers[15] holds pc+pipeline. We need raw fetch PC.
+// After flushPipeline, registers[15] = next_fetch_pc + pipeline_refill.
+// The interpreter uses a 2-stage pipeline: R15 = fetch_pc + 8 (ARM) or +4 (Thumb)
+// So actual fetch PC = *registers[15] - (isThumb ? 4 : 8)
+uint32_t getActualPC() {
+    bool thumb = cpsr & BIT(5);
+    return *registers[15] - (thumb ? 4u : 8u);
+}
+```
+
+Add this to `interpreter.h`:
+```cpp
+uint32_t getActualPC() {
+    bool thumb = cpsr & BIT(5);
+    return *registers[15] - (thumb ? 4u : 8u);
+}
+```
+
+Then in `runJitNds`:
+```cpp
+uint32_t pc9 = arm9.getActualPC();  // true fetch PC
+```
+
+---
+
+## Complete Fix Summary
+
+Here are all the fixes with corrected code:
+
+### Fix 1: Add `getActualPC()` to interpreter.h
+
+```cpp
+// In interpreter.h, public section:
+uint32_t getActualPC() {
+    bool thumb = isThumb();
+    return *registers[15] - (thumb ? 4u : 8u);
+}
+```
+
+### Fix 2: Use `getActualPC()` in `runJitNds`
+
+```cpp
+void runJitNds(Core& core) {
+    Interpreter& arm9 = core.interpreter[0];
+    Interpreter& arm7 = core.interpreter[1];
+
+    if (!arm9.halted) {
+        uint32_t pc9 = arm9.getActualPC();  // FIX: was getPC()
+        JitBlock* b  = compileBlock(&arm9, &core, pc9, false);
+        if (b) executeBlock(b);
+    }
+
+    if (!arm7.halted) {
+        uint32_t pc7 = arm7.getActualPC();  // FIX: was getPC()
+        JitBlock* b  = compileBlock(&arm7, &core, pc7, true);
+        if (b) executeBlock(b);
+    }
+}
+```
+
+### Fix 3: Fix `emit_call` to Not Use `PPC_TMP3` (r12)
+
+Declare a dedicated call scratch register and update the frame:
+
+```cpp
+// Add these constants near the register mapping section:
+static const uint8_t PPC_CALL_TMP = 29;   // r29: saved, used only for calls
+
+// Update saved register range to include r29:
+static const int FRAME_SIZE = 176;  // was 160; 16-byte aligned
+// r14..r29 = 16 regs × 4 = 64 bytes at FRAME_R14=16 → bytes 16..79
+// FRAME_REGSYNC shifts to 80: 17×4=68 bytes → bytes 80..147
+// Padding to 176 (next 16-byte boundary after 148): 28 bytes pad
+static const int FRAME_R14     = 16;
+static const int FRAME_REGSYNC = 80;  // was 72; now after 16 saved regs
+```
+
+Update static_asserts:
+```cpp
+static_assert(FRAME_SIZE % 16 == 0,               "Frame must be 16-byte aligned");
+static_assert(FRAME_REGSYNC + 17*4 <= FRAME_SIZE, "Sync area overflows frame");
+static_assert(FRAME_R14 + 16*4     <= FRAME_REGSYNC, "Saved regs overlap sync area");
+```
+
+Update prologue/epilogue to save/restore r14..r29:
+```cpp
+static void emit_prologue(EmitCtx& ctx, Interpreter* interp, Core* core) {
+    ctx.emit(ppc_stwu(1, -(int16_t)FRAME_SIZE, 1));
+    ctx.emit(ppc_mflr(0));
+    ctx.emit(ppc_stw(0, FRAME_LR, 1));
+
+    // Save r14..r29 (16 regs, includes PPC_CALL_TMP=r29)
+    for (int r = 14; r <= 29; r++)
+        ctx.emit(ppc_stw(r, FRAME_R14 + (r - 14) * 4, 1));
+
+    int n = emit_li32(ctx.cur, PPC_INTERP, (uint32_t)(uintptr_t)interp);
+    ctx.cur += n;
+    n = emit_li32(ctx.cur, PPC_CORE, (uint32_t)(uintptr_t)core);
+    ctx.cur += n;
+    n = emit_li32(ctx.cur, PPC_ARM_R15, ctx.armPC);
+    ctx.cur += n;
+}
+
+static void emit_epilogue(EmitCtx& ctx) {
+    // Restore r14..r29
+    for (int r = 14; r <= 29; r++)
+        ctx.emit(ppc_lwz(r, FRAME_R14 + (r - 14) * 4, 1));
+
+    ctx.emit(ppc_lwz(0, FRAME_LR, 1));
+    ctx.emit(ppc_mtlr(0));
+    ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));
+    ctx.emit(ppc_blr());
+}
+```
+
+Fix `emit_call`:
+```cpp
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    // Use r29 (PPC_CALL_TMP, non-volatile, saved in frame)
+    // This avoids clobbering PPC_TMP3 (r12) or any ARM-mapped reg
+    int n = emit_li32(ctx.cur, PPC_CALL_TMP, addr);
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(PPC_CALL_TMP));
+    ctx.emit(ppc_bctr(true));
+}
+```
+
+### Fix 4: `emit_prologue` Must Sync From Interpreter, Not Set R15 Early
+
+The current code sets R15 in prologue and then also in `emit_syncFromInterp` loop. The `emit_syncFromInterp` skips R15 (correct), but the prologue sets PPC_ARM_R15 = `ctx.armPC` = the block's start PC. Then the compile loop sets it again to `pc + offset`. This double-set is wasteful but not wrong.
+
+**However**: after `emit_syncFromInterp`, PPC_ARM_R15 is reloaded from the sync area at slot 15, which `JitPpc_syncFromInterp` leaves undefined:
+
+```cpp
+void JitPpc_syncFromInterp(Interpreter* interp, uint32_t* regs) {
+    for (int i = 0; i < 15; i++)
+        regs[i] = *regPtrs[i];
+    regs[16] = interp->getCpsrRef();
+    // regs[15] intentionally left undefined
+}
+```
+
+Then `emit_syncFromInterp` in JIT does:
+```cpp
+for (int i = 0; i < 15; i++)
+    ctx.emit(ppc_lwz(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
+ctx.emit(ppc_lwz(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
+// Note: does NOT reload PPC_ARM_R15 (ARM_TO_PPC[15]) ← correct
+```
+
+So `PPC_ARM_R15` keeps whatever value the prologue set (`ctx.armPC`). Then the first iteration of the compile loop overwrites it with `pc + (thumb ? 4 : 8)`. Since `pc == ctx.armPC` at the start, this becomes `armPC + 4` or `armPC + 8`. ✓
+
+This is correct — no fix needed here.
+
+### Fix 5: Block End Detection Missing for Interpreter Fallback Branches
+
+When `emit_interpFallback` is called (interpreter handles the instruction), the interpreter might execute a branch, changing the PC. But `blockEnded` stays false and the JIT continues compiling the next sequential instruction. After returning from the fallback, the interpreter's PC has changed, but the JIT then executes whatever comes next in the ROM sequentially.
+
+```cpp
+// After emit_interpFallback, we don't know if a branch occurred.
+// Safest: always end the block after a fallback.
+if (!emitARMInstr(ctx, opcode, pc))  {
+    emit_interpFallback(ctx);
+    blockEnded = true;  // ADD THIS
+}
+```
+
+Same for Thumb:
+```cpp
+if (!emitThumbInstr(ctx, top, pc)) {
+    emit_interpFallback(ctx);
+    blockEnded = true;  // ADD THIS
+}
+```
+
+### Fix 6: `emit_syncToInterp` at Block End Followed by `emit_epilogue` — Double Sync on Branch
+
+For branches, the flow is:
+```
+emit_branch → emit_syncToInterp → [fall through to block end] → emit_syncToInterp → emit_epilogue
+```
+
+The second `emit_syncToInterp` at block end re-syncs, which is harmless but wastes time. More importantly, **if a branch is taken mid-block** (blockEnded=true), the compile loop still calls `emit_syncToInterp` and `emit_epilogue` after the loop. But the branch handler already called `emit_syncToInterp` and left without calling `emit_epilogue`! The block then falls through to the `emit_syncToInterp; emit_epilogue` at the end of `compileBlock`.
+
+```cpp
+// In compileBlock, after the loop:
+emit_syncToInterp(ctx);
+emit_epilogue(ctx);
+```
+
+If the last instruction was a branch, the branch handler called `emit_syncToInterp` but NOT `emit_epilogue`. Then these two lines add another sync + epilogue. **This means the block has code like**:
+
+```
+[branch taken path]:
+  ... set R15 ...
+  emit_syncToInterp   ← branch's sync
+  [no blr here, falls through]
+  
+[block end]:
+  emit_syncToInterp   ← duplicate sync
+  emit_epilogue (blr) ← correct return
+```
+
+The duplicate sync is wasteful but the `blr` at the end is correct. However, the branch path **does NOT have a `blr`** — it falls through to the extra sync and then the epilogue's `blr`. This actually works correctly! The branch syncs the interpreter, then falls to the epilogue which returns. ✓
+
+But wait — for branches with condition codes, the non-taken path also falls through to the end, which re-syncs (potentially with the wrong R15 from the last `emit_li32`). This is a problem:
+
+```
+[conditional branch]:
+  emit_setupCondFlags
+  ppc_bc (skip if not taken)
+  ... [taken path] ...
+  set R15 = target
+  emit_syncToInterp
+  patchBranchOffset → points here ↓
+  [not-taken path falls through]
+  
+[block continues or ends]:
+  emit_li32 R15, pc+next_offset  ← next instruction's R15
+  [possibly more instructions]
+  
+[end of block]:
+  emit_syncToInterp  ← syncs with R15 = last instruction's R15, not target!
+  emit_epilogue
+```
+
+For the taken path: after the branch's `emit_syncToInterp`, execution falls through to the next instruction's `emit_li32 R15, ...` which corrupts R15, then the final `emit_syncToInterp` syncs the wrong R15. **This is a real bug.**
+
+**Fix**: After a branch is taken (emit_syncToInterp done), immediately `blr`:
+
+```cpp
+static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
+    // ... [existing code] ...
+    
+    // For BX:
+    ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRm, 0, 0, 30));
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);  // ADD: return from block immediately
+    
+    if (hasCondBranch)
+        patchBranchOffset(ctx, condBranchIdx, ctx.size());
+    return true;
+}
+```
+
+But then `compileBlock` will also add `emit_syncToInterp; emit_epilogue` after the loop. Fix this by having the branch set `blockEnded = true` and skipping the final sync/epilogue, or by adding an early-return flag.
+
+**Simplest approach**: Always add `emit_epilogue` after `emit_syncToInterp` in the branch emitters, and have `compileBlock` track whether the block already ended with a return:
+
+```cpp
+// Add to EmitCtx:
+struct EmitCtx {
+    // ... existing fields ...
+    bool hasExplicitReturn = false;  // true if block already ends with blr
+};
+
+// In emit_branch, after emit_syncToInterp:
+emit_epilogue(ctx);
+ctx.hasExplicitReturn = true;
+
+// In compileBlock, at the end:
+if (!ctx.hasExplicitReturn) {
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);
+}
+```
+
+But this breaks conditional branches where only the *taken* path has `emit_epilogue`. The not-taken path falls through and needs its own epilogue.
+
+**Better approach**: Restructure branch emission so both paths explicitly epilogue:
+
+```cpp
+static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
+    // B/BL example:
+    if ((opcode & 0x0E000000) == 0x0A000000) {
+        bool    isLink = (opcode >> 24) & 1;
+        int32_t offset = (int32_t)(opcode << 8) >> 6;
+        uint32_t target = pc + 8 + offset;
+
+        size_t condBranchIdx = 0;
+        bool   hasCondBranch = false;
+        if (cond != 14) {
+            emit_setupCondFlags(ctx);
+            CondBranch cb = armCondToPpc(cond);
+            if (!cb.valid) return false;
+            if (cb.bo != 20) {
+                condBranchIdx = ctx.size();
+                hasCondBranch = true;
+                ctx.emit(ppc_bc((cb.bo == 12) ? 4 : 12, cb.bi, 0));
+            }
+        }
+
+        // Taken path:
+        if (isLink) {
+            int n = emit_li32(ctx.cur, PPC_ARM_R14, pc + 4);
+            ctx.cur += n;
+        }
+        {
+            int n = emit_li32(ctx.cur, PPC_ARM_R15, target);
+            ctx.cur += n;
+        }
+        emit_syncToInterp(ctx);
+        emit_epilogue(ctx);  // Return from block (taken)
+
+        if (hasCondBranch) {
+            // Not-taken path: patch condition branch to here
+            patchBranchOffset(ctx, condBranchIdx, ctx.size());
+            // R15 for not-taken = pc + 4 (next instruction)
+            int n = emit_li32(ctx.cur, PPC_ARM_R15, pc + 4);
+            ctx.cur += n;
+            emit_syncToInterp(ctx);
+            emit_epilogue(ctx);  // Return from block (not-taken)
+        }
+
+        ctx.hasExplicitReturn = true;
+        return true;
+    }
+    // Similar for BX...
+}
+```
+
+### Fix 7: `JitPpc_syncToInterp` Writes Wrong PC (Stale from Register Array)
+
+```cpp
+void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 16; i++)
+        *regPtrs[i] = regs[i];  // regs[15] should be the new PC
+    interp->getCpsrRef() = regs[16];
+}
+```
+
+This writes `regs[15]` (PPC_ARM_R15) to `*regPtrs[15]`. But `regPtrs[15]` points to the PC slot in `registersUsr`. The interpreter expects PC to be `fetch_addr + pipeline_depth`. If we write the target address directly, the interpreter will read it as a pipelined value.
+
+The interpreter's `flushPipeline()` sets `*registers[15] = target + pipeline` and reloads the pipeline. We're bypassing this by directly writing `*registers[15] = target`, then returning. When the interpreter resumes, it reads `*registers[15]` as the PC and tries to continue, but without a proper pipeline refill.
+
+**Fix**: Instead of writing directly, call into the interpreter to do a proper branch:
+
+```cpp
+// Add to interpreter.h:
+void setPC(uint32_t newPC);  // properly flushes pipeline
+
+// In interpreter.cpp:
+void Interpreter::setPC(uint32_t newPC) {
+    *registers[15] = newPC;
+    flushPipeline();
+}
+```
+
+```cpp
+extern "C" void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 15; i++)  // R0-R14
+        *regPtrs[i] = regs[i];
+    interp->getCpsrRef() = regs[16];
+    // R15: properly set via setPC to flush pipeline
+    interp->setPC(regs[15]);
+}
+```
+
+---
+
+## Summary of All Fixes
+
+| # | Location | Bug | Fix |
+|---|----------|-----|-----|
+| 1 | `runJitNds` | Uses `getPC()` (pipelined) instead of actual fetch PC | Add `getActualPC()`, use it |
+| 2 | `emit_call` | Uses r12 (`PPC_TMP3`), volatile and shared | Use r29 as `PPC_CALL_TMP`, save in frame |
+| 3 | `FRAME_*` constants | Frame too small for r14..r29, `FRAME_REGSYNC` too small | Resize to 176, adjust `FRAME_REGSYNC` to 80 |
+| 4 | Branch emitters | Taken path lacks `emit_epilogue`, falls through to corrupt code | Add `emit_epilogue` after each `emit_syncToInterp` in branch paths |
+| 5 | Fallback handler | Interpreter fallback may branch, but block continues sequential | Set `blockEnded = true` after `emit_interpFallback` |
+| 6 | `JitPpc_syncToInterp` | Writes raw address to `*registers[15]`, bypassing pipeline | Call `interp->setPC()` for R15 to flush pipeline properly |
+| 7 | `compileBlock` | Final `emit_syncToInterp/epilogue` redundant when block has explicit return | Add `hasExplicitReturn` flag to `EmitCtx` |
+
+The ISI exception specifically is caused by bugs **1** (wrong PC → compiling/executing wrong block, possibly non-code memory) and **4** (taken branch path falls through to wrong code, eventually jumping to an ARM address as if it were PPC). Fix these two first and you should eliminate the ISI.
+
+=======
+
+I'll implement all the fixes systematically. Let me go through the complete corrected files:
+
+```cpp
+// interpreter.h
+#pragma once
+
+#include <cstdint>
+#include "defines.h"
+
+class Core;
+class HleBios;
+
+class Interpreter {
+public:
+    int jitRunOpcode();
+    HleBios *bios = nullptr;
+    uint32_t entryAddr = 0;
+    uint8_t halted = 0;
+
+    Interpreter(Core *core, bool arm7);
+    void saveState(FILE *file);
+    void loadState(FILE *file);
+
+    void init();
+    void directBoot();
+    void resetCycles();
+
+    static void runCoreNone(Core &core);
+    template <bool, int> static void runCoreSingle(Core &core);
+    static void runCoreNds(Core &core);
+    static void runCoreDsi(Core &core);
+
+    uint16_t getOpcode16();
+    uint32_t getOpcode32();
+
+    void halt(int bit);
+    void unhalt(int bit);
+    void sendInterrupt(int bit);
+    void interrupt();
+
+    bool isThumb() { return cpsr & BIT(5); }
+
+    // Returns the pipelined PC (pc + 8 ARM / pc + 4 Thumb).
+    uint32_t getPC() { return *registers[15]; }
+
+    // Returns the true fetch address (what the CPU is about to decode).
+    // The interpreter maintains a 2-stage pipeline so registers[15] is
+    // always ahead by one pipeline stage beyond the fetch stage:
+    //   ARM:   registers[15] = fetch_pc + 8
+    //   Thumb: registers[15] = fetch_pc + 4
+    uint32_t getActualPC() {
+        return *registers[15] - (isThumb() ? 4u : 8u);
+    }
+
+    // Properly update PC and flush the pipeline (used by the JIT sync).
+    // Calling this is equivalent to the interpreter taking a branch.
+    void setPC(uint32_t newPC);
+
+    int handleHleIrq();
+
+    uint8_t readIme() { return ime; }
+    uint32_t readIe() { return ie; }
+    uint32_t readIrf() { return irf; }
+    uint8_t readPostFlg() { return postFlg; }
+
+    void writeIme(uint8_t value);
+    void writeIe(uint32_t mask, uint32_t value);
+    void writeIrf(uint32_t mask, uint32_t value);
+    void writePostFlg(uint8_t value);
+
+    uint32_t** getRegisters()  { return registers; }
+    uint32_t&  getCpsrRef()    { return cpsr; }
+
+    static size_t offset_halted() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->halted);
+    }
+    static size_t offset_pcData() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->pcData);
+    }
+    static size_t offset_pipeline() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->pipeline);
+    }
+    static size_t offset_registersUsr() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->registersUsr);
+    }
+    static size_t offset_cpsr() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->cpsr);
+    }
+    static size_t offset_cycles() {
+        Interpreter* p = reinterpret_cast<Interpreter*>(0);
+        return (size_t)((uintptr_t)&p->cycles);
+    }
+
+private:
+    Core *core;
+    bool arm7;
+
+    uint8_t *pcData = nullptr;
+    uint32_t pipeline[2] = {};
+
+    uint32_t *registers[32] = {};
+    uint32_t registersUsr[16] = {};
+    uint32_t registersFiq[7] = {};
+    uint32_t registersSvc[2] = {};
+    uint32_t registersAbt[2] = {};
+    uint32_t registersIrq[2] = {};
+    uint32_t registersUnd[2] = {};
+
+    uint32_t cpsr = 0, *spsr = nullptr;
+    uint32_t spsrFiq = 0, spsrSvc = 0, spsrAbt = 0, spsrIrq = 0, spsrUnd = 0;
+
+    uint32_t cycles = 0;
+    bool dsiCycle = false;
+
+    uint8_t ime = 0;
+    uint32_t ie = 0, irf = 0;
+    uint8_t postFlg = 0;
+
+    static int (Interpreter::*armInstrs[0x1000])(uint32_t);
+    static int (Interpreter::*thumbInstrs[0x400])(uint16_t);
+
+    static const uint8_t condition[0x100];
+    static const uint8_t bitCount[0x100];
+
+    int runOpcode();
+    int exception(uint8_t vector);
+    void flushPipeline();
+    void swapRegisters(uint32_t value);
+    void setCpsr(uint32_t value, bool save = false);
+    int handleReserved(uint32_t opcode);
+    int finishHleIrq();
+
+    int unkArm(uint32_t opcode);
+    int unkThumb(uint16_t opcode);
+
+    int32_t clampQ(int64_t value);
+
+    uint32_t lli(uint32_t opcode);
+    uint32_t llr(uint32_t opcode);
+    uint32_t lri(uint32_t opcode);
+    uint32_t lrr(uint32_t opcode);
+    uint32_t ari(uint32_t opcode);
+    uint32_t arr(uint32_t opcode);
+    uint32_t rri(uint32_t opcode);
+    uint32_t rrr(uint32_t opcode);
+    uint32_t imm(uint32_t opcode);
+    uint32_t lliS(uint32_t opcode);
+    uint32_t llrS(uint32_t opcode);
+    uint32_t lriS(uint32_t opcode);
+    uint32_t lrrS(uint32_t opcode);
+    uint32_t ariS(uint32_t opcode);
+    uint32_t arrS(uint32_t opcode);
+    uint32_t rriS(uint32_t opcode);
+    uint32_t rrrS(uint32_t opcode);
+    uint32_t immS(uint32_t opcode);
+
+    int _and(uint32_t opcode, uint32_t op2);
+    int eor(uint32_t opcode, uint32_t op2);
+    int sub(uint32_t opcode, uint32_t op2);
+    int rsb(uint32_t opcode, uint32_t op2);
+    int add(uint32_t opcode, uint32_t op2);
+    int adc(uint32_t opcode, uint32_t op2);
+    int sbc(uint32_t opcode, uint32_t op2);
+    int rsc(uint32_t opcode, uint32_t op2);
+    int tst(uint32_t opcode, uint32_t op2);
+    int teq(uint32_t opcode, uint32_t op2);
+    int cmp(uint32_t opcode, uint32_t op2);
+    int cmn(uint32_t opcode, uint32_t op2);
+    int orr(uint32_t opcode, uint32_t op2);
+    int mov(uint32_t opcode, uint32_t op2);
+    int bic(uint32_t opcode, uint32_t op2);
+    int mvn(uint32_t opcode, uint32_t op2);
+    int ands(uint32_t opcode, uint32_t op2);
+    int eors(uint32_t opcode, uint32_t op2);
+    int subs(uint32_t opcode, uint32_t op2);
+    int rsbs(uint32_t opcode, uint32_t op2);
+    int adds(uint32_t opcode, uint32_t op2);
+    int adcs(uint32_t opcode, uint32_t op2);
+    int sbcs(uint32_t opcode, uint32_t op2);
+    int rscs(uint32_t opcode, uint32_t op2);
+    int orrs(uint32_t opcode, uint32_t op2);
+    int movs(uint32_t opcode, uint32_t op2);
+    int bics(uint32_t opcode, uint32_t op2);
+    int mvns(uint32_t opcode, uint32_t op2);
+
+    int _andLli(uint32_t opcode);
+    int _andLlr(uint32_t opcode);
+    int _andLri(uint32_t opcode);
+    int _andLrr(uint32_t opcode);
+    int _andAri(uint32_t opcode);
+    int _andArr(uint32_t opcode);
+    int _andRri(uint32_t opcode);
+    int _andRrr(uint32_t opcode);
+    int _andImm(uint32_t opcode);
+    int andsLli(uint32_t opcode);
+    int andsLlr(uint32_t opcode);
+    int andsLri(uint32_t opcode);
+    int andsLrr(uint32_t opcode);
+    int andsAri(uint32_t opcode);
+    int andsArr(uint32_t opcode);
+    int andsRri(uint32_t opcode);
+    int andsRrr(uint32_t opcode);
+    int andsImm(uint32_t opcode);
+    int eorLli(uint32_t opcode);
+    int eorLlr(uint32_t opcode);
+    int eorLri(uint32_t opcode);
+    int eorLrr(uint32_t opcode);
+    int eorAri(uint32_t opcode);
+    int eorArr(uint32_t opcode);
+    int eorRri(uint32_t opcode);
+    int eorRrr(uint32_t opcode);
+    int eorImm(uint32_t opcode);
+    int eorsLli(uint32_t opcode);
+    int eorsLlr(uint32_t opcode);
+    int eorsLri(uint32_t opcode);
+    int eorsLrr(uint32_t opcode);
+    int eorsAri(uint32_t opcode);
+    int eorsArr(uint32_t opcode);
+    int eorsRri(uint32_t opcode);
+    int eorsRrr(uint32_t opcode);
+    int eorsImm(uint32_t opcode);
+    int subLli(uint32_t opcode);
+    int subLlr(uint32_t opcode);
+    int subLri(uint32_t opcode);
+    int subLrr(uint32_t opcode);
+    int subAri(uint32_t opcode);
+    int subArr(uint32_t opcode);
+    int subRri(uint32_t opcode);
+    int subRrr(uint32_t opcode);
+    int subImm(uint32_t opcode);
+    int subsLli(uint32_t opcode);
+    int subsLlr(uint32_t opcode);
+    int subsLri(uint32_t opcode);
+    int subsLrr(uint32_t opcode);
+    int subsAri(uint32_t opcode);
+    int subsArr(uint32_t opcode);
+    int subsRri(uint32_t opcode);
+    int subsRrr(uint32_t opcode);
+    int subsImm(uint32_t opcode);
+    int rsbLli(uint32_t opcode);
+    int rsbLlr(uint32_t opcode);
+    int rsbLri(uint32_t opcode);
+    int rsbLrr(uint32_t opcode);
+    int rsbAri(uint32_t opcode);
+    int rsbArr(uint32_t opcode);
+    int rsbRri(uint32_t opcode);
+    int rsbRrr(uint32_t opcode);
+    int rsbImm(uint32_t opcode);
+    int rsbsLli(uint32_t opcode);
+    int rsbsLlr(uint32_t opcode);
+    int rsbsLri(uint32_t opcode);
+    int rsbsLrr(uint32_t opcode);
+    int rsbsAri(uint32_t opcode);
+    int rsbsArr(uint32_t opcode);
+    int rsbsRri(uint32_t opcode);
+    int rsbsRrr(uint32_t opcode);
+    int rsbsImm(uint32_t opcode);
+    int addLli(uint32_t opcode);
+    int addLlr(uint32_t opcode);
+    int addLri(uint32_t opcode);
+    int addLrr(uint32_t opcode);
+    int addAri(uint32_t opcode);
+    int addArr(uint32_t opcode);
+    int addRri(uint32_t opcode);
+    int addRrr(uint32_t opcode);
+    int addImm(uint32_t opcode);
+    int addsLli(uint32_t opcode);
+    int addsLlr(uint32_t opcode);
+    int addsLri(uint32_t opcode);
+    int addsLrr(uint32_t opcode);
+    int addsAri(uint32_t opcode);
+    int addsArr(uint32_t opcode);
+    int addsRri(uint32_t opcode);
+    int addsRrr(uint32_t opcode);
+    int addsImm(uint32_t opcode);
+    int adcLli(uint32_t opcode);
+    int adcLlr(uint32_t opcode);
+    int adcLri(uint32_t opcode);
+    int adcLrr(uint32_t opcode);
+    int adcAri(uint32_t opcode);
+    int adcArr(uint32_t opcode);
+    int adcRri(uint32_t opcode);
+    int adcRrr(uint32_t opcode);
+    int adcImm(uint32_t opcode);
+    int adcsLli(uint32_t opcode);
+    int adcsLlr(uint32_t opcode);
+    int adcsLri(uint32_t opcode);
+    int adcsLrr(uint32_t opcode);
+    int adcsAri(uint32_t opcode);
+    int adcsArr(uint32_t opcode);
+    int adcsRri(uint32_t opcode);
+    int adcsRrr(uint32_t opcode);
+    int adcsImm(uint32_t opcode);
+    int sbcLli(uint32_t opcode);
+    int sbcLlr(uint32_t opcode);
+    int sbcLri(uint32_t opcode);
+    int sbcLrr(uint32_t opcode);
+    int sbcAri(uint32_t opcode);
+    int sbcArr(uint32_t opcode);
+    int sbcRri(uint32_t opcode);
+    int sbcRrr(uint32_t opcode);
+    int sbcImm(uint32_t opcode);
+    int sbcsLli(uint32_t opcode);
+    int sbcsLlr(uint32_t opcode);
+    int sbcsLri(uint32_t opcode);
+    int sbcsLrr(uint32_t opcode);
+    int sbcsAri(uint32_t opcode);
+    int sbcsArr(uint32_t opcode);
+    int sbcsRri(uint32_t opcode);
+    int sbcsRrr(uint32_t opcode);
+    int sbcsImm(uint32_t opcode);
+    int rscLli(uint32_t opcode);
+    int rscLlr(uint32_t opcode);
+    int rscLri(uint32_t opcode);
+    int rscLrr(uint32_t opcode);
+    int rscAri(uint32_t opcode);
+    int rscArr(uint32_t opcode);
+    int rscRri(uint32_t opcode);
+    int rscRrr(uint32_t opcode);
+    int rscImm(uint32_t opcode);
+    int rscsLli(uint32_t opcode);
+    int rscsLlr(uint32_t opcode);
+    int rscsLri(uint32_t opcode);
+    int rscsLrr(uint32_t opcode);
+    int rscsAri(uint32_t opcode);
+    int rscsArr(uint32_t opcode);
+    int rscsRri(uint32_t opcode);
+    int rscsRrr(uint32_t opcode);
+    int rscsImm(uint32_t opcode);
+    int tstLli(uint32_t opcode);
+    int tstLlr(uint32_t opcode);
+    int tstLri(uint32_t opcode);
+    int tstLrr(uint32_t opcode);
+    int tstAri(uint32_t opcode);
+    int tstArr(uint32_t opcode);
+    int tstRri(uint32_t opcode);
+    int tstRrr(uint32_t opcode);
+    int tstImm(uint32_t opcode);
+    int teqLli(uint32_t opcode);
+    int teqLlr(uint32_t opcode);
+    int teqLri(uint32_t opcode);
+    int teqLrr(uint32_t opcode);
+    int teqAri(uint32_t opcode);
+    int teqArr(uint32_t opcode);
+    int teqRri(uint32_t opcode);
+    int teqRrr(uint32_t opcode);
+    int teqImm(uint32_t opcode);
+    int cmpLli(uint32_t opcode);
+    int cmpLlr(uint32_t opcode);
+    int cmpLri(uint32_t opcode);
+    int cmpLrr(uint32_t opcode);
+    int cmpAri(uint32_t opcode);
+    int cmpArr(uint32_t opcode);
+    int cmpRri(uint32_t opcode);
+    int cmpRrr(uint32_t opcode);
+    int cmpImm(uint32_t opcode);
+    int cmnLli(uint32_t opcode);
+    int cmnLlr(uint32_t opcode);
+    int cmnLri(uint32_t opcode);
+    int cmnLrr(uint32_t opcode);
+    int cmnAri(uint32_t opcode);
+    int cmnArr(uint32_t opcode);
+    int cmnRri(uint32_t opcode);
+    int cmnRrr(uint32_t opcode);
+    int cmnImm(uint32_t opcode);
+    int orrLli(uint32_t opcode);
+    int orrLlr(uint32_t opcode);
+    int orrLri(uint32_t opcode);
+    int orrLrr(uint32_t opcode);
+    int orrAri(uint32_t opcode);
+    int orrArr(uint32_t opcode);
+    int orrRri(uint32_t opcode);
+    int orrRrr(uint32_t opcode);
+    int orrImm(uint32_t opcode);
+    int orrsLli(uint32_t opcode);
+    int orrsLlr(uint32_t opcode);
+    int orrsLri(uint32_t opcode);
+    int orrsLrr(uint32_t opcode);
+    int orrsAri(uint32_t opcode);
+    int orrsArr(uint32_t opcode);
+    int orrsRri(uint32_t opcode);
+    int orrsRrr(uint32_t opcode);
+    int orrsImm(uint32_t opcode);
+    int movLli(uint32_t opcode);
+    int movLlr(uint32_t opcode);
+    int movLri(uint32_t opcode);
+    int movLrr(uint32_t opcode);
+    int movAri(uint32_t opcode);
+    int movArr(uint32_t opcode);
+    int movRri(uint32_t opcode);
+    int movRrr(uint32_t opcode);
+    int movImm(uint32_t opcode);
+    int movsLli(uint32_t opcode);
+    int movsLlr(uint32_t opcode);
+    int movsLri(uint32_t opcode);
+    int movsLrr(uint32_t opcode);
+    int movsAri(uint32_t opcode);
+    int movsArr(uint32_t opcode);
+    int movsRri(uint32_t opcode);
+    int movsRrr(uint32_t opcode);
+    int movsImm(uint32_t opcode);
+    int bicLli(uint32_t opcode);
+    int bicLlr(uint32_t opcode);
+    int bicLri(uint32_t opcode);
+    int bicLrr(uint32_t opcode);
+    int bicAri(uint32_t opcode);
+    int bicArr(uint32_t opcode);
+    int bicRri(uint32_t opcode);
+    int bicRrr(uint32_t opcode);
+    int bicImm(uint32_t opcode);
+    int bicsLli(uint32_t opcode);
+    int bicsLlr(uint32_t opcode);
+    int bicsLri(uint32_t opcode);
+    int bicsLrr(uint32_t opcode);
+    int bicsAri(uint32_t opcode);
+    int bicsArr(uint32_t opcode);
+    int bicsRri(uint32_t opcode);
+    int bicsRrr(uint32_t opcode);
+    int bicsImm(uint32_t opcode);
+    int mvnLli(uint32_t opcode);
+    int mvnLlr(uint32_t opcode);
+    int mvnLri(uint32_t opcode);
+    int mvnLrr(uint32_t opcode);
+    int mvnAri(uint32_t opcode);
+    int mvnArr(uint32_t opcode);
+    int mvnRri(uint32_t opcode);
+    int mvnRrr(uint32_t opcode);
+    int mvnImm(uint32_t opcode);
+    int mvnsLli(uint32_t opcode);
+    int mvnsLlr(uint32_t opcode);
+    int mvnsLri(uint32_t opcode);
+    int mvnsLrr(uint32_t opcode);
+    int mvnsAri(uint32_t opcode);
+    int mvnsArr(uint32_t opcode);
+    int mvnsRri(uint32_t opcode);
+    int mvnsRrr(uint32_t opcode);
+    int mvnsImm(uint32_t opcode);
+    int mul(uint32_t opcode);
+    int mla(uint32_t opcode);
+    int umull(uint32_t opcode);
+    int umlal(uint32_t opcode);
+    int smull(uint32_t opcode);
+    int smlal(uint32_t opcode);
+    int muls(uint32_t opcode);
+    int mlas(uint32_t opcode);
+    int umulls(uint32_t opcode);
+    int umlals(uint32_t opcode);
+    int smulls(uint32_t opcode);
+    int smlals(uint32_t opcode);
+    int smulbb(uint32_t opcode);
+    int smulbt(uint32_t opcode);
+    int smultb(uint32_t opcode);
+    int smultt(uint32_t opcode);
+    int smulwb(uint32_t opcode);
+    int smulwt(uint32_t opcode);
+    int smlabb(uint32_t opcode);
+    int smlabt(uint32_t opcode);
+    int smlatb(uint32_t opcode);
+    int smlatt(uint32_t opcode);
+    int smlawb(uint32_t opcode);
+    int smlawt(uint32_t opcode);
+    int smlalbb(uint32_t opcode);
+    int smlalbt(uint32_t opcode);
+    int smlaltb(uint32_t opcode);
+    int smlaltt(uint32_t opcode);
+    int qadd(uint32_t opcode);
+    int qsub(uint32_t opcode);
+    int qdadd(uint32_t opcode);
+    int qdsub(uint32_t opcode);
+    int clz(uint32_t opcode);
+    int addRegT(uint16_t opcode);
+    int subRegT(uint16_t opcode);
+    int addHT(uint16_t opcode);
+    int cmpHT(uint16_t opcode);
+    int movHT(uint16_t opcode);
+    int addPcT(uint16_t opcode);
+    int addSpT(uint16_t opcode);
+    int addSpImmT(uint16_t opcode);
+    int lslImmT(uint16_t opcode);
+    int lsrImmT(uint16_t opcode);
+    int asrImmT(uint16_t opcode);
+    int addImm3T(uint16_t opcode);
+    int subImm3T(uint16_t opcode);
+    int addImm8T(uint16_t opcode);
+    int subImm8T(uint16_t opcode);
+    int cmpImm8T(uint16_t opcode);
+    int movImm8T(uint16_t opcode);
+    int lslDpT(uint16_t opcode);
+    int lsrDpT(uint16_t opcode);
+    int asrDpT(uint16_t opcode);
+    int rorDpT(uint16_t opcode);
+    int andDpT(uint16_t opcode);
+    int eorDpT(uint16_t opcode);
+    int adcDpT(uint16_t opcode);
+    int sbcDpT(uint16_t opcode);
+    int tstDpT(uint16_t opcode);
+    int cmpDpT(uint16_t opcode);
+    int cmnDpT(uint16_t opcode);
+    int orrDpT(uint16_t opcode);
+    int bicDpT(uint16_t opcode);
+    int mvnDpT(uint16_t opcode);
+    int negDpT(uint16_t opcode);
+    int mulDpT(uint16_t opcode);
+    uint32_t ip(uint32_t opcode);
+    uint32_t ipH(uint32_t opcode);
+    uint32_t rp(uint32_t opcode);
+    uint32_t rpll(uint32_t opcode);
+    uint32_t rplr(uint32_t opcode);
+    uint32_t rpar(uint32_t opcode);
+    uint32_t rprr(uint32_t opcode);
+    int ldrsbOf(uint32_t opcode, uint32_t op2);
+    int ldrshOf(uint32_t opcode, uint32_t op2);
+    int ldrbOf(uint32_t opcode, uint32_t op2);
+    int strbOf(uint32_t opcode, uint32_t op2);
+    int ldrhOf(uint32_t opcode, uint32_t op2);
+    int strhOf(uint32_t opcode, uint32_t op2);
+    int ldrOf(uint32_t opcode, uint32_t op2);
+    int strOf(uint32_t opcode, uint32_t op2);
+    int ldrdOf(uint32_t opcode, uint32_t op2);
+    int strdOf(uint32_t opcode, uint32_t op2);
+    int ldrsbPr(uint32_t opcode, uint32_t op2);
+    int ldrshPr(uint32_t opcode, uint32_t op2);
+    int ldrbPr(uint32_t opcode, uint32_t op2);
+    int strbPr(uint32_t opcode, uint32_t op2);
+    int ldrhPr(uint32_t opcode, uint32_t op2);
+    int strhPr(uint32_t opcode, uint32_t op2);
+    int ldrPr(uint32_t opcode, uint32_t op2);
+    int strPr(uint32_t opcode, uint32_t op2);
+    int ldrdPr(uint32_t opcode, uint32_t op2);
+    int strdPr(uint32_t opcode, uint32_t op2);
+    int ldrsbPt(uint32_t opcode, uint32_t op2);
+    int ldrshPt(uint32_t opcode, uint32_t op2);
+    int ldrbPt(uint32_t opcode, uint32_t op2);
+    int strbPt(uint32_t opcode, uint32_t op2);
+    int ldrhPt(uint32_t opcode, uint32_t op2);
+    int strhPt(uint32_t opcode, uint32_t op2);
+    int ldrPt(uint32_t opcode, uint32_t op2);
+    int strPt(uint32_t opcode, uint32_t op2);
+    int ldrdPt(uint32_t opcode, uint32_t op2);
+    int strdPt(uint32_t opcode, uint32_t op2);
+    int ldrsbOfrm(uint32_t opcode);
+    int ldrsbOfim(uint32_t opcode);
+    int ldrsbOfrp(uint32_t opcode);
+    int ldrsbOfip(uint32_t opcode);
+    int ldrsbPrrm(uint32_t opcode);
+    int ldrsbPrim(uint32_t opcode);
+    int ldrsbPrrp(uint32_t opcode);
+    int ldrsbPrip(uint32_t opcode);
+    int ldrsbPtrm(uint32_t opcode);
+    int ldrsbPtim(uint32_t opcode);
+    int ldrsbPtrp(uint32_t opcode);
+    int ldrsbPtip(uint32_t opcode);
+    int ldrshOfrm(uint32_t opcode);
+    int ldrshOfim(uint32_t opcode);
+    int ldrshOfrp(uint32_t opcode);
+    int ldrshOfip(uint32_t opcode);
+    int ldrshPrrm(uint32_t opcode);
+    int ldrshPrim(uint32_t opcode);
+    int ldrshPrrp(uint32_t opcode);
+    int ldrshPrip(uint32_t opcode);
+    int ldrshPtrm(uint32_t opcode);
+    int ldrshPtim(uint32_t opcode);
+    int ldrshPtrp(uint32_t opcode);
+    int ldrshPtip(uint32_t opcode);
+    int ldrbOfim(uint32_t opcode);
+    int ldrbOfip(uint32_t opcode);
+    int ldrbOfrmll(uint32_t opcode);
+    int ldrbOfrmlr(uint32_t opcode);
+    int ldrbOfrmar(uint32_t opcode);
+    int ldrbOfrmrr(uint32_t opcode);
+    int ldrbOfrpll(uint32_t opcode);
+    int ldrbOfrplr(uint32_t opcode);
+    int ldrbOfrpar(uint32_t opcode);
+    int ldrbOfrprr(uint32_t opcode);
+    int ldrbPrim(uint32_t opcode);
+    int ldrbPrip(uint32_t opcode);
+    int ldrbPrrmll(uint32_t opcode);
+    int ldrbPrrmlr(uint32_t opcode);
+    int ldrbPrrmar(uint32_t opcode);
+    int ldrbPrrmrr(uint32_t opcode);
+    int ldrbPrrpll(uint32_t opcode);
+    int ldrbPrrplr(uint32_t opcode);
+    int ldrbPrrpar(uint32_t opcode);
+    int ldrbPrrprr(uint32_t opcode);
+    int ldrbPtim(uint32_t opcode);
+    int ldrbPtip(uint32_t opcode);
+    int ldrbPtrmll(uint32_t opcode);
+    int ldrbPtrmlr(uint32_t opcode);
+    int ldrbPtrmar(uint32_t opcode);
+    int ldrbPtrmrr(uint32_t opcode);
+    int ldrbPtrpll(uint32_t opcode);
+    int ldrbPtrplr(uint32_t opcode);
+    int ldrbPtrpar(uint32_t opcode);
+    int ldrbPtrprr(uint32_t opcode);
+    int strbOfim(uint32_t opcode);
+    int strbOfip(uint32_t opcode);
+    int strbOfrmll(uint32_t opcode);
+    int strbOfrmlr(uint32_t opcode);
+    int strbOfrmar(uint32_t opcode);
+    int strbOfrmrr(uint32_t opcode);
+    int strbOfrpll(uint32_t opcode);
+    int strbOfrplr(uint32_t opcode);
+    int strbOfrpar(uint32_t opcode);
+    int strbOfrprr(uint32_t opcode);
+    int strbPrim(uint32_t opcode);
+    int strbPrip(uint32_t opcode);
+    int strbPrrmll(uint32_t opcode);
+    int strbPrrmlr(uint32_t opcode);
+    int strbPrrmar(uint32_t opcode);
+    int strbPrrmrr(uint32_t opcode);
+    int strbPrrpll(uint32_t opcode);
+    int strbPrrplr(uint32_t opcode);
+    int strbPrrpar(uint32_t opcode);
+    int strbPrrprr(uint32_t opcode);
+    int strbPtim(uint32_t opcode);
+    int strbPtip(uint32_t opcode);
+    int strbPtrmll(uint32_t opcode);
+    int strbPtrmlr(uint32_t opcode);
+    int strbPtrmar(uint32_t opcode);
+    int strbPtrmrr(uint32_t opcode);
+    int strbPtrpll(uint32_t opcode);
+    int strbPtrplr(uint32_t opcode);
+    int strbPtrpar(uint32_t opcode);
+    int strbPtrprr(uint32_t opcode);
+    int ldrhOfrm(uint32_t opcode);
+    int ldrhOfim(uint32_t opcode);
+    int ldrhOfrp(uint32_t opcode);
+    int ldrhOfip(uint32_t opcode);
+    int ldrhPrrm(uint32_t opcode);
+    int ldrhPrim(uint32_t opcode);
+    int ldrhPrrp(uint32_t opcode);
+    int ldrhPrip(uint32_t opcode);
+    int ldrhPtrm(uint32_t opcode);
+    int ldrhPtim(uint32_t opcode);
+    int ldrhPtrp(uint32_t opcode);
+    int ldrhPtip(uint32_t opcode);
+    int strhOfrm(uint32_t opcode);
+    int strhOfim(uint32_t opcode);
+    int strhOfrp(uint32_t opcode);
+    int strhOfip(uint32_t opcode);
+    int strhPrrm(uint32_t opcode);
+    int strhPrim(uint32_t opcode);
+    int strhPrrp(uint32_t opcode);
+    int strhPrip(uint32_t opcode);
+    int strhPtrm(uint32_t opcode);
+    int strhPtim(uint32_t opcode);
+    int strhPtrp(uint32_t opcode);
+    int strhPtip(uint32_t opcode);
+    int ldrOfim(uint32_t opcode);
+    int ldrOfip(uint32_t opcode);
+    int ldrOfrmll(uint32_t opcode);
+    int ldrOfrmlr(uint32_t opcode);
+    int ldrOfrmar(uint32_t opcode);
+    int ldrOfrmrr(uint32_t opcode);
+    int ldrOfrpll(uint32_t opcode);
+    int ldrOfrplr(uint32_t opcode);
+    int ldrOfrpar(uint32_t opcode);
+    int ldrOfrprr(uint32_t opcode);
+    int ldrPrim(uint32_t opcode);
+    int ldrPrip(uint32_t opcode);
+    int ldrPrrmll(uint32_t opcode);
+    int ldrPrrmlr(uint32_t opcode);
+    int ldrPrrmar(uint32_t opcode);
+    int ldrPrrmrr(uint32_t opcode);
+    int ldrPrrpll(uint32_t opcode);
+    int ldrPrrplr(uint32_t opcode);
+    int ldrPrrpar(uint32_t opcode);
+    int ldrPrrprr(uint32_t opcode);
+    int ldrPtim(uint32_t opcode);
+    int ldrPtip(uint32_t opcode);
+    int ldrPtrmll(uint32_t opcode);
+    int ldrPtrmlr(uint32_t opcode);
+    int ldrPtrmar(uint32_t opcode);
+    int ldrPtrmrr(uint32_t opcode);
+    int ldrPtrpll(uint32_t opcode);
+    int ldrPtrplr(uint32_t opcode);
+    int ldrPtrpar(uint32_t opcode);
+    int ldrPtrprr(uint32_t opcode);
+    int strOfim(uint32_t opcode);
+    int strOfip(uint32_t opcode);
+    int strOfrmll(uint32_t opcode);
+    int strOfrmlr(uint32_t opcode);
+    int strOfrmar(uint32_t opcode);
+    int strOfrmrr(uint32_t opcode);
+    int strOfrpll(uint32_t opcode);
+    int strOfrplr(uint32_t opcode);
+    int strOfrpar(uint32_t opcode);
+    int strOfrprr(uint32_t opcode);
+    int strPrim(uint32_t opcode);
+    int strPrip(uint32_t opcode);
+    int strPrrmll(uint32_t opcode);
+    int strPrrmlr(uint32_t opcode);
+    int strPrrmar(uint32_t opcode);
+    int strPrrmrr(uint32_t opcode);
+    int strPrrpll(uint32_t opcode);
+    int strPrrplr(uint32_t opcode);
+    int strPrrpar(uint32_t opcode);
+    int strPrrprr(uint32_t opcode);
+    int strPtim(uint32_t opcode);
+    int strPtip(uint32_t opcode);
+    int strPtrmll(uint32_t opcode);
+    int strPtrmlr(uint32_t opcode);
+    int strPtrmar(uint32_t opcode);
+    int strPtrmrr(uint32_t opcode);
+    int strPtrpll(uint32_t opcode);
+    int strPtrplr(uint32_t opcode);
+    int strPtrpar(uint32_t opcode);
+    int strPtrprr(uint32_t opcode);
+    int ldrdOfrm(uint32_t opcode);
+    int ldrdOfim(uint32_t opcode);
+    int ldrdOfrp(uint32_t opcode);
+    int ldrdOfip(uint32_t opcode);
+    int ldrdPrrm(uint32_t opcode);
+    int ldrdPrim(uint32_t opcode);
+    int ldrdPrrp(uint32_t opcode);
+    int ldrdPrip(uint32_t opcode);
+    int ldrdPtrm(uint32_t opcode);
+    int ldrdPtim(uint32_t opcode);
+    int ldrdPtrp(uint32_t opcode);
+    int ldrdPtip(uint32_t opcode);
+    int strdOfrm(uint32_t opcode);
+    int strdOfim(uint32_t opcode);
+    int strdOfrp(uint32_t opcode);
+    int strdOfip(uint32_t opcode);
+    int strdPrrm(uint32_t opcode);
+    int strdPrim(uint32_t opcode);
+    int strdPrrp(uint32_t opcode);
+    int strdPrip(uint32_t opcode);
+    int strdPtrm(uint32_t opcode);
+    int strdPtim(uint32_t opcode);
+    int strdPtrp(uint32_t opcode);
+    int strdPtip(uint32_t opcode);
+    int swpb(uint32_t opcode);
+    int swp(uint32_t opcode);
+    int ldmda(uint32_t opcode);
+    int stmda(uint32_t opcode);
+    int ldmia(uint32_t opcode);
+    int stmia(uint32_t opcode);
+    int ldmdb(uint32_t opcode);
+    int stmdb(uint32_t opcode);
+    int ldmib(uint32_t opcode);
+    int stmib(uint32_t opcode);
+    int ldmdaW(uint32_t opcode);
+    int stmdaW(uint32_t opcode);
+    int ldmiaW(uint32_t opcode);
+    int stmiaW(uint32_t opcode);
+    int ldmdbW(uint32_t opcode);
+    int stmdbW(uint32_t opcode);
+    int ldmibW(uint32_t opcode);
+    int stmibW(uint32_t opcode);
+    int ldmdaU(uint32_t opcode);
+    int stmdaU(uint32_t opcode);
+    int ldmiaU(uint32_t opcode);
+    int stmiaU(uint32_t opcode);
+    int ldmdbU(uint32_t opcode);
+    int stmdbU(uint32_t opcode);
+    int ldmibU(uint32_t opcode);
+    int stmibU(uint32_t opcode);
+    int ldmdaUW(uint32_t opcode);
+    int stmdaUW(uint32_t opcode);
+    int ldmiaUW(uint32_t opcode);
+    int stmiaUW(uint32_t opcode);
+    int ldmdbUW(uint32_t opcode);
+    int stmdbUW(uint32_t opcode);
+    int ldmibUW(uint32_t opcode);
+    int stmibUW(uint32_t opcode);
+    int msrRc(uint32_t opcode);
+    int msrRs(uint32_t opcode);
+    int msrIc(uint32_t opcode);
+    int msrIs(uint32_t opcode);
+    int mrsRc(uint32_t opcode);
+    int mrsRs(uint32_t opcode);
+    int mrc(uint32_t opcode);
+    int mcr(uint32_t opcode);
+    int ldrsbRegT(uint16_t opcode);
+    int ldrshRegT(uint16_t opcode);
+    int ldrbRegT(uint16_t opcode);
+    int strbRegT(uint16_t opcode);
+    int ldrhRegT(uint16_t opcode);
+    int strhRegT(uint16_t opcode);
+    int ldrRegT(uint16_t opcode);
+    int strRegT(uint16_t opcode);
+    int ldrbImm5T(uint16_t opcode);
+    int strbImm5T(uint16_t opcode);
+    int ldrhImm5T(uint16_t opcode);
+    int strhImm5T(uint16_t opcode);
+    int ldrImm5T(uint16_t opcode);
+    int strImm5T(uint16_t opcode);
+    int ldrPcT(uint16_t opcode);
+    int ldrSpT(uint16_t opcode);
+    int strSpT(uint16_t opcode);
+    int ldmiaT(uint16_t opcode);
+    int stmiaT(uint16_t opcode);
+    int popT(uint16_t opcode);
+    int pushT(uint16_t opcode);
+    int popPcT(uint16_t opcode);
+    int pushLrT(uint16_t opcode);
+    int bx(uint32_t opcode);
+    int blxReg(uint32_t opcode);
+    int b(uint32_t opcode);
+    int bl(uint32_t opcode);
+    int blx(uint32_t opcode);
+    int swi(uint32_t opcode);
+    int bxRegT(uint16_t opcode);
+    int blxRegT(uint16_t opcode);
+    int bT(uint16_t opcode);
+    int beqT(uint16_t opcode);
+    int bneT(uint16_t opcode);
+    int bcsT(uint16_t opcode);
+    int bccT(uint16_t opcode);
+    int bmiT(uint16_t opcode);
+    int bplT(uint16_t opcode);
+    int bvsT(uint16_t opcode);
+    int bvcT(uint16_t opcode);
+    int bhiT(uint16_t opcode);
+    int blsT(uint16_t opcode);
+    int bgeT(uint16_t opcode);
+    int bltT(uint16_t opcode);
+    int bgtT(uint16_t opcode);
+    int bleT(uint16_t opcode);
+    int blSetupT(uint16_t opcode);
+    int blOffT(uint16_t opcode);
+    int blxOffT(uint16_t opcode);
+    int swiT(uint16_t opcode);
+};
+```
+
+Now the complete rewritten `jit_ppc.cpp`:
+
+```cpp
+// jit_ppc.cpp
+// ARMv4/5 -> PowerPC/Gekko JIT Recompiler for NooDS on Wii
+// All bugs fixed per analysis.
+
+#include "jit_ppc.h"
+#include "core.h"
+#include "interpreter.h"
+#include "memory.h"
+#include "defines.h"
+
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <cassert>
+#include <cstdio>
+#include <malloc.h>
+
+extern "C" {
+    #include <ogc/cache.h>
+}
+
+// ============================================================
+// Frame layout (all offsets from new r1 after stwu):
+//
+//   [r1+ 0]   back-chain (written by stwu)
+//   [r1+ 4]   ABI LR save area (callee writes here, we don't use)
+//   [r1+ 8]   our saved LR                          FRAME_LR
+//   [r1+12]   padding
+//   [r1+16]   saved r14..r29  (16 regs x 4 = 64 b)  FRAME_R14
+//   [r1+80]   ARM reg sync (17 words x 4 = 68 b)    FRAME_REGSYNC
+//   [r1+148]  padding to reach 176 (16-byte aligned)
+//
+// Total: 176 bytes.
+//
+// Why r14..r29?
+//   r14-r26: original ARM-mapped non-volatiles.
+//   r27-r28: PPC_INTERP / PPC_CORE changed to r27/r28 (see below).
+//   r29:     PPC_CALL_TMP — dedicated register for emit_call, kept
+//             non-volatile so its value survives calls.
+//   r30,r31: left free (ABI reserves r31 for frame pointer in some
+//             conventions; we leave both untouched).
+// ============================================================
+
+static const int FRAME_SIZE    = 176;   // must be divisible by 16
+static const int FRAME_LR      = 8;
+static const int FRAME_R14     = 16;    // r14..r29 saved here (16 regs)
+static const int FRAME_REGSYNC = 80;    // 17 x 4 = 68 bytes for ARM R0-R15+CPSR
+
+static_assert(FRAME_SIZE % 16 == 0,               "Frame must be 16-byte aligned");
+static_assert(FRAME_REGSYNC + 17*4 <= FRAME_SIZE, "Sync area overflows frame");
+static_assert(FRAME_R14   + 16*4  <= FRAME_REGSYNC, "Saved regs overlap sync area");
+
+namespace JitPpc {
+
+// ============================================================
+// PPC instruction word builders
+// ============================================================
+
+static inline uint32_t ppc_b(int32_t offset, bool aa = false, bool lk = false) {
+    return (18u << 26) | ((uint32_t)(offset & 0x3FFFFFC)) | (aa ? 2u : 0u) | (lk ? 1u : 0u);
+}
+static inline uint32_t ppc_bc(uint8_t bo, uint8_t bi, int16_t offset, bool lk = false) {
+    return (16u << 26) | ((uint32_t)(bo & 0x1F) << 21) |
+           ((uint32_t)(bi & 0x1F) << 16) | ((uint32_t)(offset & 0xFFFC)) | (lk ? 1u : 0u);
+}
+static inline uint32_t ppc_bclr(uint8_t bo, uint8_t bi, bool lk = false) {
+    return (19u << 26) | ((uint32_t)(bo & 0x1F) << 21) |
+           ((uint32_t)(bi & 0x1F) << 16) | (16u << 1) | (lk ? 1u : 0u);
+}
+static inline uint32_t ppc_bctr(bool lk = false) {
+    return (19u << 26) | (20u << 21) | (528u << 1) | (lk ? 1u : 0u);
+}
+static inline uint32_t ppc_addi(uint8_t rt, uint8_t ra, int16_t imm) {
+    return (14u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)imm;
+}
+static inline uint32_t ppc_addis(uint8_t rt, uint8_t ra, int16_t imm) {
+    return (15u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)imm;
+}
+static inline uint32_t ppc_ori(uint8_t ra, uint8_t rs, uint16_t imm) {
+    return (24u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | imm;
+}
+static inline uint32_t ppc_oris(uint8_t ra, uint8_t rs, uint16_t imm) {
+    return (25u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | imm;
+}
+static inline uint32_t ppc_andi(uint8_t ra, uint8_t rs, uint16_t imm) {
+    return (28u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | imm;
+}
+static inline uint32_t ppc_andis(uint8_t ra, uint8_t rs, uint16_t imm) {
+    return (29u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | imm;
+}
+static inline uint32_t ppc_xori(uint8_t ra, uint8_t rs, uint16_t imm) {
+    return (26u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | imm;
+}
+static inline uint32_t ppc_xoris(uint8_t ra, uint8_t rs, uint16_t imm) {
+    return (27u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | imm;
+}
+static inline uint32_t ppc_lwz(uint8_t rt, int16_t d, uint8_t ra) {
+    return (32u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_stw(uint8_t rs, int16_t d, uint8_t ra) {
+    return (36u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_lbz(uint8_t rt, int16_t d, uint8_t ra) {
+    return (34u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_stb(uint8_t rs, int16_t d, uint8_t ra) {
+    return (38u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_lhz(uint8_t rt, int16_t d, uint8_t ra) {
+    return (40u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_lha(uint8_t rt, int16_t d, uint8_t ra) {
+    return (42u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_sth(uint8_t rs, int16_t d, uint8_t ra) {
+    return (44u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_cmpi(uint8_t crD, uint8_t ra, int16_t imm, bool l = false) {
+    return (11u << 26) | ((uint32_t)(crD & 7) << 23) | (l ? (1u << 21) : 0u) |
+           ((uint32_t)ra << 16) | (uint16_t)imm;
+}
+static inline uint32_t ppc_cmpli(uint8_t crD, uint8_t ra, uint16_t imm, bool l = false) {
+    return (10u << 26) | ((uint32_t)(crD & 7) << 23) | (l ? (1u << 21) : 0u) |
+           ((uint32_t)ra << 16) | imm;
+}
+static inline uint32_t ppc_subfic(uint8_t rt, uint8_t ra, int16_t imm) {
+    return (8u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)imm;
+}
+static inline uint32_t ppc_Xform(uint32_t op, uint8_t rt, uint8_t ra, uint8_t rb,
+                                   uint32_t xop, bool rc = false) {
+    return (op << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) |
+           ((uint32_t)rb << 11) | (xop << 1) | (rc ? 1u : 0u);
+}
+static inline uint32_t ppc_XOform(uint32_t op, uint8_t rt, uint8_t ra, uint8_t rb,
+                                    bool oe, uint32_t xop, bool rc = false) {
+    return (op << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) |
+           ((uint32_t)rb << 11) | (oe ? (1u << 10) : 0u) | (xop << 1) | (rc ? 1u : 0u);
+}
+static inline uint32_t ppc_add(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 266, rc);
+}
+static inline uint32_t ppc_addc(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 10, rc);
+}
+static inline uint32_t ppc_adde(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 138, rc);
+}
+static inline uint32_t ppc_subf(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 40, rc);
+}
+static inline uint32_t ppc_subfc(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 8, rc);
+}
+static inline uint32_t ppc_subfe(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 136, rc);
+}
+static inline uint32_t ppc_subfme(uint8_t rt, uint8_t ra, bool rc = false) {
+    return ppc_XOform(31, rt, ra, 0, false, 232, rc);
+}
+static inline uint32_t ppc_neg(uint8_t rt, uint8_t ra, bool rc = false) {
+    return ppc_XOform(31, rt, ra, 0, false, 104, rc);
+}
+static inline uint32_t ppc_mullw(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 235, rc);
+}
+static inline uint32_t ppc_mulhw(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 75, rc);
+}
+static inline uint32_t ppc_mulhwu(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 11, rc);
+}
+static inline uint32_t ppc_divwu(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 459, rc);
+}
+static inline uint32_t ppc_divw(uint8_t rt, uint8_t ra, uint8_t rb, bool rc = false) {
+    return ppc_XOform(31, rt, ra, rb, false, 491, rc);
+}
+static inline uint32_t ppc_and(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 28, rc);
+}
+static inline uint32_t ppc_or(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 444, rc);
+}
+static inline uint32_t ppc_xor(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 316, rc);
+}
+static inline uint32_t ppc_andc(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 60, rc);
+}
+static inline uint32_t ppc_nor(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 124, rc);
+}
+static inline uint32_t ppc_eqv(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 284, rc);
+}
+static inline uint32_t ppc_nand(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 476, rc);
+}
+static inline uint32_t ppc_orc(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 412, rc);
+}
+static inline uint32_t ppc_mr(uint8_t ra, uint8_t rs) {
+    return ppc_or(ra, rs, rs);
+}
+static inline uint32_t ppc_nop() {
+    return ppc_ori(0, 0, 0);
+}
+static inline uint32_t ppc_slw(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 24, rc);
+}
+static inline uint32_t ppc_srw(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 536, rc);
+}
+static inline uint32_t ppc_sraw(uint8_t ra, uint8_t rs, uint8_t rb, bool rc = false) {
+    return ppc_Xform(31, rs, ra, rb, 792, rc);
+}
+static inline uint32_t ppc_rlwinm(uint8_t ra, uint8_t rs, uint8_t sh,
+                                    uint8_t mb, uint8_t me, bool rc = false) {
+    return (21u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) |
+           ((uint32_t)sh << 11) | ((uint32_t)mb << 6) | ((uint32_t)me << 1) | (rc ? 1u : 0u);
+}
+static inline uint32_t ppc_rlwimi(uint8_t ra, uint8_t rs, uint8_t sh,
+                                    uint8_t mb, uint8_t me, bool rc = false) {
+    return (20u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) |
+           ((uint32_t)sh << 11) | ((uint32_t)mb << 6) | ((uint32_t)me << 1) | (rc ? 1u : 0u);
+}
+static inline uint32_t ppc_rlwnm(uint8_t ra, uint8_t rs, uint8_t rb,
+                                   uint8_t mb, uint8_t me, bool rc = false) {
+    return (23u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) |
+           ((uint32_t)rb << 11) | ((uint32_t)mb << 6) | ((uint32_t)me << 1) | (rc ? 1u : 0u);
+}
+static inline uint32_t ppc_srawi(uint8_t ra, uint8_t rs, uint8_t sh, bool rc = false) {
+    return (31u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) |
+           ((uint32_t)sh << 11) | (824u << 1) | (rc ? 1u : 0u);
+}
+static inline uint32_t ppc_cntlzw(uint8_t ra, uint8_t rs, bool rc = false) {
+    return ppc_Xform(31, rs, ra, 0, 26, rc);
+}
+static inline uint32_t ppc_cmp(uint8_t crD, uint8_t ra, uint8_t rb) {
+    return (31u << 26) | ((uint32_t)(crD & 7) << 23) | ((uint32_t)ra << 16) |
+           ((uint32_t)rb << 11) | (0u << 1);
+}
+static inline uint32_t ppc_cmpl(uint8_t crD, uint8_t ra, uint8_t rb) {
+    return (31u << 26) | ((uint32_t)(crD & 7) << 23) | ((uint32_t)ra << 16) |
+           ((uint32_t)rb << 11) | (32u << 1);
+}
+static inline uint32_t ppc_mtspr(uint16_t spr, uint8_t rs) {
+    uint8_t sprLo = spr & 0x1F;
+    uint8_t sprHi = (spr >> 5) & 0x1F;
+    return (31u << 26) | ((uint32_t)rs << 21) | ((uint32_t)sprLo << 16) |
+           ((uint32_t)sprHi << 11) | (467u << 1);
+}
+static inline uint32_t ppc_mfspr(uint8_t rt, uint16_t spr) {
+    uint8_t sprLo = spr & 0x1F;
+    uint8_t sprHi = (spr >> 5) & 0x1F;
+    return (31u << 26) | ((uint32_t)rt << 21) | ((uint32_t)sprLo << 16) |
+           ((uint32_t)sprHi << 11) | (339u << 1);
+}
+static inline uint32_t ppc_mtctr(uint8_t rs) { return ppc_mtspr(9, rs); }
+static inline uint32_t ppc_mfctr(uint8_t rt) { return ppc_mfspr(rt, 9); }
+static inline uint32_t ppc_mtlr(uint8_t rs)  { return ppc_mtspr(8, rs); }
+static inline uint32_t ppc_mflr(uint8_t rt)  { return ppc_mfspr(rt, 8); }
+static inline uint32_t ppc_mtxer(uint8_t rs) { return ppc_mtspr(1, rs); }
+static inline uint32_t ppc_mfxer(uint8_t rt) { return ppc_mfspr(rt, 1); }
+static inline uint32_t ppc_mfcr(uint8_t rt) {
+    return (31u << 26) | ((uint32_t)rt << 21) | (19u << 1);
+}
+static inline uint32_t ppc_mtcrf(uint8_t fxm, uint8_t rs) {
+    return (31u << 26) | ((uint32_t)rs << 21) | ((uint32_t)(fxm & 0xFF) << 12) | (144u << 1);
+}
+static inline uint32_t ppc_isync() { return (19u << 26) | (150u << 1); }
+static inline uint32_t ppc_sync()  { return (31u << 26) | (598u << 1); }
+static inline uint32_t ppc_eieio() { return (31u << 26) | (854u << 1); }
+static inline uint32_t ppc_lwzx(uint8_t rt, uint8_t ra, uint8_t rb) {
+    return ppc_Xform(31, rt, ra, rb, 23);
+}
+static inline uint32_t ppc_lbzx(uint8_t rt, uint8_t ra, uint8_t rb) {
+    return ppc_Xform(31, rt, ra, rb, 87);
+}
+static inline uint32_t ppc_lhzx(uint8_t rt, uint8_t ra, uint8_t rb) {
+    return ppc_Xform(31, rt, ra, rb, 279);
+}
+static inline uint32_t ppc_lhax(uint8_t rt, uint8_t ra, uint8_t rb) {
+    return ppc_Xform(31, rt, ra, rb, 343);
+}
+static inline uint32_t ppc_stwx(uint8_t rs, uint8_t ra, uint8_t rb) {
+    return ppc_Xform(31, rs, ra, rb, 151);
+}
+static inline uint32_t ppc_stbx(uint8_t rs, uint8_t ra, uint8_t rb) {
+    return ppc_Xform(31, rs, ra, rb, 215);
+}
+static inline uint32_t ppc_sthx(uint8_t rs, uint8_t ra, uint8_t rb) {
+    return ppc_Xform(31, rs, ra, rb, 407);
+}
+static inline uint32_t ppc_stwu(uint8_t rs, int16_t d, uint8_t ra) {
+    return (37u << 26) | ((uint32_t)rs << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_lwzu(uint8_t rt, int16_t d, uint8_t ra) {
+    return (33u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+static inline uint32_t ppc_blr() { return ppc_bclr(20, 0); }
+static inline uint32_t ppc_extsb(uint8_t ra, uint8_t rs, bool rc = false) {
+    return ppc_Xform(31, rs, ra, 0, 954, rc);
+}
+static inline uint32_t ppc_extsh(uint8_t ra, uint8_t rs, bool rc = false) {
+    return ppc_Xform(31, rs, ra, 0, 922, rc);
+}
+
+// ============================================================
+// emit_li32: load any 32-bit immediate into a register.
+// Uses addis+ori (zero-extending) to avoid sign-extension bugs.
+// ============================================================
+static int emit_li32(uint32_t* out, uint8_t rt, uint32_t imm) {
+    uint16_t lo = (uint16_t)(imm & 0xFFFF);
+    uint16_t hi = (uint16_t)(imm >> 16);
+
+    if (imm == 0) {
+        out[0] = ppc_addi(rt, 0, 0);
+        return 1;
+    }
+    if (hi == 0) {
+        if (lo < 0x8000u) {
+            out[0] = ppc_addi(rt, 0, (int16_t)lo);
+            return 1;
+        } else {
+            // bit15 set: addi would sign-extend. Use li+ori.
+            out[0] = ppc_addi(rt, 0, 0);
+            out[1] = ppc_ori(rt, rt, lo);
+            return 2;
+        }
+    }
+    if (lo == 0) {
+        out[0] = ppc_addis(rt, 0, (int16_t)hi);
+        return 1;
+    }
+    // General case: addis fills upper 16 bits, ori (zero-extend) fills lower.
+    out[0] = ppc_addis(rt, 0, (int16_t)hi);
+    out[1] = ppc_ori(rt, rt, lo);
+    return 2;
+}
+
+// ============================================================
+// ARM -> PPC register mapping
+//
+// ARM R0-R7  -> PPC r3-r10   (volatile, caller-saved)
+// ARM R8-R14 -> PPC r14-r20  (non-volatile, callee-saved)
+// ARM R15    -> PPC r21       (non-volatile)
+// CPSR       -> PPC r22       (non-volatile)
+// PPC_INTERP -> PPC r23       (non-volatile) — interpreter pointer
+// PPC_CORE   -> PPC r24       (non-volatile) — core pointer
+// PPC_TMP0   -> PPC r25       (non-volatile) — scratch, survives calls
+// PPC_TMP1   -> PPC r26       (non-volatile) — scratch, survives calls
+// PPC_TMP2   -> PPC r11       (volatile)     — local scratch only
+// PPC_TMP3   -> PPC r12       (volatile)     — local scratch only
+// PPC_CALL_TMP -> PPC r29     (non-volatile) — DEDICATED to emit_call
+//
+// Note: r27, r28 are not used to keep room for future expansion.
+// r30, r31 are left free (some ABI conventions reserve r31).
+// ============================================================
+static const uint8_t PPC_ARM_R0  = 3;
+static const uint8_t PPC_ARM_R1  = 4;
+static const uint8_t PPC_ARM_R2  = 5;
+static const uint8_t PPC_ARM_R3  = 6;
+static const uint8_t PPC_ARM_R4  = 7;
+static const uint8_t PPC_ARM_R5  = 8;
+static const uint8_t PPC_ARM_R6  = 9;
+static const uint8_t PPC_ARM_R7  = 10;
+static const uint8_t PPC_ARM_R8  = 14;
+static const uint8_t PPC_ARM_R9  = 15;
+static const uint8_t PPC_ARM_R10 = 16;
+static const uint8_t PPC_ARM_R11 = 17;
+static const uint8_t PPC_ARM_R12 = 18;
+static const uint8_t PPC_ARM_R13 = 19;
+static const uint8_t PPC_ARM_R14 = 20;
+static const uint8_t PPC_ARM_R15 = 21;
+static const uint8_t PPC_CPSR    = 22;
+static const uint8_t PPC_INTERP  = 23;
+static const uint8_t PPC_CORE    = 24;
+static const uint8_t PPC_TMP0    = 25;   // non-volatile scratch
+static const uint8_t PPC_TMP1    = 26;   // non-volatile scratch
+static const uint8_t PPC_TMP2    = 11;   // volatile local scratch
+static const uint8_t PPC_TMP3    = 12;   // volatile local scratch
+// FIX #2: dedicated call scratch — non-volatile, never an ARM reg,
+// saved/restored in our frame.  emit_call ONLY uses this register.
+static const uint8_t PPC_CALL_TMP = 29;
+
+static const uint8_t ARM_TO_PPC[16] = {
+    PPC_ARM_R0,  PPC_ARM_R1,  PPC_ARM_R2,  PPC_ARM_R3,
+    PPC_ARM_R4,  PPC_ARM_R5,  PPC_ARM_R6,  PPC_ARM_R7,
+    PPC_ARM_R8,  PPC_ARM_R9,  PPC_ARM_R10, PPC_ARM_R11,
+    PPC_ARM_R12, PPC_ARM_R13, PPC_ARM_R14, PPC_ARM_R15,
+};
+
+// ============================================================
+// CPSR bit definitions
+// ============================================================
+#define CPSR_N  (1u << 31)
+#define CPSR_Z  (1u << 30)
+#define CPSR_C  (1u << 29)
+#define CPSR_V  (1u << 28)
+#define CPSR_T  (1u << 5)
+#define CPSR_I  (1u << 7)
+#define CPSR_F  (1u << 6)
+#define CPSR_MODE_MASK 0x1Fu
+
+// ============================================================
+// JIT Code Buffer
+// ============================================================
+static const size_t JIT_CODE_SIZE   = 4 * 1024 * 1024;
+static const size_t JIT_MAX_INSTRS  = JIT_CODE_SIZE / 4;
+static const size_t MAX_BLOCK_SIZE  = 256;
+static const size_t MAX_PPC_PER_ARM = 64;
+
+static uint32_t* codeBuffer    = nullptr;
+static size_t    codeBufferPos = 0;
+
+// ============================================================
+// Block cache
+// ============================================================
+struct JitBlock {
+    uint32_t  armPC;
+    uint32_t* ppcCode;
+    uint32_t  ppcWords;
+    uint32_t  armInstrs;
+    bool      thumb;
+    bool      valid;
+};
+
+static const size_t BLOCK_CACHE_SIZE = 8192;
+static JitBlock blockCache[BLOCK_CACHE_SIZE];
+static uint32_t blockCacheGen = 0;
+
+static inline size_t hashPC(uint32_t pc) {
+    return (pc >> 1) & (BLOCK_CACHE_SIZE - 1);
+}
+
+void flushJitCache() {
+    codeBufferPos = 0;
+    for (size_t i = 0; i < BLOCK_CACHE_SIZE; i++)
+        blockCache[i].valid = false;
+    blockCacheGen++;
+}
+
+// ============================================================
+// Code emitter context
+// ============================================================
+struct EmitCtx {
+    uint32_t* base;
+    uint32_t* cur;
+    size_t    capacity;
+
+    bool thumb;
+    bool arm7;
+    uint32_t armPC;
+
+    Interpreter* interp;
+    Core*        core;
+
+    // FIX #6/#7: track whether the block already ends with a blr
+    // so compileBlock does not add a duplicate epilogue.
+    bool hasExplicitReturn;
+
+    void emit(uint32_t word) {
+        if ((size_t)(cur - base) < capacity)
+            *cur++ = word;
+    }
+    size_t size() const { return (size_t)(cur - base); }
+};
+
+// ============================================================
+// Cache flush
+// ============================================================
+static void flushCaches(uint32_t* start, size_t words) {
+    DCFlushRange(start, words * 4);
+    ICInvalidateRange(start, words * 4);
+}
+
+// ============================================================
+// Condition check helpers
+// ============================================================
+static void emit_setupCondFlags(EmitCtx& ctx) {
+    ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_CPSR, 0, 28, 31));
+    ctx.emit(ppc_mtcrf(0x80, PPC_TMP0));
+}
+
+struct CondBranch { uint8_t bo; uint8_t bi; bool valid; };
+
+static CondBranch armCondToPpc(uint8_t cond) {
+    switch (cond) {
+        case 0:  return {12, 2, true};
+        case 1:  return {4,  2, true};
+        case 2:  return {12, 1, true};
+        case 3:  return {4,  1, true};
+        case 4:  return {12, 3, true};
+        case 5:  return {4,  3, true};
+        case 6:  return {12, 0, true};
+        case 7:  return {4,  0, true};
+        case 14: return {20, 0, true};
+        default: return {0,  0, false};
+    }
+}
+
+// ============================================================
+// Struct offsets (computed from Interpreter's public helpers)
+// ============================================================
+static size_t off_registersUsr = 0;
+static size_t off_cpsr         = 0;
+static size_t off_cycles       = 0;
+static size_t off_halted       = 0;
+static size_t off_pipeline     = 0;
+static size_t off_pcData       = 0;
+
+// ============================================================
+// C helpers called from JIT code
+// ============================================================
+extern "C" {
+
+// FIX #6: JitPpc_syncToInterp writes R0-R14 directly and calls
+// interp->setPC() for R15 so the pipeline is properly flushed.
+// Writing raw to *registers[15] without flushing would leave the
+// pipeline in an inconsistent state and cause wrong fetch addresses.
+void JitPpc_syncToInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    // Write R0-R14 through the banked-register pointer array.
+    for (int i = 0; i < 15; i++)
+        *regPtrs[i] = regs[i];
+    // Write CPSR before setPC so the pipeline refill uses the
+    // correct instruction width (ARM vs Thumb).
+    interp->getCpsrRef() = regs[16];
+    // R15: go through setPC to flush the pipeline correctly.
+    interp->setPC(regs[15]);
+}
+
+// JitPpc_syncFromInterp: load R0-R14 + CPSR from the interpreter.
+// R15 is intentionally skipped; compileBlock sets PPC_ARM_R15 to
+// the correct architectural value (pc+8 or pc+4) per instruction.
+void JitPpc_syncFromInterp(Interpreter* interp, uint32_t* regs) {
+    uint32_t** regPtrs = interp->getRegisters();
+    for (int i = 0; i < 15; i++)
+        regs[i] = *regPtrs[i];
+    regs[16] = interp->getCpsrRef();
+    // regs[15] deliberately left undefined here.
+}
+
+int JitPpc_interpFallback(Interpreter* interp) {
+    return interp->jitRunOpcode();
+}
+
+uint32_t JitPpc_memRead32(Core* core, bool arm7, uint32_t addr) {
+    return core->memory.read<uint32_t>(arm7, addr);
+}
+uint16_t JitPpc_memRead16(Core* core, bool arm7, uint32_t addr) {
+    return core->memory.read<uint16_t>(arm7, addr);
+}
+uint8_t JitPpc_memRead8(Core* core, bool arm7, uint32_t addr) {
+    return core->memory.read<uint8_t>(arm7, addr);
+}
+void JitPpc_memWrite32(Core* core, bool arm7, uint32_t addr, uint32_t val) {
+    core->memory.write<uint32_t>(arm7, addr, val);
+}
+void JitPpc_memWrite16(Core* core, bool arm7, uint32_t addr, uint16_t val) {
+    core->memory.write<uint16_t>(arm7, addr, val);
+}
+void JitPpc_memWrite8(Core* core, bool arm7, uint32_t addr, uint8_t val) {
+    core->memory.write<uint8_t>(arm7, addr, val);
+}
+
+void JitPpc_addCycles(Interpreter* interp, uint32_t cycles) {
+    uint32_t* cyc = (uint32_t*)((uint8_t*)interp + off_cycles);
+    *cyc += cycles;
+}
+
+} // extern "C"
+
+// ============================================================
+// FIX #2: emit_call uses PPC_CALL_TMP (r29) exclusively.
+//
+// r29 is non-volatile and saved in our frame, so its value
+// survives across calls to this very helper.  We never use r29
+// as an ARM register or a general scratch, ensuring there is no
+// aliasing with PPC_TMP3 (r12) which was the original bug.
+//
+// BCTRL sets LR to the instruction after itself (the return
+// address) and branches to CTR.  The callee then does blr to
+// return here.  Our frame's LR slot at r1+8 is untouched by the
+// callee (callees write their own LR to *their* r1+4 per ABI).
+// ============================================================
+static void emit_call(EmitCtx& ctx, void* fnAddr) {
+    uint32_t addr = (uint32_t)(uintptr_t)fnAddr;
+    int n = emit_li32(ctx.cur, PPC_CALL_TMP, addr);
+    ctx.cur += n;
+    ctx.emit(ppc_mtctr(PPC_CALL_TMP));
+    ctx.emit(ppc_bctr(true));   // BCTRL
+}
+
+// ============================================================
+// FIX #3: Prologue saves r14..r29 (16 registers).
+// FIX #8: PPC_ARM_R15 is set to the block's starting armPC here;
+//         the compile loop will refresh it per instruction.
+// ============================================================
+static void emit_prologue(EmitCtx& ctx, Interpreter* interp, Core* core) {
+    // Allocate frame; stwu writes back-chain to 0(new_r1).
+    ctx.emit(ppc_stwu(1, -(int16_t)FRAME_SIZE, 1));
+
+    // Save LR into our frame slot (not at r1+4 which is the ABI
+    // "callee LR save area" written by our callees, not by us).
+    ctx.emit(ppc_mflr(0));
+    ctx.emit(ppc_stw(0, FRAME_LR, 1));
+
+    // Save non-volatile regs r14..r29 (includes PPC_CALL_TMP=r29).
+    for (int r = 14; r <= 29; r++)
+        ctx.emit(ppc_stw(r, FRAME_R14 + (r - 14) * 4, 1));
+
+    // Load interpreter and core pointers.
+    int n = emit_li32(ctx.cur, PPC_INTERP, (uint32_t)(uintptr_t)interp);
+    ctx.cur += n;
+    n = emit_li32(ctx.cur, PPC_CORE, (uint32_t)(uintptr_t)core);
+    ctx.cur += n;
+
+    // Set R15 to block start PC.  The compile loop overwrites this
+    // per instruction with pc + (thumb ? 4 : 8).
+    n = emit_li32(ctx.cur, PPC_ARM_R15, ctx.armPC);
+    ctx.cur += n;
+}
+
+// ============================================================
+// FIX #3: Epilogue restores r14..r29 to match prologue.
+// ============================================================
+static void emit_epilogue(EmitCtx& ctx) {
+    // Restore non-volatile regs r14..r29.
+    for (int r = 14; r <= 29; r++)
+        ctx.emit(ppc_lwz(r, FRAME_R14 + (r - 14) * 4, 1));
+
+    // Restore LR and deallocate frame.
+    ctx.emit(ppc_lwz(0, FRAME_LR, 1));
+    ctx.emit(ppc_mtlr(0));
+    ctx.emit(ppc_addi(1, 1, (int16_t)FRAME_SIZE));
+    ctx.emit(ppc_blr());
+}
+
+// ============================================================
+// Sync helpers emitted inline
+// ============================================================
+
+// Spill ARM R0-R15 and CPSR to the frame sync area, then call
+// JitPpc_syncToInterp to write them through the register pointer
+// array (and flush the pipeline for R15 via setPC).
+static void emit_syncToInterp(EmitCtx& ctx) {
+    for (int i = 0; i < 16; i++)
+        ctx.emit(ppc_stw(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
+    ctx.emit(ppc_stw(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
+
+    ctx.emit(ppc_mr(3, PPC_INTERP));
+    ctx.emit(ppc_addi(4, 1, (int16_t)FRAME_REGSYNC));
+    emit_call(ctx, (void*)JitPpc_syncToInterp);
+}
+
+// Call JitPpc_syncFromInterp then reload R0-R14 and CPSR from
+// the sync area.  R15 is not reloaded (set per instruction).
+static void emit_syncFromInterp(EmitCtx& ctx) {
+    ctx.emit(ppc_mr(3, PPC_INTERP));
+    ctx.emit(ppc_addi(4, 1, (int16_t)FRAME_REGSYNC));
+    emit_call(ctx, (void*)JitPpc_syncFromInterp);
+
+    for (int i = 0; i < 15; i++)
+        ctx.emit(ppc_lwz(ARM_TO_PPC[i], FRAME_REGSYNC + i * 4, 1));
+    ctx.emit(ppc_lwz(PPC_CPSR, FRAME_REGSYNC + 16 * 4, 1));
+}
+
+// ============================================================
+// CPSR flag update helpers
+// ============================================================
+static void emit_updateNZ(EmitCtx& ctx, uint8_t result) {
+    ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 2, 31));
+    ctx.emit(ppc_rlwimi(PPC_CPSR, result, 0, 0, 0));
+    ctx.emit(ppc_cmpi(0, result, 0));
+    ctx.emit(ppc_mfcr(PPC_TMP0));
+    ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 1, 30, 30));
+    ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));
+}
+
+static void emit_updateC_fromXER(EmitCtx& ctx) {
+    ctx.emit(ppc_mfxer(PPC_TMP0));
+    ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 0, 2, 2));
+    ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 3, 1));
+    ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));
+}
+
+static void emit_updateV_fromXER(EmitCtx& ctx) {
+    ctx.emit(ppc_mfxer(PPC_TMP0));
+    ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 30, 29, 29));
+    ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 4, 2));
+    ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));
+}
+
+static void emit_updateNZCV_add(EmitCtx& ctx, uint8_t result) {
+    emit_updateNZ(ctx, result);
+    emit_updateC_fromXER(ctx);
+    emit_updateV_fromXER(ctx);
+}
+
+static void emit_updateNZCV_sub(EmitCtx& ctx, uint8_t result) {
+    emit_updateNZ(ctx, result);
+    emit_updateC_fromXER(ctx);
+    emit_updateV_fromXER(ctx);
+}
+
+static void emit_updateC_fromTMP1(EmitCtx& ctx) {
+    ctx.emit(ppc_rlwinm(PPC_TMP2, PPC_TMP1, 29, 29, 29));
+    ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 3, 1));
+    ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP2));
+}
+
+// ============================================================
+// ARM Immediate operand decoder
+// ============================================================
+static uint32_t armImm(uint32_t opcode) {
+    uint32_t imm = opcode & 0xFF;
+    uint32_t rot = ((opcode >> 8) & 0xF) * 2;
+    if (rot == 0) return imm;
+    return (imm >> rot) | (imm << (32 - rot));
+}
+
+// ============================================================
+// Shift / rotate helpers
+// ============================================================
+static void emit_lsl_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
+                          bool setCarry = false) {
+    if (imm == 0) {
+        if (dst != src) ctx.emit(ppc_mr(dst, src));
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 3, 31, 31));
+    } else if (imm < 32) {
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, src, imm, 31, 31));
+        ctx.emit(ppc_rlwinm(dst, src, imm, 0, 31 - imm));
+    } else if (imm == 32) {
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, src, 0, 31, 31));
+        ctx.emit(ppc_addi(dst, 0, 0));
+    } else {
+        if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
+        ctx.emit(ppc_addi(dst, 0, 0));
+    }
+}
+
+static void emit_lsr_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
+                          bool setCarry = false) {
+    if (imm == 0 || imm == 32) {
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, src, 1, 31, 31));
+        ctx.emit(ppc_addi(dst, 0, 0));
+    } else if (imm < 32) {
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, src, 33 - imm, 31, 31));
+        ctx.emit(ppc_rlwinm(dst, src, 32 - imm, imm, 31));
+    } else {
+        if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
+        ctx.emit(ppc_addi(dst, 0, 0));
+    }
+}
+
+static void emit_asr_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
+                          bool setCarry = false) {
+    if (imm == 0 || imm >= 32) {
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, src, 1, 31, 31));
+        ctx.emit(ppc_srawi(dst, src, 31));
+    } else {
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, src, 33 - imm, 31, 31));
+        ctx.emit(ppc_srawi(dst, src, imm));
+    }
+}
+
+static void emit_ror_imm(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t imm,
+                          bool setCarry = false) {
+    if (imm == 0) {
+        // RRX: shift right through carry
+        ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 3, 31, 31));
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP0, src, 0, 31, 31));
+        ctx.emit(ppc_rlwinm(dst, src, 31, 1, 31));
+        ctx.emit(ppc_rlwimi(dst, PPC_TMP1, 31, 0, 0));
+        if (setCarry)
+            ctx.emit(ppc_mr(PPC_TMP1, PPC_TMP0));
+    } else {
+        imm &= 31;
+        if (imm == 0) imm = 32;
+        if (setCarry)
+            ctx.emit(ppc_rlwinm(PPC_TMP1, src, 33 - imm, 31, 31));
+        ctx.emit(ppc_rlwinm(dst, src, 32 - imm, 0, 31));
+    }
+}
+
+static void emit_lsl_reg(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t shiftReg,
+                          bool setCarry = false) {
+    if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
+    ctx.emit(ppc_slw(dst, src, shiftReg));
+}
+
+static void emit_lsr_reg(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t shiftReg,
+                          bool setCarry = false) {
+    if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
+    ctx.emit(ppc_srw(dst, src, shiftReg));
+}
+
+static void emit_asr_reg(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t shiftReg,
+                          bool setCarry = false) {
+    if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
+    ctx.emit(ppc_sraw(dst, src, shiftReg));
+}
+
+static void emit_ror_reg(EmitCtx& ctx, uint8_t dst, uint8_t src, uint8_t shiftReg,
+                          bool setCarry = false) {
+    if (setCarry) ctx.emit(ppc_addi(PPC_TMP1, 0, 0));
+    ctx.emit(ppc_subfic(PPC_TMP0, shiftReg, 32));
+    ctx.emit(ppc_rlwnm(dst, src, PPC_TMP0, 0, 31));
+}
+
+static bool emit_shifterOp(EmitCtx& ctx, uint32_t opcode, uint8_t dstReg,
+                            bool setCarry, bool& outCarryValid) {
+    outCarryValid = setCarry;
+    bool isImm = (opcode >> 25) & 1;
+
+    if (isImm) {
+        uint32_t val = armImm(opcode);
+        int n = emit_li32(ctx.cur, dstReg, val);
+        ctx.cur += n;
+        if (setCarry) {
+            uint32_t rot = ((opcode >> 8) & 0xF) * 2;
+            if (rot != 0) {
+                int n2 = emit_li32(ctx.cur, PPC_TMP1, val >> 31);
+                ctx.cur += n2;
+            } else {
+                outCarryValid = false;
+            }
+        }
+        return true;
+    }
+
+    uint8_t rm         = opcode & 0xF;
+    uint8_t ppcRm      = ARM_TO_PPC[rm];
+    bool    isRegShift = (opcode >> 4) & 1;
+    uint8_t shiftType  = (opcode >> 5) & 3;
+
+    if (!isRegShift) {
+        uint8_t shiftAmt = (opcode >> 7) & 0x1F;
+        switch (shiftType) {
+            case 0: emit_lsl_imm(ctx, dstReg, ppcRm, shiftAmt, setCarry);                 break;
+            case 1: emit_lsr_imm(ctx, dstReg, ppcRm, shiftAmt ? shiftAmt : 32, setCarry); break;
+            case 2: emit_asr_imm(ctx, dstReg, ppcRm, shiftAmt ? shiftAmt : 32, setCarry); break;
+            case 3: emit_ror_imm(ctx, dstReg, ppcRm, shiftAmt, setCarry);                 break;
+        }
+    } else {
+        uint8_t rs    = (opcode >> 8) & 0xF;
+        uint8_t ppcRs = ARM_TO_PPC[rs];
+        ctx.emit(ppc_rlwinm(PPC_TMP2, ppcRs, 0, 24, 31));
+        ctx.emit(ppc_mr(PPC_TMP3, ppcRm));
+        switch (shiftType) {
+            case 0: emit_lsl_reg(ctx, dstReg, PPC_TMP3, PPC_TMP2, setCarry); break;
+            case 1: emit_lsr_reg(ctx, dstReg, PPC_TMP3, PPC_TMP2, setCarry); break;
+            case 2: emit_asr_reg(ctx, dstReg, PPC_TMP3, PPC_TMP2, setCarry); break;
+            case 3: emit_ror_reg(ctx, dstReg, PPC_TMP3, PPC_TMP2, setCarry); break;
+        }
+        outCarryValid = false;
+    }
+    return true;
+}
+
+// ============================================================
+// Data processing
+// ============================================================
+enum ArmDpOp {
+    DP_AND=0, DP_EOR=1, DP_SUB=2, DP_RSB=3,
+    DP_ADD=4, DP_ADC=5, DP_SBC=6, DP_RSC=7,
+    DP_TST=8, DP_TEQ=9, DP_CMP=10, DP_CMN=11,
+    DP_ORR=12, DP_MOV=13, DP_BIC=14, DP_MVN=15
+};
+
+// FIX #5: Patch a BC instruction's BD field.
+// BC format bits[15:2] = 14-bit signed word offset.
+// Mask clears BD; (off & 0xFFFC) fills it.
+static void patchBranchOffset(EmitCtx& ctx, size_t branchIdx, size_t targetIdx) {
+    int32_t off = (int32_t)((targetIdx - branchIdx) * 4);
+    ctx.base[branchIdx] = (ctx.base[branchIdx] & 0xFFFF0003u) | (uint32_t)(off & 0xFFFC);
+}
+
+static bool emit_dataProc(EmitCtx& ctx, uint32_t opcode) {
+    uint8_t cond  = (opcode >> 28) & 0xF;
+    uint8_t dpOp  = (opcode >> 21) & 0xF;
+    bool    setCC = (opcode >> 20) & 1;
+    uint8_t rn    = (opcode >> 16) & 0xF;
+    uint8_t rd    = (opcode >> 12) & 0xF;
+
+    if (rd == 15 && setCC) return false;
+    if (rd == 15)          return false;
+
+    uint8_t ppcRd = ARM_TO_PPC[rd];
+    uint8_t ppcRn = ARM_TO_PPC[rn];
+
+    size_t condBranchIdx = 0;
+    bool   hasCondBranch = false;
+    if (cond != 14) {
+        emit_setupCondFlags(ctx);
+        CondBranch cb = armCondToPpc(cond);
+        if (!cb.valid) return false;
+        if (cb.bo != 20) {
+            condBranchIdx = ctx.size();
+            hasCondBranch = true;
+            uint8_t skipBO = (cb.bo == 12) ? 4 : 12;
+            ctx.emit(ppc_bc(skipBO, cb.bi, 0));
+        }
+    }
+
+    bool needCarry      = (dpOp == DP_ADC || dpOp == DP_SBC || dpOp == DP_RSC);
+    bool needShiftCarry = setCC && (dpOp == DP_AND || dpOp == DP_EOR || dpOp == DP_TST ||
+                                    dpOp == DP_TEQ || dpOp == DP_ORR || dpOp == DP_MOV ||
+                                    dpOp == DP_BIC || dpOp == DP_MVN);
+    bool carryValid = false;
+    if (!emit_shifterOp(ctx, opcode, PPC_TMP0, needShiftCarry, carryValid))
+        return false;
+
+    if (needCarry) {
+        ctx.emit(ppc_rlwinm(PPC_TMP1, PPC_CPSR, 0, 2, 2));
+        ctx.emit(ppc_mtxer(PPC_TMP1));
+    }
+
+    bool testOnly  = (dpOp == DP_TST || dpOp == DP_TEQ ||
+                      dpOp == DP_CMP || dpOp == DP_CMN);
+    uint8_t resReg = testOnly ? PPC_TMP1 : ppcRd;
+
+    switch ((ArmDpOp)dpOp) {
+        case DP_AND: case DP_TST:
+            ctx.emit(ppc_and(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_EOR: case DP_TEQ:
+            ctx.emit(ppc_xor(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_SUB: case DP_CMP:
+            ctx.emit(ppc_subfc(resReg, PPC_TMP0, ppcRn)); break;
+        case DP_RSB:
+            ctx.emit(ppc_subfc(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_ADD: case DP_CMN:
+            ctx.emit(ppc_addc(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_ADC:
+            ctx.emit(ppc_adde(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_SBC:
+            ctx.emit(ppc_subfe(resReg, PPC_TMP0, ppcRn)); break;
+        case DP_RSC:
+            ctx.emit(ppc_subfe(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_ORR:
+            ctx.emit(ppc_or(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_MOV:
+            if (resReg != PPC_TMP0) ctx.emit(ppc_mr(resReg, PPC_TMP0)); break;
+        case DP_BIC:
+            ctx.emit(ppc_andc(resReg, ppcRn, PPC_TMP0)); break;
+        case DP_MVN:
+            ctx.emit(ppc_nor(resReg, PPC_TMP0, PPC_TMP0)); break;
+    }
+
+    if (setCC) {
+        switch ((ArmDpOp)dpOp) {
+            case DP_ADD: case DP_CMN: case DP_ADC:
+                emit_updateNZCV_add(ctx, resReg); break;
+            case DP_SUB: case DP_CMP: case DP_RSB:
+            case DP_SBC: case DP_RSC:
+                emit_updateNZCV_sub(ctx, resReg); break;
+            default:
+                emit_updateNZ(ctx, resReg);
+                if (carryValid) emit_updateC_fromTMP1(ctx);
+                break;
+        }
+    }
+
+    if (hasCondBranch)
+        patchBranchOffset(ctx, condBranchIdx, ctx.size());
+
+    return true;
+}
+
+// ============================================================
+// FIX #4 + FIX #6: Branch instructions.
+//
+// Every control-flow path that changes PC must end with
+// emit_syncToInterp + emit_epilogue so the block returns
+// immediately with the correct state.  Conditional branches
+// emit explicit epilogues for BOTH the taken and not-taken
+// paths so there is no fall-through to a stale PC value.
+// hasExplicitReturn is set so compileBlock skips the trailing
+// emit_syncToInterp/emit_epilogue it would otherwise add.
+// ============================================================
+static bool emit_branch(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
+    uint8_t cond = (opcode >> 28) & 0xF;
+
+    // ---- BX Rm ----
+    if ((opcode & 0x0FFFFFF0) == 0x012FFF10) {
+        uint8_t rm = opcode & 0xF;
+        if (rm == 15) return false;
+        uint8_t ppcRm = ARM_TO_PPC[rm];
+
+        size_t condBranchIdx = 0;
+        bool   hasCondBranch = false;
+        if (cond != 14) {
+            emit_setupCondFlags(ctx);
+            CondBranch cb = armCondToPpc(cond);
+            if (!cb.valid) return false;
+            if (cb.bo != 20) {
+                condBranchIdx = ctx.size();
+                hasCondBranch = true;
+                // Branch past the taken path if condition NOT met.
+                ctx.emit(ppc_bc((cb.bo == 12) ? 4 : 12, cb.bi, 0));
+            }
+        }
+
+        // Taken path: update CPSR T bit and PC from Rm.
+        ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 27, 25));   // clear T
+        ctx.emit(ppc_rlwinm(PPC_TMP0, ppcRm, 5, 26, 26));       // T = Rm[0] << 26? 
+        // Correct: T is bit5 of CPSR; Rm[0] tells us Thumb mode.
+        // Rm[0] -> CPSR bit5: shift Rm right by 0, mask bit0, shift left 5.
+        // Let's redo: extract bit0 of Rm into bit5 of CPSR.
+        ctx.emit(ppc_rlwinm(PPC_TMP0, ppcRm, 0, 31, 31));       // TMP0 = Rm[0]
+        ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 5, 26, 26));    // TMP0 = Rm[0] << 5, in CPSR pos
+        ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));          // set T bit
+        ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRm, 0, 0, 30));      // PC = Rm & ~1
+        emit_syncToInterp(ctx);
+        emit_epilogue(ctx);   // FIX #4: return immediately
+
+        if (hasCondBranch) {
+            // Not-taken path: patch cond branch to here, then sync+return.
+            patchBranchOffset(ctx, condBranchIdx, ctx.size());
+            // PC stays unchanged; R15 already has the current pc+8.
+            // We must still sync so the interpreter's registers are
+            // consistent with the JIT's non-volatile state.
+            emit_syncToInterp(ctx);
+            emit_epilogue(ctx);
+        }
+
+        ctx.hasExplicitReturn = true;
+        return true;
+    }
+
+    // ---- B / BL ----
+    if ((opcode & 0x0E000000) == 0x0A000000) {
+        bool    isLink = (opcode >> 24) & 1;
+        int32_t offset = (int32_t)(opcode << 8) >> 6;
+        uint32_t target = pc + 8 + offset;
+
+        size_t condBranchIdx = 0;
+        bool   hasCondBranch = false;
+        if (cond != 14) {
+            emit_setupCondFlags(ctx);
+            CondBranch cb = armCondToPpc(cond);
+            if (!cb.valid) return false;
+            if (cb.bo != 20) {
+                condBranchIdx = ctx.size();
+                hasCondBranch = true;
+                ctx.emit(ppc_bc((cb.bo == 12) ? 4 : 12, cb.bi, 0));
+            }
+        }
+
+        // Taken path.
+        if (isLink) {
+            int n = emit_li32(ctx.cur, PPC_ARM_R14, pc + 4);
+            ctx.cur += n;
+        }
+        {
+            int n = emit_li32(ctx.cur, PPC_ARM_R15, target);
+            ctx.cur += n;
+        }
+        emit_syncToInterp(ctx);
+        emit_epilogue(ctx);   // FIX #4: return immediately after taken branch
+
+        if (hasCondBranch) {
+            // Not-taken path: patch cond branch to here.
+            patchBranchOffset(ctx, condBranchIdx, ctx.size());
+            // R15 for not-taken = pc + 4 (next sequential instruction).
+            int n = emit_li32(ctx.cur, PPC_ARM_R15, pc + 4);
+            ctx.cur += n;
+            emit_syncToInterp(ctx);
+            emit_epilogue(ctx);   // FIX #4
+        }
+
+        ctx.hasExplicitReturn = true;
+        return true;
+    }
+
+    return false;
+}
+
+// ============================================================
+// Load/Store
+// ============================================================
+static bool emit_loadStore(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
+    uint8_t cond    = (opcode >> 28) & 0xF;
+    bool    isLoad  = (opcode >> 20) & 1;
+    bool    isByte  = (opcode >> 22) & 1;
+    bool    isUp    = (opcode >> 23) & 1;
+    bool    preIdx  = (opcode >> 24) & 1;
+    bool    wback   = (opcode >> 21) & 1;
+    bool    immOff  = !((opcode >> 25) & 1);
+    uint8_t rn      = (opcode >> 16) & 0xF;
+    uint8_t rd      = (opcode >> 12) & 0xF;
+
+    if (rd == 15 || rn == 15) return false;
+
+    uint8_t ppcRn = ARM_TO_PPC[rn];
+    uint8_t ppcRd = ARM_TO_PPC[rd];
+
+    size_t condBranchIdx = 0;
+    bool   hasCondBranch = false;
+    if (cond != 14) {
+        emit_setupCondFlags(ctx);
+        CondBranch cb = armCondToPpc(cond);
+        if (!cb.valid) return false;
+        if (cb.bo != 20) {
+            condBranchIdx = ctx.size();
+            hasCondBranch = true;
+            ctx.emit(ppc_bc((cb.bo == 12) ? 4 : 12, cb.bi, 0));
+        }
+    }
+
+    // Compute offset into PPC_TMP0.
+    if (immOff) {
+        uint32_t offset = opcode & 0xFFF;
+        int n = emit_li32(ctx.cur, PPC_TMP0, offset);
+        ctx.cur += n;
+    } else {
+        uint8_t rm    = opcode & 0xF;
+        uint8_t ppcRm = ARM_TO_PPC[rm];
+        ctx.emit(ppc_mr(PPC_TMP0, ppcRm));
+    }
+
+    // Effective address into PPC_TMP1.
+    if (preIdx) {
+        if (isUp)
+            ctx.emit(ppc_add(PPC_TMP1, ppcRn, PPC_TMP0));
+        else
+            ctx.emit(ppc_subf(PPC_TMP1, PPC_TMP0, ppcRn));
+    } else {
+        ctx.emit(ppc_mr(PPC_TMP1, ppcRn));
+    }
+
+    // Save volatile ARM regs (r3-r10) around the C call.
+    // These are ARM R0-R7 mapped to PPC r3-r10.
+    for (int i = 0; i < 8; i++)
+        ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));
+
+    ctx.emit(ppc_mr(3, PPC_CORE));
+    ctx.emit(ppc_addi(4, 0, ctx.arm7 ? 1 : 0));
+    ctx.emit(ppc_mr(5, PPC_TMP1));
+
+    if (!isLoad)
+        ctx.emit(ppc_mr(6, ppcRd));
+
+    void* memFn;
+    if (isLoad)
+        memFn = isByte ? (void*)JitPpc_memRead8 : (void*)JitPpc_memRead32;
+    else
+        memFn = isByte ? (void*)JitPpc_memWrite8 : (void*)JitPpc_memWrite32;
+
+    emit_call(ctx, memFn);
+
+    // FIX #7: save load result into non-volatile PPC_TMP0 (r25)
+    // BEFORE restoring volatile regs so r3 is not clobbered first.
+    if (isLoad)
+        ctx.emit(ppc_mr(PPC_TMP0, 3));
+
+    // Restore volatile ARM regs.
+    for (int i = 0; i < 8; i++)
+        ctx.emit(ppc_lwz(3 + i, FRAME_REGSYNC + i * 4, 1));
+
+    // Copy result from non-volatile holding reg to destination.
+    if (isLoad)
+        ctx.emit(ppc_mr(ppcRd, PPC_TMP0));
+
+    // Write-back.
+    if (!preIdx) {
+        if (isUp)
+            ctx.emit(ppc_add(ppcRn, ppcRn, PPC_TMP0));
+        else
+            ctx.emit(ppc_subf(ppcRn, PPC_TMP0, ppcRn));
+    } else if (wback && rn != rd) {
+        ctx.emit(ppc_mr(ppcRn, PPC_TMP1));
+    }
+
+    if (hasCondBranch)
+        patchBranchOffset(ctx, condBranchIdx, ctx.size());
+
+    return true;
+}
+
+// ============================================================
+// Multiply
+// ============================================================
+static bool emit_multiply(EmitCtx& ctx, uint32_t opcode) {
+    bool    setCC = (opcode >> 20) & 1;
+    uint8_t rd    = (opcode >> 16) & 0xF;
+    uint8_t rn    = (opcode >> 12) & 0xF;
+    uint8_t rs    = (opcode >> 8)  & 0xF;
+    uint8_t rm    = (opcode >> 0)  & 0xF;
+    bool    accum = (opcode >> 21) & 1;
+    bool    isLong= (opcode >> 23) & 1;
+
+    if (rd == 15 || rm == 15 || rs == 15) return false;
+    if (isLong) return false;
+
+    uint8_t ppcRd = ARM_TO_PPC[rd];
+    uint8_t ppcRn = ARM_TO_PPC[rn];
+    uint8_t ppcRs = ARM_TO_PPC[rs];
+    uint8_t ppcRm = ARM_TO_PPC[rm];
+
+    if (accum) {
+        ctx.emit(ppc_mullw(PPC_TMP0, ppcRm, ppcRs));
+        ctx.emit(ppc_add(ppcRd, PPC_TMP0, ppcRn));
+    } else {
+        ctx.emit(ppc_mullw(ppcRd, ppcRm, ppcRs));
+    }
+
+    if (setCC)
+        emit_updateNZ(ctx, ppcRd);
+
+    return true;
+}
+
+// ============================================================
+// FIX #5: Interpreter fallback ends the block immediately.
+//
+// When we fall back to the interpreter for one instruction it
+// may execute a branch, SWI, exception, or any side-effecting
+// operation.  We cannot safely continue emitting sequential
+// code after a fallback, so we sync, epilogue, and set
+// hasExplicitReturn.  The next runJitNds call will re-dispatch
+// from the interpreter's updated PC.
+// ============================================================
+static void emit_interpFallback(EmitCtx& ctx) {
+    emit_syncToInterp(ctx);
+    ctx.emit(ppc_mr(3, PPC_INTERP));
+    emit_call(ctx, (void*)JitPpc_interpFallback);
+    // After the fallback the interpreter has executed one instruction
+    // and updated its internal PC.  We must re-sync from the
+    // interpreter before returning so we don't clobber its state.
+    emit_syncFromInterp(ctx);
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);
+    ctx.hasExplicitReturn = true;
+}
+
+// ============================================================
+// Thumb emitters
+// ============================================================
+static bool emit_thumb_lslImm(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t rd  = (opcode >> 0) & 7;
+    uint8_t rs  = (opcode >> 3) & 7;
+    uint8_t imm = (opcode >> 6) & 0x1F;
+    emit_lsl_imm(ctx, ARM_TO_PPC[rd], ARM_TO_PPC[rs], imm, true);
+    emit_updateNZ(ctx, ARM_TO_PPC[rd]);
+    emit_updateC_fromTMP1(ctx);
+    return true;
+}
+
+static bool emit_thumb_lsrImm(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t rd  = (opcode >> 0) & 7;
+    uint8_t rs  = (opcode >> 3) & 7;
+    uint8_t imm = (opcode >> 6) & 0x1F;
+    emit_lsr_imm(ctx, ARM_TO_PPC[rd], ARM_TO_PPC[rs], imm ? imm : 32, true);
+    emit_updateNZ(ctx, ARM_TO_PPC[rd]);
+    emit_updateC_fromTMP1(ctx);
+    return true;
+}
+
+static bool emit_thumb_asrImm(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t rd  = (opcode >> 0) & 7;
+    uint8_t rs  = (opcode >> 3) & 7;
+    uint8_t imm = (opcode >> 6) & 0x1F;
+    emit_asr_imm(ctx, ARM_TO_PPC[rd], ARM_TO_PPC[rs], imm ? imm : 32, true);
+    emit_updateNZ(ctx, ARM_TO_PPC[rd]);
+    emit_updateC_fromTMP1(ctx);
+    return true;
+}
+
+static bool emit_thumb_addSubReg(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t rd  = (opcode >> 0) & 7;
+    uint8_t rs  = (opcode >> 3) & 7;
+    bool    sub = (opcode >> 9) & 1;
+    bool    imm = (opcode >> 10) & 1;
+    uint8_t ppcRd = ARM_TO_PPC[rd];
+    uint8_t ppcRs = ARM_TO_PPC[rs];
+
+    if (imm) {
+        uint32_t immVal = (opcode >> 6) & 7;
+        int n = emit_li32(ctx.cur, PPC_TMP0, immVal);
+        ctx.cur += n;
+    } else {
+        uint8_t rn = (opcode >> 6) & 7;
+        ctx.emit(ppc_mr(PPC_TMP0, ARM_TO_PPC[rn]));
+    }
+
+    if (sub) {
+        ctx.emit(ppc_subfc(ppcRd, PPC_TMP0, ppcRs));
+        emit_updateNZCV_sub(ctx, ppcRd);
+    } else {
+        ctx.emit(ppc_addc(ppcRd, ppcRs, PPC_TMP0));
+        emit_updateNZCV_add(ctx, ppcRd);
+    }
+    return true;
+}
+
+static bool emit_thumb_movImm(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t rd = (opcode >> 8) & 7;
+    uint32_t imm = opcode & 0xFF;
+    int n = emit_li32(ctx.cur, ARM_TO_PPC[rd], imm);
+    ctx.cur += n;
+    emit_updateNZ(ctx, ARM_TO_PPC[rd]);
+    return true;
+}
+
+static bool emit_thumb_cmpImm(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t rs   = (opcode >> 8) & 7;
+    uint32_t imm = opcode & 0xFF;
+    int n = emit_li32(ctx.cur, PPC_TMP0, imm);
+    ctx.cur += n;
+    ctx.emit(ppc_subfc(PPC_TMP1, PPC_TMP0, ARM_TO_PPC[rs]));
+    emit_updateNZCV_sub(ctx, PPC_TMP1);
+    return true;
+}
+
+static bool emit_thumb_addImm8(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t  rd  = (opcode >> 8) & 7;
+    uint32_t imm = opcode & 0xFF;
+    int n = emit_li32(ctx.cur, PPC_TMP0, imm);
+    ctx.cur += n;
+    ctx.emit(ppc_addc(ARM_TO_PPC[rd], ARM_TO_PPC[rd], PPC_TMP0));
+    emit_updateNZCV_add(ctx, ARM_TO_PPC[rd]);
+    return true;
+}
+
+static bool emit_thumb_subImm8(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t  rd  = (opcode >> 8) & 7;
+    uint32_t imm = opcode & 0xFF;
+    int n = emit_li32(ctx.cur, PPC_TMP0, imm);
+    ctx.cur += n;
+    ctx.emit(ppc_subfc(ARM_TO_PPC[rd], PPC_TMP0, ARM_TO_PPC[rd]));
+    emit_updateNZCV_sub(ctx, ARM_TO_PPC[rd]);
+    return true;
+}
+
+static bool emit_thumb_aluOp(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t rd    = (opcode >> 0) & 7;
+    uint8_t rs    = (opcode >> 3) & 7;
+    uint8_t op    = (opcode >> 6) & 0xF;
+    uint8_t ppcRd = ARM_TO_PPC[rd];
+    uint8_t ppcRs = ARM_TO_PPC[rs];
+
+    switch (op) {
+        case 0:  ctx.emit(ppc_and(ppcRd, ppcRd, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
+        case 1:  ctx.emit(ppc_xor(ppcRd, ppcRd, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
+        case 2:  ctx.emit(ppc_slw(ppcRd, ppcRd, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
+        case 3:  ctx.emit(ppc_srw(ppcRd, ppcRd, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
+        case 4:  ctx.emit(ppc_sraw(ppcRd, ppcRd, ppcRs));  emit_updateNZ(ctx, ppcRd); break;
+        case 5: {
+            ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_CPSR, 0, 2, 2));
+            ctx.emit(ppc_mtxer(PPC_TMP0));
+            ctx.emit(ppc_adde(ppcRd, ppcRd, ppcRs));
+            emit_updateNZCV_add(ctx, ppcRd);
+            break;
+        }
+        case 6: {
+            ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_CPSR, 0, 2, 2));
+            ctx.emit(ppc_mtxer(PPC_TMP0));
+            ctx.emit(ppc_subfe(ppcRd, ppcRs, ppcRd));
+            emit_updateNZCV_sub(ctx, ppcRd);
+            break;
+        }
+        case 7:
+            emit_ror_reg(ctx, ppcRd, ppcRd, ppcRs, true);
+            emit_updateNZ(ctx, ppcRd);
+            break;
+        case 8: {
+            ctx.emit(ppc_and(PPC_TMP0, ppcRd, ppcRs));
+            emit_updateNZ(ctx, PPC_TMP0);
+            break;
+        }
+        case 9: {
+            ctx.emit(ppc_addi(PPC_TMP0, 0, 0));
+            ctx.emit(ppc_subfc(ppcRd, ppcRd, PPC_TMP0));
+            emit_updateNZCV_sub(ctx, ppcRd);
+            break;
+        }
+        case 10: {
+            ctx.emit(ppc_subfc(PPC_TMP0, ppcRs, ppcRd));
+            emit_updateNZCV_sub(ctx, PPC_TMP0);
+            break;
+        }
+        case 11: {
+            ctx.emit(ppc_addc(PPC_TMP0, ppcRd, ppcRs));
+            emit_updateNZCV_add(ctx, PPC_TMP0);
+            break;
+        }
+        case 12: ctx.emit(ppc_or(ppcRd, ppcRd, ppcRs));     emit_updateNZ(ctx, ppcRd); break;
+        case 13: ctx.emit(ppc_mullw(ppcRd, ppcRd, ppcRs));   emit_updateNZ(ctx, ppcRd); break;
+        case 14: ctx.emit(ppc_andc(ppcRd, ppcRd, ppcRs));    emit_updateNZ(ctx, ppcRd); break;
+        case 15: ctx.emit(ppc_nor(ppcRd, ppcRs, ppcRs));     emit_updateNZ(ctx, ppcRd); break;
+        default: return false;
+    }
+    return true;
+}
+
+static bool emit_thumb_hiRegOp(EmitCtx& ctx, uint16_t opcode) {
+    uint8_t op  = (opcode >> 8) & 3;
+    uint8_t h1  = (opcode >> 7) & 1;
+    uint8_t h2  = (opcode >> 6) & 1;
+    uint8_t rs  = ((opcode >> 3) & 7) | (h2 << 3);
+    uint8_t rd  = (opcode & 7) | (h1 << 3);
+
+    if (rd == 15 || rs == 15) return false;
+
+    uint8_t ppcRd = ARM_TO_PPC[rd];
+    uint8_t ppcRs = ARM_TO_PPC[rs];
+
+    switch (op) {
+        case 0: ctx.emit(ppc_add(ppcRd, ppcRd, ppcRs)); break;
+        case 1: {
+            ctx.emit(ppc_subfc(PPC_TMP0, ppcRs, ppcRd));
+            emit_updateNZCV_sub(ctx, PPC_TMP0);
+            break;
+        }
+        case 2: ctx.emit(ppc_mr(ppcRd, ppcRs)); break;
+        case 3: {
+            // BX Rs (Thumb hi-reg)
+            ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 27, 25));  // clear T
+            ctx.emit(ppc_rlwinm(PPC_TMP0, ppcRs, 0, 31, 31));      // TMP0 = Rs[0]
+            ctx.emit(ppc_rlwinm(PPC_TMP0, PPC_TMP0, 5, 26, 26));   // TMP0 = Rs[0] << 5
+            ctx.emit(ppc_or(PPC_CPSR, PPC_CPSR, PPC_TMP0));         // set T
+            ctx.emit(ppc_rlwinm(PPC_ARM_R15, ppcRs, 0, 0, 30));    // PC = Rs & ~1
+            emit_syncToInterp(ctx);
+            emit_epilogue(ctx);   // FIX #4
+            ctx.hasExplicitReturn = true;
+            break;
+        }
+    }
+    return true;
+}
+
+static bool emit_thumb_ldrPc(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
+    uint8_t  rd   = (opcode >> 8) & 7;
+    uint32_t off  = (opcode & 0xFF) << 2;
+    uint32_t addr = ((pc + 4) & ~3u) + off;
+
+    int n = emit_li32(ctx.cur, PPC_TMP1, addr);
+    ctx.cur += n;
+
+    // Save volatile regs.
+    for (int i = 0; i < 8; i++)
+        ctx.emit(ppc_stw(3 + i, FRAME_REGSYNC + i * 4, 1));
+
+    ctx.emit(ppc_mr(3, PPC_CORE));
+    ctx.emit(ppc_addi(4, 0, ctx.arm7 ? 1 : 0));
+    ctx.emit(ppc_mr(5, PPC_TMP1));
+    emit_call(ctx, (void*)JitPpc_memRead32);
+
+    // FIX #7: save result before restoring volatiles.
+    ctx.emit(ppc_mr(PPC_TMP0, 3));
+
+    for (int i = 0; i < 8; i++)
+        ctx.emit(ppc_lwz(3 + i, FRAME_REGSYNC + i * 4, 1));
+
+    ctx.emit(ppc_mr(ARM_TO_PPC[rd], PPC_TMP0));
+    return true;
+}
+
+// FIX #4: Thumb branch — both taken and not-taken paths end with
+// explicit sync + epilogue.
+static bool emit_thumb_branch(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
+    uint8_t cond = (opcode >> 8) & 0xF;
+
+    if (cond == 0xE) {
+        // Unconditional B
+        int32_t offset = (int8_t)(opcode & 0xFF);
+        offset <<= 1;
+        uint32_t target = pc + 4 + offset;
+        int n = emit_li32(ctx.cur, PPC_ARM_R15, target);
+        ctx.cur += n;
+        emit_syncToInterp(ctx);
+        emit_epilogue(ctx);   // FIX #4
+        ctx.hasExplicitReturn = true;
+        return true;
+    }
+
+    if (cond == 0xF) return false; // SWI
+
+    // Conditional branch.
+    int32_t  offset      = (int8_t)(opcode & 0xFF);
+    offset <<= 1;
+    uint32_t target      = pc + 4 + offset;
+    uint32_t fallthrough = pc + 2;
+
+    emit_setupCondFlags(ctx);
+    CondBranch cb = armCondToPpc(cond);
+    if (!cb.valid) return false;
+
+    // Skip taken path if condition NOT met.
+    size_t condBranchIdx = ctx.size();
+    ctx.emit(ppc_bc((cb.bo == 12) ? 4 : 12, cb.bi, 0));
+
+    // Taken path.
+    {
+        int n = emit_li32(ctx.cur, PPC_ARM_R15, target);
+        ctx.cur += n;
+    }
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);   // FIX #4: return from taken path
+
+    // Not-taken path starts here; patch the condition branch.
+    patchBranchOffset(ctx, condBranchIdx, ctx.size());
+
+    {
+        int n = emit_li32(ctx.cur, PPC_ARM_R15, fallthrough);
+        ctx.cur += n;
+    }
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);   // FIX #4: return from not-taken path
+
+    ctx.hasExplicitReturn = true;
+    return true;
+}
+
+// FIX #4: Thumb BL/BLX — sync + epilogue after setting LR and PC.
+static bool emit_thumb_bl(EmitCtx& ctx, uint16_t op1, uint16_t op2, uint32_t pc) {
+    int32_t  hiOff  = (int32_t)((op1 & 0x7FF) << 21) >> 9;
+    int32_t  loOff  = (op2 & 0x7FF) << 1;
+    uint32_t target  = pc + 4 + hiOff + loOff;
+    uint32_t retAddr = pc + 4;
+
+    int n = emit_li32(ctx.cur, PPC_ARM_R14, retAddr | 1u);
+    ctx.cur += n;
+    n = emit_li32(ctx.cur, PPC_ARM_R15, target & ~1u);
+    ctx.cur += n;
+
+    // BLX: clear T bit to switch to ARM mode.
+    uint8_t botBits = (op2 >> 11) & 0x1F;
+    if (botBits == 0x1C) {
+        ctx.emit(ppc_rlwinm(PPC_CPSR, PPC_CPSR, 0, 27, 25));
+        ctx.emit(ppc_rlwinm(PPC_ARM_R15, PPC_ARM_R15, 0, 0, 29));
+    }
+
+    emit_syncToInterp(ctx);
+    emit_epilogue(ctx);   // FIX #4
+    ctx.hasExplicitReturn = true;
+    return true;
+}
+
+// ============================================================
+// ARM instruction dispatch
+// ============================================================
+static bool emitARMInstr(EmitCtx& ctx, uint32_t opcode, uint32_t pc) {
+    uint8_t cond = (opcode >> 28) & 0xF;
+    if (cond == 15) return false;
+
+    uint32_t instrType = (opcode >> 25) & 7;
+
+    switch (instrType) {
+        case 0:
+        case 1: {
+            if ((opcode & 0x0FC000F0) == 0x00000090)
+                return emit_multiply(ctx, opcode);
+            if ((opcode & 0x0FFFFFF0) == 0x012FFF10 ||
+                (opcode & 0x0FFFFFF0) == 0x012FFF30)
+                return emit_branch(ctx, opcode, pc);
+            if ((opcode & 0x0FB00FF0) == 0x01000000 ||
+                (opcode & 0x0FB00000) == 0x03200000 ||
+                (opcode & 0x0DB0F000) == 0x010F0000)
+                return false;
+            return emit_dataProc(ctx, opcode);
+        }
+        case 2:
+        case 3:
+            return emit_loadStore(ctx, opcode, pc);
+        case 4:
+            return false; // LDM/STM — fallback
+        case 5:
+            return emit_branch(ctx, opcode, pc);
+        case 6:
+            return false; // coprocessor load/store
+        case 7:
+            if ((opcode & 0x0F000000) == 0x0F000000) return false; // SWI
+            if ((opcode & 0x0F000010) == 0x0E000010) return false; // MRC/MCR
+            return false;
+    }
+    return false;
+}
+
+// ============================================================
+// Thumb instruction dispatch
+// ============================================================
+static bool emitThumbInstr(EmitCtx& ctx, uint16_t opcode, uint32_t pc) {
+    uint8_t bits1514 = (opcode >> 14) & 3;
+    uint8_t bits1311 = (opcode >> 11) & 7;
+
+    switch (bits1514) {
+        case 0:
+            switch (bits1311) {
+                case 0: return emit_thumb_lslImm(ctx, opcode);
+                case 1: return emit_thumb_lsrImm(ctx, opcode);
+                case 2: return emit_thumb_asrImm(ctx, opcode);
+                case 3: return emit_thumb_addSubReg(ctx, opcode);
+                case 4: return emit_thumb_movImm(ctx, opcode);
+                case 5: return emit_thumb_cmpImm(ctx, opcode);
+                case 6: return emit_thumb_addImm8(ctx, opcode);
+                case 7: return emit_thumb_subImm8(ctx, opcode);
+            }
+            break;
+        case 1: {
+            uint8_t bits10 = (opcode >> 10) & 3;
+            if (bits10 == 0) return emit_thumb_aluOp(ctx, opcode);
+            if (bits10 == 1) return emit_thumb_hiRegOp(ctx, opcode);
+            if (bits1311 == 0x09) return emit_thumb_ldrPc(ctx, opcode, pc);
+            return false;
+        }
+        case 2:
+            return false;
+        case 3: {
+            uint8_t bits1512 = (opcode >> 12) & 0xF;
+            if (bits1512 == 0xD || bits1512 == 0xE)
+                return emit_thumb_branch(ctx, opcode, pc);
+            return false;
+        }
+    }
+    return false;
+}
+
+// ============================================================
+// Block compiler
+// ============================================================
+static JitBlock* compileBlock(Interpreter* interp, Core* core,
+                               uint32_t armPC, bool arm7) {
+    bool isThumb = interp->isThumb();
+
+    size_t bucket  = hashPC(armPC);
+    JitBlock& slot = blockCache[bucket];
+    if (slot.valid && slot.armPC == armPC && slot.thumb == isThumb)
+        return &slot;
+
+    if (codeBufferPos + MAX_BLOCK_SIZE * MAX_PPC_PER_ARM + 256 >= JIT_MAX_INSTRS)
+        flushJitCache();
+
+    EmitCtx ctx;
+    ctx.base             = codeBuffer + codeBufferPos;
+    ctx.cur              = ctx.base;
+    ctx.capacity         = JIT_MAX_INSTRS - codeBufferPos;
+    ctx.thumb            = isThumb;
+    ctx.arm7             = arm7;
+    ctx.armPC            = armPC;
+    ctx.interp           = interp;
+    ctx.core             = core;
+    ctx.hasExplicitReturn = false;   // FIX #6/#7
+
+    emit_prologue(ctx, interp, core);
+    emit_syncFromInterp(ctx);
+
+    uint32_t pc         = armPC;
+    int      instrCount = 0;
+    bool     blockEnded = false;
+
+    for (instrCount = 0;
+         instrCount < (int)MAX_BLOCK_SIZE && !blockEnded;
+         instrCount++) {
+
+        // FIX #8: set PPC_ARM_R15 to the correct architectural PC
+        // value for this instruction position.
+        // ARM:   reads of R15 return pc + 8 (two instructions ahead).
+        // Thumb: reads of R15 return pc + 4.
+        {
+            int n = emit_li32(ctx.cur, PPC_ARM_R15, pc + (isThumb ? 4u : 8u));
+            ctx.cur += n;
+        }
+
+        if (isThumb) {
+            uint16_t top      = core->memory.read<uint16_t>(arm7, pc);
+            uint8_t  bits1511 = (top >> 11) & 0x1F;
+
+            // Detect BL/BLX two-halfword sequence.
+            if (bits1511 == 0x1E) {
+                uint16_t bot     = core->memory.read<uint16_t>(arm7, pc + 2);
+                uint8_t  botBits = (bot >> 11) & 0x1F;
+                if (botBits == 0x1F || botBits == 0x1C) {
+                    if (emit_thumb_bl(ctx, top, bot, pc)) {
+                        pc += 4;
+                        instrCount++;
+                        blockEnded = true;
+                        continue;
+                    }
+                }
+            }
+
+            if (!emitThumbInstr(ctx, top, pc)) {
+                // FIX #5: fallback ends the block; hasExplicitReturn set inside.
+                emit_interpFallback(ctx);
+                blockEnded = true;
+            } else {
+                pc += 2;
+                // End block on branch-type instructions.
+                uint8_t bits1512 = (top >> 12) & 0xF;
+                if (bits1512 == 0xD || bits1512 == 0xE)
+                    blockEnded = true;
+                // If the emitter set hasExplicitReturn (e.g. BX), stop.
+                if (ctx.hasExplicitReturn)
+                    blockEnded = true;
+            }
+        } else {
+            uint32_t opcode = core->memory.read<uint32_t>(arm7, pc);
+
+            if (!emitARMInstr(ctx, opcode, pc)) {
+                // FIX #5: fallback ends the block.
+                emit_interpFallback(ctx);
+                blockEnded = true;
+            } else {
+                pc += 4;
+
+                uint32_t itype = (opcode >> 25) & 7;
+                if (itype == 5 ||
+                    (opcode & 0x0FFFFFF0) == 0x012FFF10 ||
+                    (opcode & 0x0FFFFFF0) == 0x012FFF30)
+                    blockEnded = true;
+
+                if (itype == 4 && ((opcode >> 20) & 1) && (opcode & (1u << 15)))
+                    blockEnded = true;
+
+                // If a branch emitter set hasExplicitReturn, stop.
+                if (ctx.hasExplicitReturn)
+                    blockEnded = true;
+            }
+        }
+    }
+
+    // FIX #6/#7: only add the trailing sync+epilogue if no emitter
+    // has already ended the block with an explicit return.
+    if (!ctx.hasExplicitReturn) {
+        emit_syncToInterp(ctx);
+        emit_epilogue(ctx);
+    }
+
+    slot.armPC     = armPC;
+    slot.ppcCode   = ctx.base;
+    slot.ppcWords  = (uint32_t)ctx.size();
+    slot.armInstrs = (uint32_t)instrCount;
+    slot.thumb     = isThumb;
+    slot.valid     = true;
+
+    codeBufferPos += ctx.size();
+
+    flushCaches(ctx.base, ctx.size());
+    return &slot;
+}
+
+// ============================================================
+// Execute a compiled block.
+//
+// The block is a self-contained PPC function: it allocates its
+// own frame, saves/restores non-volatiles, and returns via blr.
+// We call it as a plain function pointer; no extra wrapper frame
+// is needed here because the block's prologue handles the ABI.
+// ============================================================
+static void executeBlock(const JitBlock* block) {
+    typedef void (*BlockFn)();
+    ((BlockFn)block->ppcCode)();
+}
+
+// ============================================================
+// JIT public run entry point.
+//
+// FIX #1: use getActualPC() (= pipelined PC - pipeline depth)
+// to get the true fetch address.  getPC() returns the pipelined
+// value (pc+8 ARM / pc+4 Thumb) which is wrong for block lookup
+// and for reading the first instruction of the block.
+// ============================================================
+void runJitNds(Core& core) {
+    Interpreter& arm9 = core.interpreter[0];
+    Interpreter& arm7 = core.interpreter[1];
+
+    if (!arm9.halted) {
+        uint32_t pc9 = arm9.getActualPC();   // FIX #1
+        JitBlock* b  = compileBlock(&arm9, &core, pc9, false);
+        if (b) executeBlock(b);
+    }
+
+    if (!arm7.halted) {
+        uint32_t pc7 = arm7.getActualPC();   // FIX #1
+        JitBlock* b  = compileBlock(&arm7, &core, pc7, true);
+        if (b) executeBlock(b);
+    }
+}
+
+// ============================================================
+// Offset computation
+// ============================================================
+static void computeOffsets() {
+    off_halted       = Interpreter::offset_halted();
+    off_pcData       = Interpreter::offset_pcData();
+    off_pipeline     = Interpreter::offset_pipeline();
+    off_registersUsr = Interpreter::offset_registersUsr();
+    off_cpsr         = Interpreter::offset_cpsr();
+    off_cycles       = Interpreter::offset_cycles();
+
+    printf("[JIT] Struct offsets:\n");
+    printf("[JIT]   halted       = %zu\n", off_halted);
+    printf("[JIT]   pcData       = %zu\n", off_pcData);
+    printf("[JIT]   pipeline     = %zu\n", off_pipeline);
+    printf("[JIT]   registersUsr = %zu\n", off_registersUsr);
+    printf("[JIT]   cpsr         = %zu\n", off_cpsr);
+    printf("[JIT]   cycles       = %zu\n", off_cycles);
+}
+
+// ============================================================
+// initJit / shutdownJit / invalidateJitRange
+// ============================================================
+bool initJit() {
+    computeOffsets();
+
+    codeBuffer = (uint32_t*)memalign(32, JIT_CODE_SIZE);
+    if (!codeBuffer) {
+        printf("[JIT] Failed to allocate %zu KB code buffer\n",
+               JIT_CODE_SIZE / 1024);
+        return false;
+    }
+
+    codeBufferPos = 0;
+    for (size_t i = 0; i < BLOCK_CACHE_SIZE; i++)
+        blockCache[i].valid = false;
+
+    printf("[JIT] ARM->PPC JIT ready. Buffer: %p  (%zu KB)\n",
+           (void*)codeBuffer, JIT_CODE_SIZE / 1024);
+    return true;
+}
+
+void shutdownJit() {
+    if (codeBuffer) {
+        free(codeBuffer);
+        codeBuffer = nullptr;
+    }
+}
+
+void invalidateJitRange(uint32_t start, uint32_t end) {
+    for (size_t i = 0; i < BLOCK_CACHE_SIZE; i++) {
+        if (blockCache[i].valid) {
+            uint32_t bpc = blockCache[i].armPC;
+            if (bpc >= start && bpc < end)
+                blockCache[i].valid = false;
+        }
+    }
+}
+
+} // namespace JitPpc
+```
+
+You also need to add `setPC` to the interpreter's `.cpp`. Add this alongside the other method implementations:
+
+```cpp
+// In interpreter.cpp — add this method:
+void Interpreter::setPC(uint32_t newPC) {
+    // Write the new PC directly and flush the pipeline so the
+    // next fetch comes from the correct address.  This mirrors
+    // what the interpreter does internally on every branch.
+    *registers[15] = newPC;
+    flushPipeline();
+}
+```
+
+The key changes and why each matters:
+
+| Fix | What changed | Why |
+|-----|-------------|-----|
+| **#1** | `getActualPC()` subtracts pipeline depth | `getPC()` returned `pc+8`/`pc+4`, causing wrong block lookup and wrong first-instruction fetch |
+| **#2** | `emit_call` uses dedicated `PPC_CALL_TMP` (r29) | r12 (`PPC_TMP3`) was both the call scratch and a general temp, causing aliasing |
+| **#3** | Frame saves r14..r29 (16 regs), `FRAME_SIZE=176`, `FRAME_REGSYNC=80` | r29 must be saved since it's now non-volatile and used by emit_call |
+| **#4** | Every branch path ends with `emit_syncToInterp` + `emit_epilogue` | Taken path was falling through to sequential code with a stale PC |
+| **#5** | Fallback sets `blockEnded=true` and calls epilogue inside | Interpreter may branch; continuing sequential emission after fallback is wrong |
+| **#6** | `JitPpc_syncToInterp` calls `interp->setPC()` for R15 | Writing raw to `*registers[15]` bypasses pipeline flush, causing wrong fetch |
+| **#7** | `hasExplicitReturn` flag skips duplicate trailing epilogue | Prevents double sync/epilogue when branches already returned |
+| **#8** | R15 set per-instruction to `pc + (thumb?4:8)` in compile loop | Architectural R15 value must reflect each instruction's position |
+
+
+=====================================================
+
+backup4-prod-profile-2/core.cpp:185:35: error: too few arguments to function 'bool JitPpc::initJit(Core*)'
+185 | jitAvailable = JitPpc::initJit();
+| ~~~~~~~~~~~~~~~^~
+In file included from backup4-prod-profile-2/core.cpp:31:
+backup4-prod-profile-2/jit_ppc.h:8:10: note: declared here
+8 | bool initJit(Core* core); // takes Core* so it can hook runFunc
+| ^~~~~~~
+backup4-prod-profile-2/core.cpp: In destructor 'Core::~Core()':
+backup4-prod-profile-2/core.cpp:267:28: error: too few arguments to function 'void JitPpc::shutdownJit(Core*)'
+267 | JitPpc::shutdownJit();
+| ~~~~~~~~~~~~~~~~~~~^~
+backup4-prod-profile-2/jit_ppc.h:9:10: note: declared here
+9 | void shutdownJit(Core* core);
+| ^~~~~~~~~~~
+make: *** [Makefile-backup4-prod-profile-2:32: backup4
+
+
+Here is my core.cpp
+//core.cpp
+#include <algorithm>
+#include <cstring>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#include "core.h"
+#include "jit_ppc.h"
+
+extern void* Noods_MEM2_Alloc(size_t size);
+extern void  Noods_MEM2_Free(void* ptr);
+
+// ---------------------------------------------------------------------------
+// Custom allocators — route to MEM2
+// ---------------------------------------------------------------------------
+void* Core::operator new(size_t size) {
+    void* p = Noods_MEM2_Alloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void Core::operator delete(void* p) noexcept { Noods_MEM2_Free(p); }
+
+void* Core::operator new[](size_t size) {
+    void* p = Noods_MEM2_Alloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
+
+// ---------------------------------------------------------------------------
+// JIT run wrappers
+//
+// runFunc has signature void(*)(Core&).  We provide one thin wrapper per
+// emulation mode so the JIT can be installed wherever the interpreter sits.
+// ---------------------------------------------------------------------------
+static void runJitNdsWrapper(Core& core)  { JitPpc::runJitNds(core); }
+static void runJitSingle9(Core& core)     { JitPpc::runJitNds(core); }
+static void runJitSingle7(Core& core)     { JitPpc::runJitNds(core); }
+static void runJitDsiWrapper(Core& core)  { JitPpc::runJitNds(core); }
+static void runJitGbaWrapper(Core& core)  { JitPpc::runJitNds(core); }
+
+// ---------------------------------------------------------------------------
+// pickJitFunc — mirror of the interpreter selection logic in updateRun(),
+// but returns a JIT wrapper.  Returns nullptr only when both CPUs are halted
+// (caller handles that case before calling this).
+// ---------------------------------------------------------------------------
+static void (*pickJitFunc(const Core& core))(Core&)
+{
+    if (core.gbaMode)
+        return runJitGbaWrapper;
+    if (core.dsiMode)
+        return runJitDsiWrapper;
+    if (!core.interpreter[0].halted && !core.interpreter[1].halted)
+        return runJitNdsWrapper;
+    if (core.interpreter[0].halted)
+        return runJitSingle7;
+    return runJitSingle9;
+}
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+Core::Core(std::string ndsRom, std::string gbaRom, int id,
+           int ndsRomFd,  int gbaRomFd,
+           int ndsSaveFd, int gbaSaveFd,
+           int ndsStateFd, int gbaStateFd, int ndsCheatFd)
+    : id(id),
+      actionReplay(this), cartridgeGba(this), cartridgeNds(this),
+      cp15(this), divSqrt(this), dldi(this),
+      dma { Dma(this, 0), Dma(this, 1) },
+      gpu(this),
+      gpu2D { Gpu2D(this, 0), Gpu2D(this, 1) },
+      gpu3D(this), gpu3DRenderer(this),
+      hleArm7(this),
+      hleBios { HleBios(this, 0, HleBios::swiTable9),
+                HleBios(this, 1, HleBios::swiTable7),
+                HleBios(this, 1, HleBios::swiTableGba) },
+      input(this),
+      interpreter { Interpreter(this, 0), Interpreter(this, 1) },
+      ipc(this), memory(this), rtc(this), saveStates(this),
+      spi(this), spu(this),
+      timers { Timers(this, 0), Timers(this, 1) },
+      wifi(this),
+      running(0),
+      lastFpsTimeTicks(0),
+      fpsCount(0)
+{
+    // ------------------------------------------------------------------
+    // Bind task table
+    // ------------------------------------------------------------------
+    tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
+    tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
+
+    tasks[CART9_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 0);
+    tasks[CART7_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 1);
+
+    tasks[DMA9_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[0], 0);
+    tasks[DMA9_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[0], 1);
+    tasks[DMA9_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[0], 2);
+    tasks[DMA9_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[0], 3);
+
+    tasks[DMA7_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[1], 0);
+    tasks[DMA7_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[1], 1);
+    tasks[DMA7_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[1], 2);
+    tasks[DMA7_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[1], 3);
+
+    tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,    &gpu);
+    tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,    &gpu);
+    tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
+    tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
+
+    tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
+
+    tasks[ARM9_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[0]);
+    tasks[ARM7_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[1]);
+
+    tasks[NDS_SPU_SAMPLE]   = SchedCallback(shim_spuSample,    &spu);
+    tasks[GBA_SPU_SAMPLE]   = SchedCallback(shim_spuGbaSample, &spu);
+
+    tasks[TIMER9_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[0], 0);
+    tasks[TIMER9_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[0], 1);
+    tasks[TIMER9_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[0], 2);
+    tasks[TIMER9_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[0], 3);
+
+    tasks[TIMER7_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[1], 0);
+    tasks[TIMER7_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[1], 1);
+    tasks[TIMER7_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[1], 2);
+    tasks[TIMER7_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[1], 3);
+
+    tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs,  &wifi);
+    tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
+    tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
+
+    // ------------------------------------------------------------------
+    // BIOS / firmware loading
+    // ------------------------------------------------------------------
+    bool required = !Settings::directBoot ||
+                    (ndsRom == "" && gbaRom == "" &&
+                     ndsRomFd == -1 && gbaRomFd == -1);
+
+    if (!memory.loadBios9() && required) throw ERROR_BIOS;
+    if (!memory.loadBios7() && required) throw ERROR_BIOS;
+    if (!spi.loadFirmware()  && required) throw ERROR_FIRM;
+    realGbaBios = memory.loadGbaBios();
+
+    // ------------------------------------------------------------------
+    // Initial scheduling
+    // ------------------------------------------------------------------
+    schedule(RESET_CYCLES,    0x7FFFFFFF);
+    schedule(NDS_SCANLINE256, 256 * 6);
+    schedule(NDS_SCANLINE355, 355 * 6);
+    schedule(NDS_SPU_SAMPLE,  512 * 2);
+
+    dsiMode = Settings::dsiMode;
+
+    // ------------------------------------------------------------------
+    // JIT initialisation
+    //
+    // Must happen after memory maps are set up but before updateRun()
+    // installs runFunc, so that pickJitFunc() can be used immediately.
+    // ------------------------------------------------------------------
+    jitAvailable = JitPpc::initJit();
+
+    if (jitAvailable)
+        printf("[Core %d] JIT recompiler active\n", id);
+    else
+        printf("[Core %d] JIT unavailable — interpreter only\n", id);
+
+    updateRun();
+
+    memory.updateMap9(0x00000000, 0xFFFFFFFF);
+    memory.updateMap7(0x00000000, 0xFFFFFFFF);
+    interpreter[0].init();
+    interpreter[1].init();
+
+    // ------------------------------------------------------------------
+    // GBA ROM
+    // ------------------------------------------------------------------
+    if (gbaRom != "" || gbaRomFd != -1) {
+        if (!cartridgeGba.setRom(gbaRom, gbaRomFd, gbaSaveFd, gbaStateFd, -1))
+            throw ERROR_ROM;
+
+        if (Settings::directBoot && ndsRom == "" && ndsRomFd == -1) {
+            memory.write<uint16_t>(0, 0x4000304, 0x8003);
+            enterGbaMode();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // NDS ROM
+    // ------------------------------------------------------------------
+    if (ndsRom != "" || ndsRomFd != -1) {
+        if (!cartridgeNds.setRom(ndsRom, ndsRomFd, ndsSaveFd, ndsStateFd, ndsCheatFd))
+            throw ERROR_ROM;
+
+        actionReplay.loadCheats();
+
+        if (Settings::directBoot) {
+            cp15.write(1, 0, 0, 0x0005707D);
+            cp15.write(9, 1, 0, 0x0300000A);
+            cp15.write(9, 1, 1, 0x00000020);
+            memory.write<uint8_t> (0,  0x4000247, 0x03);
+            memory.write<uint8_t> (0,  0x4000300, 0x01);
+            memory.write<uint8_t> (1,  0x4000300, 0x01);
+            memory.write<uint16_t>(0,  0x4000304, 0x0001);
+            memory.write<uint16_t>(1,  0x4000504, 0x0200);
+            memory.write<uint32_t>(0,  0x27FF800, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FF804, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FF850, 0x5835);
+            memory.write<uint16_t>(0,  0x27FF880, 0x0007);
+            memory.write<uint16_t>(0,  0x27FF884, 0x0006);
+            memory.write<uint32_t>(0,  0x27FFC00, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FFC04, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FFC10, 0x5835);
+            memory.write<uint16_t>(0,  0x27FFC40, 0x0001);
+            cartridgeNds.directBoot();
+            interpreter[0].directBoot();
+            interpreter[1].directBoot();
+            spi.directBoot();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // HLE ARM7
+    // ------------------------------------------------------------------
+    if (!gbaMode && Settings::arm7Hle) {
+        arm7Hle = true;
+        hleArm7.init();
+    }
+
+    lastFpsTimeTicks = PPCGetTickCount();
+
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 1;
+    PPCIrqUnlockByMsr(st);
+}
+
+// ---------------------------------------------------------------------------
+// Destructor — shut down JIT and release the code buffer
+// ---------------------------------------------------------------------------
+Core::~Core()
+{
+    if (jitAvailable) {
+        JitPpc::shutdownJit();
+        jitAvailable = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State save / load
+// ---------------------------------------------------------------------------
+void Core::saveState(FILE* file) {
+    fwrite(&arm7Hle,      sizeof(arm7Hle),      1, file);
+    fwrite(&dsiMode,      sizeof(dsiMode),      1, file);
+    fwrite(&gbaMode,      sizeof(gbaMode),      1, file);
+    fwrite(&globalCycles, sizeof(globalCycles), 1, file);
+
+    uint32_t count = static_cast<uint32_t>(events.size());
+    fwrite(&count, sizeof(count), 1, file);
+    for (uint32_t i = 0; i < count; i++)
+        fwrite(&events[i], sizeof(events[i]), 1, file);
+}
+
+void Core::loadState(FILE* file) {
+    fread(&arm7Hle,      sizeof(arm7Hle),      1, file);
+    fread(&dsiMode,      sizeof(dsiMode),      1, file);
+    fread(&gbaMode,      sizeof(gbaMode),      1, file);
+    fread(&globalCycles, sizeof(globalCycles), 1, file);
+
+    events.clear();
+    uint32_t count = 0;
+    fread(&count, sizeof(count), 1, file);
+    SchedEvent event(MAX_TASKS, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        fread(&event, sizeof(event), 1, file);
+        events.push_back(event);
+    }
+
+    // Blocks compiled against the pre-save state are now stale.
+    if (jitAvailable)
+        JitPpc::flushJitCache();
+
+    updateRun();
+}
+
+// ---------------------------------------------------------------------------
+// updateRun — select the tightest run function for the current state
+// ---------------------------------------------------------------------------
+void Core::updateRun()
+{
+    // Determine the new runFunc without using goto so that no
+    // initialisation is skipped across a label.
+    void (*newFunc)(Core&) = nullptr;
+
+    if (interpreter[0].halted && interpreter[1].halted) {
+        // Nothing to execute; the interpreter's no-op loop is fine.
+        newFunc = &Interpreter::runCoreNone;
+    } else if (jitAvailable) {
+        newFunc = pickJitFunc(*this);
+    }
+
+    // If the JIT is not available, or pickJitFunc somehow returned nullptr
+    // (should not happen for non-halted states), use the interpreter.
+    if (!newFunc) {
+        if (gbaMode)
+            newFunc = &Interpreter::runCoreSingle<true, 0>;
+        else if (dsiMode)
+            newFunc = &Interpreter::runCoreDsi;
+        else if (!interpreter[0].halted && !interpreter[1].halted)
+            newFunc = &Interpreter::runCoreNds;
+        else if (interpreter[0].halted)
+            newFunc = &Interpreter::runCoreSingle<true, 1>;
+        else
+            newFunc = &Interpreter::runCoreSingle<false, 0>;
+    }
+
+    runFunc = newFunc;
+
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 0;
+    PPCIrqUnlockByMsr(st);
+}
+
+// ---------------------------------------------------------------------------
+// resetCycles — prevent globalCycles overflow
+// ---------------------------------------------------------------------------
+void Core::resetCycles() {
+    const size_t n = events.size();
+    for (size_t i = 0; i < n; i++)
+        events[i].cycles -= globalCycles;
+
+    for (int i = 0; i < 2; i++) {
+        interpreter[i].resetCycles();
+        timers[i].resetCycles();
+    }
+
+    globalCycles = 0;
+    schedule(RESET_CYCLES, 0x7FFFFFFF);
+}
+
+// ---------------------------------------------------------------------------
+// schedule — insert a new event in sorted order
+// ---------------------------------------------------------------------------
+void Core::schedule(SchedTask task, uint32_t cycles) {
+    SchedEvent event(task, globalCycles + cycles);
+    auto it = std::upper_bound(events.cbegin(), events.cend(), event);
+    events.insert(it, event);
+}
+
+// ---------------------------------------------------------------------------
+// enterGbaMode
+// ---------------------------------------------------------------------------
+void Core::enterGbaMode() {
+    gbaMode = true;
+
+    interpreter[0].halt(2);
+    interpreter[1].unhalt(2);
+
+    // NDS-mapped JIT blocks are invalid once the GBA memory map is live.
+    if (jitAvailable)
+        JitPpc::flushJitCache();
+
+    updateRun();
+
+    events.clear();
+    schedule(RESET_CYCLES,    0x7FFFFFFF);
+    schedule(GBA_SCANLINE240, 240 * 4);
+    schedule(GBA_SCANLINE308, 308 * 4);
+    schedule(GBA_SPU_SAMPLE,  512);
+
+    memory.updateMap7(0x00000000, 0xFFFFFFFF);
+    interpreter[1].init();
+    rtc.reset();
+
+    memory.write<uint8_t>(0, 0x4000240, 0x80);
+    memory.write<uint8_t>(0, 0x4000241, 0x80);
+
+    if (realGbaBios) {
+        interpreter[1].bios = nullptr;
+        return;
+    }
+
+    interpreter[1].bios = &hleBios[2];
+    interpreter[1].directBoot();
+    memory.write<uint16_t>(1, 0x4000088, 0x200);
+}
+
+// ---------------------------------------------------------------------------
+// endFrame
+// ---------------------------------------------------------------------------
+void Core::endFrame() {
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 0;
+    PPCIrqUnlockByMsr(st);
+
+    fpsCount++;
+
+    if (arm7Hle)
+        hleArm7.runFrame();
+
+    uint64_t now     = PPCGetTickCount();
+    uint64_t elapsed = now - lastFpsTimeTicks;
+    if (elapsed >= PPCMsToTicks(1000)) {
+        fps              = fpsCount;
+        fpsCount         = 0;
+        lastFpsTimeTicks = now;
+    }
+
+    if (wifi.shouldSchedule())
+        wifi.scheduleInit();
+}
+
+// ---------------------------------------------------------------------------
+// invalidateJitPage — fine-grained cache invalidation for a single 4 KB page
+// ---------------------------------------------------------------------------
+void Core::invalidateJitPage(uint32_t addr)
+{
+    if (!jitAvailable) return;
+    uint32_t pageStart = addr & ~0xFFFu;
+    JitPpc::invalidateJitRange(pageStart, pageStart + 0x1000u);
+}
+
+
+A:
+
+The fix is straightforward — update the call sites in `core.cpp` to pass `this`, and update `jit_ppc.h` to provide a no-argument overload for backward compatibility. Here are the minimal changes:
+
+**`jit_ppc.h`** — add the overloads:
+
+```cpp
+// jit_ppc.h
+#pragma once
+#include <cstdint>
+#include <cstdlib>
+
+class Core;
+
+namespace JitPpc {
+    // Core* overloads (preferred — hook runFunc automatically)
+    bool initJit(Core* core);
+    void shutdownJit(Core* core);
+
+    // No-argument overloads for call sites that don't have a Core* handy.
+    // These skip the runFunc hook; caller must call core->setRunFunc() separately.
+    inline bool initJit()      { return initJit(nullptr); }
+    inline void shutdownJit()  { shutdownJit(nullptr);    }
+
+    void runJitNds(Core& core);
+    void runJitGba(Core& core);
+    void invalidateJitRange(uint32_t start, uint32_t end);
+    void flushJitCache();
+}
+```
+
+**`core.cpp`** — three targeted changes:
+
+```cpp
+// Line 185 — pass `this` so initJit hooks runFunc immediately:
+jitAvailable = JitPpc::initJit(this);
+
+// Line 267 — pass `this` so shutdownJit restores the interpreter runFunc:
+JitPpc::shutdownJit(this);
+```
+
+**`core.h`** — add `setRunFunc` to the public section:
+
+```cpp
+// In class Core, public section, add:
+void setRunFunc(void (*f)(Core&)) {
+    runFunc = (f != nullptr) ? f : &Interpreter::runCoreNds;
+}
+```
+
+Now the full corrected `core.cpp` with all the integration pieces working together, `updateRun` properly routing through the JIT, and the scheduler hooked correctly:
+
+```cpp
+// core.cpp
+#include <algorithm>
+#include <cstring>
+
+extern "C" {
+    #include <tuxedo/thread.h>
+    #include <tuxedo/ppc/intrinsics.h>
+    #include <tuxedo/ppc/clock.h>
+}
+
+#include "core.h"
+#include "jit_ppc.h"
+
+extern void* Noods_MEM2_Alloc(size_t size);
+extern void  Noods_MEM2_Free(void* ptr);
+
+// ---------------------------------------------------------------------------
+// Custom allocators
+// ---------------------------------------------------------------------------
+void* Core::operator new(size_t size) {
+    void* p = Noods_MEM2_Alloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void Core::operator delete(void* p) noexcept { Noods_MEM2_Free(p); }
+void* Core::operator new[](size_t size) {
+    void* p = Noods_MEM2_Alloc(size);
+    if (!p) throw std::bad_alloc();
+    return p;
+}
+void Core::operator delete[](void* p) noexcept { Noods_MEM2_Free(p); }
+
+// ---------------------------------------------------------------------------
+// Constructor
+// ---------------------------------------------------------------------------
+Core::Core(std::string ndsRom, std::string gbaRom, int id,
+           int ndsRomFd,  int gbaRomFd,
+           int ndsSaveFd, int gbaSaveFd,
+           int ndsStateFd, int gbaStateFd, int ndsCheatFd)
+    : id(id),
+      actionReplay(this), cartridgeGba(this), cartridgeNds(this),
+      cp15(this), divSqrt(this), dldi(this),
+      dma { Dma(this, 0), Dma(this, 1) },
+      gpu(this),
+      gpu2D { Gpu2D(this, 0), Gpu2D(this, 1) },
+      gpu3D(this), gpu3DRenderer(this),
+      hleArm7(this),
+      hleBios { HleBios(this, 0, HleBios::swiTable9),
+                HleBios(this, 1, HleBios::swiTable7),
+                HleBios(this, 1, HleBios::swiTableGba) },
+      input(this),
+      interpreter { Interpreter(this, 0), Interpreter(this, 1) },
+      ipc(this), memory(this), rtc(this), saveStates(this),
+      spi(this), spu(this),
+      timers { Timers(this, 0), Timers(this, 1) },
+      wifi(this),
+      running(0),
+      lastFpsTimeTicks(0),
+      fpsCount(0)
+{
+    // ------------------------------------------------------------------
+    // Bind task table
+    // ------------------------------------------------------------------
+    tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
+    tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
+
+    tasks[CART9_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 0);
+    tasks[CART7_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 1);
+
+    tasks[DMA9_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[0], 0);
+    tasks[DMA9_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[0], 1);
+    tasks[DMA9_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[0], 2);
+    tasks[DMA9_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[0], 3);
+
+    tasks[DMA7_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[1], 0);
+    tasks[DMA7_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[1], 1);
+    tasks[DMA7_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[1], 2);
+    tasks[DMA7_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[1], 3);
+
+    tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,    &gpu);
+    tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,    &gpu);
+    tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
+    tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
+
+    tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
+
+    tasks[ARM9_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[0]);
+    tasks[ARM7_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[1]);
+
+    tasks[NDS_SPU_SAMPLE]   = SchedCallback(shim_spuSample,    &spu);
+    tasks[GBA_SPU_SAMPLE]   = SchedCallback(shim_spuGbaSample, &spu);
+
+    tasks[TIMER9_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[0], 0);
+    tasks[TIMER9_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[0], 1);
+    tasks[TIMER9_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[0], 2);
+    tasks[TIMER9_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[0], 3);
+
+    tasks[TIMER7_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[1], 0);
+    tasks[TIMER7_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[1], 1);
+    tasks[TIMER7_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[1], 2);
+    tasks[TIMER7_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[1], 3);
+
+    tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs,  &wifi);
+    tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
+    tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
+
+    // ------------------------------------------------------------------
+    // BIOS / firmware loading
+    // ------------------------------------------------------------------
+    bool required = !Settings::directBoot ||
+                    (ndsRom == "" && gbaRom == "" &&
+                     ndsRomFd == -1 && gbaRomFd == -1);
+
+    if (!memory.loadBios9() && required) throw ERROR_BIOS;
+    if (!memory.loadBios7() && required) throw ERROR_BIOS;
+    if (!spi.loadFirmware()  && required) throw ERROR_FIRM;
+    realGbaBios = memory.loadGbaBios();
+
+    // ------------------------------------------------------------------
+    // Initial scheduling
+    // ------------------------------------------------------------------
+    schedule(RESET_CYCLES,    0x7FFFFFFF);
+    schedule(NDS_SCANLINE256, 256 * 6);
+    schedule(NDS_SCANLINE355, 355 * 6);
+    schedule(NDS_SPU_SAMPLE,  512 * 2);
+
+    dsiMode = Settings::dsiMode;
+
+    // ------------------------------------------------------------------
+    // JIT initialisation
+    //
+    // Pass `this` so initJit can immediately hook runFunc.
+    // initJit() must be called before updateRun() so that the first
+    // call to updateRun() already sees jitAvailable == true and can
+    // select the JIT run function.
+    // ------------------------------------------------------------------
+    jitAvailable = JitPpc::initJit(this);   // FIX: was initJit()
+
+    if (jitAvailable)
+        printf("[Core %d] JIT recompiler active\n", id);
+    else
+        printf("[Core %d] JIT unavailable — interpreter only\n", id);
+
+    // updateRun() reads jitAvailable; called after initJit() so the
+    // JIT path is selected immediately.
+    updateRun();
+
+    memory.updateMap9(0x00000000, 0xFFFFFFFF);
+    memory.updateMap7(0x00000000, 0xFFFFFFFF);
+    interpreter[0].init();
+    interpreter[1].init();
+
+    // ------------------------------------------------------------------
+    // GBA ROM
+    // ------------------------------------------------------------------
+    if (gbaRom != "" || gbaRomFd != -1) {
+        if (!cartridgeGba.setRom(gbaRom, gbaRomFd, gbaSaveFd, gbaStateFd, -1))
+            throw ERROR_ROM;
+
+        if (Settings::directBoot && ndsRom == "" && ndsRomFd == -1) {
+            memory.write<uint16_t>(0, 0x4000304, 0x8003);
+            enterGbaMode();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // NDS ROM
+    // ------------------------------------------------------------------
+    if (ndsRom != "" || ndsRomFd != -1) {
+        if (!cartridgeNds.setRom(ndsRom, ndsRomFd, ndsSaveFd, ndsStateFd, ndsCheatFd))
+            throw ERROR_ROM;
+
+        actionReplay.loadCheats();
+
+        if (Settings::directBoot) {
+            cp15.write(1, 0, 0, 0x0005707D);
+            cp15.write(9, 1, 0, 0x0300000A);
+            cp15.write(9, 1, 1, 0x00000020);
+            memory.write<uint8_t> (0,  0x4000247, 0x03);
+            memory.write<uint8_t> (0,  0x4000300, 0x01);
+            memory.write<uint8_t> (1,  0x4000300, 0x01);
+            memory.write<uint16_t>(0,  0x4000304, 0x0001);
+            memory.write<uint16_t>(1,  0x4000504, 0x0200);
+            memory.write<uint32_t>(0,  0x27FF800, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FF804, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FF850, 0x5835);
+            memory.write<uint16_t>(0,  0x27FF880, 0x0007);
+            memory.write<uint16_t>(0,  0x27FF884, 0x0006);
+            memory.write<uint32_t>(0,  0x27FFC00, 0x00001FC2);
+            memory.write<uint32_t>(0,  0x27FFC04, 0x00001FC2);
+            memory.write<uint16_t>(0,  0x27FFC10, 0x5835);
+            memory.write<uint16_t>(0,  0x27FFC40, 0x0001);
+            cartridgeNds.directBoot();
+            interpreter[0].directBoot();
+            interpreter[1].directBoot();
+            spi.directBoot();
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // HLE ARM7
+    // ------------------------------------------------------------------
+    if (!gbaMode && Settings::arm7Hle) {
+        arm7Hle = true;
+        hleArm7.init();
+    }
+
+    lastFpsTimeTicks = PPCGetTickCount();
+
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 1;
+    PPCIrqUnlockByMsr(st);
+}
+
+// ---------------------------------------------------------------------------
+// Destructor
+// ---------------------------------------------------------------------------
+Core::~Core()
+{
+    if (jitAvailable) {
+        JitPpc::shutdownJit(this);   // FIX: was shutdownJit()
+        jitAvailable = false;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// State save / load
+// ---------------------------------------------------------------------------
+void Core::saveState(FILE* file) {
+    fwrite(&arm7Hle,      sizeof(arm7Hle),      1, file);
+    fwrite(&dsiMode,      sizeof(dsiMode),      1, file);
+    fwrite(&gbaMode,      sizeof(gbaMode),      1, file);
+    fwrite(&globalCycles, sizeof(globalCycles), 1, file);
+
+    uint32_t count = static_cast<uint32_t>(events.size());
+    fwrite(&count, sizeof(count), 1, file);
+    for (uint32_t i = 0; i < count; i++)
+        fwrite(&events[i], sizeof(events[i]), 1, file);
+}
+
+void Core::loadState(FILE* file) {
+    fread(&arm7Hle,      sizeof(arm7Hle),      1, file);
+    fread(&dsiMode,      sizeof(dsiMode),      1, file);
+    fread(&gbaMode,      sizeof(gbaMode),      1, file);
+    fread(&globalCycles, sizeof(globalCycles), 1, file);
+
+    events.clear();
+    uint32_t count = 0;
+    fread(&count, sizeof(count), 1, file);
+    SchedEvent event(MAX_TASKS, 0);
+    for (uint32_t i = 0; i < count; i++) {
+        fread(&event, sizeof(event), 1, file);
+        events.push_back(event);
+    }
+
+    if (jitAvailable)
+        JitPpc::flushJitCache();
+
+    updateRun();
+}
+
+// ---------------------------------------------------------------------------
+// updateRun
+// ---------------------------------------------------------------------------
+void Core::updateRun()
+{
+    void (*newFunc)(Core&) = nullptr;
+
+    if (interpreter[0].halted && interpreter[1].halted) {
+        // Both halted: use the no-op loop regardless of JIT availability.
+        newFunc = &Interpreter::runCoreNone;
+    } else if (jitAvailable) {
+        // JIT is available: select JIT wrapper based on current mode.
+        // The JIT wrappers (runJitNds, runJitGba) internally check the
+        // halted flags per-CPU so we don't need per-halted-state variants.
+        if (gbaMode)
+            newFunc = &JitPpc::runJitGba;
+        else
+            newFunc = &JitPpc::runJitNds;
+    }
+
+    // Fallback to interpreter if JIT not available or not applicable.
+    if (!newFunc) {
+        if (gbaMode)
+            newFunc = &Interpreter::runCoreSingle<true, 0>;
+        else if (dsiMode)
+            newFunc = &Interpreter::runCoreDsi;
+        else if (!interpreter[0].halted && !interpreter[1].halted)
+            newFunc = &Interpreter::runCoreNds;
+        else if (interpreter[0].halted)
+            newFunc = &Interpreter::runCoreSingle<true, 1>;
+        else
+            newFunc = &Interpreter::runCoreSingle<false, 0>;
+    }
+
+    runFunc = newFunc;
+
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 0;
+    PPCIrqUnlockByMsr(st);
+}
+
+// ---------------------------------------------------------------------------
+// resetCycles
+// ---------------------------------------------------------------------------
+void Core::resetCycles() {
+    const size_t n = events.size();
+    for (size_t i = 0; i < n; i++)
+        events[i].cycles -= globalCycles;
+
+    for (int i = 0; i < 2; i++) {
+        interpreter[i].resetCycles();
+        timers[i].resetCycles();
+    }
+
+    globalCycles = 0;
+    schedule(RESET_CYCLES, 0x7FFFFFFF);
+}
+
+// ---------------------------------------------------------------------------
+// schedule
+// ---------------------------------------------------------------------------
+void Core::schedule(SchedTask task, uint32_t cycles) {
+    SchedEvent event(task, globalCycles + cycles);
+    auto it = std::upper_bound(events.cbegin(), events.cend(), event);
+    events.insert(it, event);
+}
+
+// ---------------------------------------------------------------------------
+// enterGbaMode
+// ---------------------------------------------------------------------------
+void Core::enterGbaMode() {
+    gbaMode = true;
+
+    interpreter[0].halt(2);
+    interpreter[1].unhalt(2);
+
+    if (jitAvailable)
+        JitPpc::flushJitCache();
+
+    updateRun();
+
+    events.clear();
+    schedule(RESET_CYCLES,    0x7FFFFFFF);
+    schedule(GBA_SCANLINE240, 240 * 4);
+    schedule(GBA_SCANLINE308, 308 * 4);
+    schedule(GBA_SPU_SAMPLE,  512);
+
+    memory.updateMap7(0x00000000, 0xFFFFFFFF);
+    interpreter[1].init();
+    rtc.reset();
+
+    memory.write<uint8_t>(0, 0x4000240, 0x80);
+    memory.write<uint8_t>(0, 0x4000241, 0x80);
+
+    if (realGbaBios) {
+        interpreter[1].bios = nullptr;
+        return;
+    }
+
+    interpreter[1].bios = &hleBios[2];
+    interpreter[1].directBoot();
+    memory.write<uint16_t>(1, 0x4000088, 0x200);
+}
+
+// ---------------------------------------------------------------------------
+// endFrame
+// ---------------------------------------------------------------------------
+void Core::endFrame() {
+    PPCIrqState st = PPCIrqLockByMsr();
+    running = 0;
+    PPCIrqUnlockByMsr(st);
+
+    fpsCount++;
+
+    if (arm7Hle)
+        hleArm7.runFrame();
+
+    uint64_t now     = PPCGetTickCount();
+    uint64_t elapsed = now - lastFpsTimeTicks;
+    if (elapsed >= PPCMsToTicks(1000)) {
+        fps              = fpsCount;
+        fpsCount         = 0;
+        lastFpsTimeTicks = now;
+    }
+
+    if (wifi.shouldSchedule())
+        wifi.scheduleInit();
+}
+
+// ---------------------------------------------------------------------------
+// invalidateJitPage
+// ---------------------------------------------------------------------------
+void Core::invalidateJitPage(uint32_t addr)
+{
+    if (!jitAvailable) return;
+    uint32_t pageStart = addr & ~0xFFFu;
+    JitPpc::invalidateJitRange(pageStart, pageStart + 0x1000u);
+}
+```
+
+The three changes in summary:
+
+| File | Line | Was | Now |
+|------|------|-----|-----|
+| `core.cpp` | 185 | `JitPpc::initJit()` | `JitPpc::initJit(this)` |
+| `core.cpp` | 267 | `JitPpc::shutdownJit()` | `JitPpc::shutdownJit(this)` |
+| `jit_ppc.h` | — | no overloads | `inline bool initJit()` and `inline void shutdownJit()` added |
+
+The `updateRun()` simplification also removes the now-unnecessary `pickJitFunc` helper since `runJitNds` and `runJitGba` already handle the halted-per-CPU logic internally by checking `interpreter[i].halted` before dispatching each block.
+
+
