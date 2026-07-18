@@ -1,0 +1,526 @@
+Yes — but first, an important correction to my previous answer:
+
+**Do not change `ppc_bc(12, 2, ...)` to `ppc_bc(4, 2, ...)`.**  
+On PowerPC:
+
+- `BO = 12`, `BI = 2` is `beq cr0`
+- `BO = 4`, `BI = 2` is `bne cr0`
+
+Your existing comments and branch encodings in `emitSyncFrom()` / `emitCondSkip()` are correct.
+
+The much more serious bug visible in your JIT is the **Thumb dispatcher**. It currently decodes large parts of Thumb instruction space incorrectly.
+
+For example:
+
+- `0x2000` (`MOVS r0, #imm`) is incorrectly sent to `emitT_alu()`.
+- `0x3000` (`ADDS r0, #imm`) is incorrectly sent to `emitT_memReg()`.
+- `0x4000` ALU instructions are partially decoded as memory operations.
+- `0x5000` register-offset load/store is the only range that should call `emitT_memReg()`.
+
+That absolutely can explain GBA boot reaching the logo and then falling apart once the ROM starts running Thumb initialization code.
+
+Below is a concrete patch.
+
+---
+
+## 1. Replace `dispThumb()` completely
+
+Replace your current `dispThumb()` with this:
+
+```cpp
+static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    /*
+     * Thumb-1 instruction groups:
+     *
+     * 00000-00010 : move shifted register
+     * 00011       : add/subtract register/immediate3
+     * 001xx       : MOV/CMP/ADD/SUB immediate8
+     * 010000      : ALU operations
+     * 010001      : high-register operations / BX
+     * 01001       : LDR literal
+     * 0101        : register-offset load/store
+     * 0110        : word immediate load/store
+     * 0111        : byte immediate load/store
+     * 1000        : halfword immediate load/store
+     * 1001        : SP-relative load/store
+     * 1010        : ADD Rd, PC/SP, #imm
+     * 1011        : misc / stack operations
+     * 1100        : LDMIA / STMIA
+     * 1101        : conditional branch / SWI
+     * 11100       : unconditional branch
+     * 11110/11111 : BL prefix/suffix
+     * 11101       : BLX suffix
+     */
+
+    /* 000xxxxx xxxxxxxx: shifts and add/sub. */
+    if ((op & 0xE000) == 0x0000) {
+        /*
+         * 00000 / 00001 / 00010 = LSL/LSR/ASR immediate.
+         * 00011                    = ADD/SUB register/immediate3.
+         */
+        if ((op & 0x1800) != 0x1800)
+            return emitT_shifts(ctx, op);
+
+        return emitT_addSub3(ctx, op);
+    }
+
+    /* 001xxxxx xxxxxxxx: MOV/CMP/ADD/SUB immediate8. */
+    if ((op & 0xE000) == 0x2000)
+        return emitT_imm8(ctx, op);
+
+    /* 010000xxxxxxxxxx: Thumb ALU operations. */
+    if ((op & 0xFC00) == 0x4000)
+        return emitT_alu(ctx, op);
+
+    /* 010001xxxxxxxxxx: high register operation / BX / BLX register. */
+    if ((op & 0xFC00) == 0x4400)
+        return emitT_hiReg(ctx, op, curPC);
+
+    /* 01001xxxxxxxxxxx: LDR Rd, [PC, #imm]. */
+    if ((op & 0xF800) == 0x4800)
+        return emitT_ldrPc(ctx, op, curPC);
+
+    /* 0101xxxxxxxxxxxx: register-offset load/store. */
+    if ((op & 0xF000) == 0x5000)
+        return emitT_memReg(ctx, op);
+
+    /*
+     * 0110: STR/LDR word immediate
+     * 0111: STRB/LDRB immediate
+     * 1000: STRH/LDRH immediate
+     */
+    if ((op & 0xE000) == 0x6000 ||
+        (op & 0xF000) == 0x8000)
+        return emitT_memImm(ctx, op);
+
+    /* 1001: STR/LDR SP-relative. */
+    if ((op & 0xF000) == 0x9000)
+        return emitT_spLoad(ctx, op, curPC);
+
+    /* 1010: ADD Rd, PC/SP, #imm. */
+    if ((op & 0xF000) == 0xA000)
+        return emitT_addSpPc(ctx, op, curPC);
+
+    if ((op & 0xF000) == 0xB000) {
+        /*
+         * 1011 0000: ADD/SUB SP, #imm
+         * 1011 010x: PUSH
+         * 1011 110x: POP
+         */
+        if ((op & 0xFF00) == 0xB000 ||
+            (op & 0xFF00) == 0xB080)
+            return emitT_addSpPc(ctx, op, curPC);
+
+        if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6)
+            return emitT_pushPop(ctx, op, curPC);
+
+        /*
+         * Other 0xBxxx instructions include:
+         *   SXTH/SXTB/UXTH/UXTB
+         *   REV/REV16/REVSH
+         *   BKPT
+         *   CPS
+         *
+         * Let the interpreter handle those for now.
+         */
+        return false;
+    }
+
+    /* 1100: STMIA/LDMIA. */
+    if ((op & 0xF000) == 0xC000)
+        return emitT_ldmStm(ctx, op);
+
+    /* 1101: conditional branch / SWI. */
+    if ((op & 0xF000) == 0xD000)
+        return emitT_branch(ctx, op, curPC);
+
+    /*
+     * 1110:
+     *   11100 = unconditional B
+     *   11101 = BLX suffix
+     *
+     * emitT_branch deliberately rejects BLX suffixes, which is correct:
+     * compile() consumes a BL/BLX pair together.
+     */
+    if ((op & 0xF000) == 0xE000)
+        return emitT_branch(ctx, op, curPC);
+
+    /*
+     * 1111:
+     * BL prefix / suffix.  compile() recognizes a complete pair before
+     * calling dispThumb().  A lone half must fall back to the interpreter.
+     */
+    return false;
+}
+```
+
+This is the highest-priority fix.
+
+---
+
+## 2. Fix the Thumb SP-adjust decoder
+
+Your existing `emitT_addSpPc()` has this:
+
+```cpp
+uint8_t s = (op >> 8) & 0xF;
+if (s == 0) {
+```
+
+That is too broad and does not properly distinguish the Thumb `ADD/SUB SP, #imm` format.
+
+Replace the full function with:
+
+```cpp
+static bool emitT_addSpPc(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    /*
+     * 1010 Rd imm8:
+     *   ADD Rd, PC, #imm
+     *   ADD Rd, SP, #imm
+     *
+     * 1011 0000 0iiiiiii:
+     *   ADD SP, #imm
+     *
+     * 1011 0000 1iiiiiii:
+     *   SUB SP, #imm
+     */
+
+    /* ADD Rd, PC/SP, #imm */
+    if ((op & 0xF000) == 0xA000) {
+        const uint8_t rd = (op >> 8) & 7;
+        const bool fromSp = (op & 0x0800) != 0;
+        const uint32_t imm = (uint32_t)(op & 0xFF) << 2;
+
+        if (fromSp) {
+            ctx.li(TA, imm);
+            ctx.E(ppc_add(RA[rd], RA[13], TA));
+        } else {
+            ctx.li(RA[rd], ((curPC + 4) & ~3u) + imm);
+        }
+        return true;
+    }
+
+    /* ADD/SUB SP, #imm */
+    if ((op & 0xFF00) == 0xB000 ||
+        (op & 0xFF00) == 0xB080) {
+        const bool sub = (op & 0x0080) != 0;
+        const uint32_t imm = (uint32_t)(op & 0x7F) << 2;
+
+        ctx.li(TA, imm);
+
+        if (sub)
+            ctx.E(ppc_subf(RA[13], TA, RA[13]));
+        else
+            ctx.E(ppc_add(RA[13], RA[13], TA));
+
+        return true;
+    }
+
+    return false;
+}
+```
+
+---
+
+## 3. Fix Thumb `ROR` flags or fall back
+
+Your current Thumb ALU `ROR` implementation does not correctly set carry:
+
+```cpp
+case 7:
+    ctx.E(ppc_subfic(TA, s, 32));
+    ctx.E(ppc_rlwnm(d, d, TA, 0, 31));
+    setNZ(ctx, d);
+    break;
+```
+
+This is unsafe because GBA code often uses `ROR` followed by carry-dependent operations.
+
+The simplest correctness-first fix is to refuse JIT compilation for Thumb register ROR until you implement exact ARM carry semantics.
+
+In `emitT_alu()`, replace case `7` with:
+
+```cpp
+case 7:
+    /*
+     * ROR Rd, Rs:
+     * Carry behavior depends on Rs[4:0], including the zero-shift case.
+     * Use the interpreter until this is implemented exactly.
+     */
+    return false;
+```
+
+That is slower for instructions using `ROR`, but correct.
+
+---
+
+## 4. Fix the `JitHelp_commit()` high-PC rejection
+
+This code is unsafe:
+
+```cpp
+if (pc >= 0x80000000u) {
+    g_exitReason[cpu] = EXIT_FALLBACK;
+    return -1;
+}
+```
+
+ARM9 BIOS lives at `0xFFFF0000`, which is a valid guest PC in NDS mode. Rejecting every address above `0x80000000` is wrong.
+
+Replace it with:
+
+```cpp
+int JitHelp_commit(Interpreter* interp, int cpu,
+                   uint32_t* regs, uint32_t cpsr,
+                   uint32_t pc, int reason) {
+    if (!interp || !regs || cpu < 0 || cpu > 1)
+        return -1;
+
+    uint32_t** p = interp->getRegisters();
+    if (!p)
+        return -1;
+
+    for (int i = 0; i < 15; i++) {
+        if (!p[i])
+            return -1;
+
+        *p[i] = regs[i];
+    }
+
+    interp->getCpsrRef() = cpsr;
+
+    g_exitPC[cpu]     = pc;
+    g_exitCPSR[cpu]   = cpsr;
+    g_exitReason[cpu] = reason;
+
+    if (reason == EXIT_NORMAL)
+        interp->setPC(pc);
+
+    return 0;
+}
+```
+
+Your existing `validPC()` checks already decide whether the JIT can compile/execute a PC. `JitHelp_commit()` should only commit machine state.
+
+---
+
+## 5. Make JIT buffer ownership correct
+
+At present, `initJit()` allocates with `memalign()` but `shutdownJit()` never frees the original allocation. Also, `codeBuf` can be a cached alias rather than the pointer returned by `memalign()`, so you must retain the original pointer for `free()`.
+
+Add this beside your globals:
+
+```cpp
+static void*     codeBufRaw = nullptr;
+static uint32_t* codeBuf    = nullptr;
+```
+
+Then modify `initJit()`:
+
+```cpp
+bool initJit(Core* core) {
+    g_jitLive = false;
+    codeBuf = nullptr;
+    codeBufRaw = nullptr;
+
+    void* raw = memalign(32, JIT_BYTES);
+    if (!raw) {
+        printf("[JIT] memalign failed\n");
+        return false;
+    }
+
+    uintptr_t addr = (uintptr_t)raw;
+
+    bool ok = (addr >= 0x80000000u &&
+               addr + JIT_BYTES <= 0x81800000u);
+
+    if (!ok && addr < 0x01800000u) {
+        addr |= 0x80000000u;
+        ok = (addr + JIT_BYTES <= 0x81800000u);
+    } else if (!ok && addr >= 0xC0000000u && addr < 0xC1800000u) {
+        addr -= 0x40000000u;
+        ok = (addr + JIT_BYTES <= 0x81800000u);
+    }
+
+    if (!ok) {
+        printf("[JIT] not in MEM1: %p\n", raw);
+        free(raw);
+        return false;
+    }
+
+    uintptr_t tr = (uintptr_t)(void*)executeBlock_asm;
+    if (tr < 0x80000000u || tr >= 0x81800000u) {
+        printf("[JIT] bad trampoline %p\n", (void*)tr);
+        free(raw);
+        return false;
+    }
+
+    codeBufRaw = raw;
+    codeBuf = reinterpret_cast<uint32_t*>(addr);
+
+    codePos = 0;
+    cacheGen = 1;
+    g_dbgFB = 0;
+    g_trace = 0;
+
+    for (size_t i = 0; i < CSIZ; i++)
+        cache[i].valid = false;
+
+    memset(g_exitPC, 0, sizeof(g_exitPC));
+    memset(g_exitCPSR, 0, sizeof(g_exitCPSR));
+
+    g_exitReason[0] = EXIT_NORMAL;
+    g_exitReason[1] = EXIT_NORMAL;
+
+    memset(codeBuf, 0, JIT_BYTES);
+    DCFlushRange(codeBuf, JIT_BYTES);
+    ICInvalidateRange(codeBuf, JIT_BYTES);
+
+    g_jitLive = true;
+
+    printf("[JIT] ready buf=%p raw=%p (%zuKB) tramp=%p BLK_ARMS=%zu\n",
+           (void*)codeBuf,
+           codeBufRaw,
+           JIT_BYTES >> 10,
+           (void*)tr,
+           BLK_ARMS);
+
+    if (core)
+        core->setRunFunc(core->gbaMode ? runJitGba : runJitNds);
+
+    return true;
+}
+```
+
+Then replace `shutdownJit()` with:
+
+```cpp
+void shutdownJit(Core* core) {
+    g_jitLive = false;
+
+    if (core) {
+        core->setRunFunc(
+            core->gbaMode
+                ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
+                : &Interpreter::runCoreNds
+        );
+    }
+
+    for (size_t i = 0; i < CSIZ; i++)
+        cache[i].valid = false;
+
+    codePos = 0;
+
+    if (codeBufRaw) {
+        free(codeBufRaw);
+        codeBufRaw = nullptr;
+    }
+
+    codeBuf = nullptr;
+}
+```
+
+---
+
+## 6. Add useful fallback tracing
+
+Add this near the JIT globals:
+
+```cpp
+static uint32_t g_dbgFallback = 0;
+static uint32_t g_dbgNormal   = 0;
+```
+
+Then update `runCpu()`:
+
+```cpp
+if (reason == EXIT_FALLBACK) {
+    if (g_dbgFallback++ < 128) {
+        printf("[JIT] fallback cpu=%d mode=%s pc=%08X next=%08X cpsr=%08X\n",
+               cpu,
+               gba ? "gba" : "nds",
+               pc,
+               expc,
+               interp.getCpsrRef());
+    }
+
+    if (validPC(expc, gba))
+        interp.setPC(expc);
+
+    interp.jitRunOpcode();
+    return;
+}
+
+if (g_dbgNormal++ < 32) {
+    printf("[JIT] normal cpu=%d mode=%s pc=%08X -> %08X\n",
+           cpu,
+           gba ? "gba" : "nds",
+           pc,
+           expc);
+}
+```
+
+This will immediately tell you whether:
+
+1. The JIT is compiling Thumb blocks.
+2. It is falling back because of unsupported instructions.
+3. PC becomes corrupt before or after the JIT block.
+4. GBA execution reaches ROM at `0x08000000`.
+
+---
+
+## 7. Keep these PowerPC branches unchanged
+
+These are correct and should remain exactly as they are:
+
+```cpp
+ctx.E(ppc_bc(12, 2, 8)); // beq
+```
+
+and:
+
+```cpp
+ctx.base[idx] = ppc_bc(12, 2, (int16_t)off); // beq
+```
+
+Your PPC branch helper is fine:
+
+```cpp
+static inline uint32_t ppc_bc(uint8_t bo, uint8_t bi, int16_t off, bool lk = false) {
+    return (16u << 26) | ((bo & 31u) << 21) | ((bi & 31u) << 16) |
+           ((uint32_t)(off & 0xFFFC)) | (lk ? 1u : 0u);
+}
+```
+
+For your use case:
+
+```cpp
+ppc_bc(12, 2, offset)
+```
+
+means effectively:
+
+```asm
+beq cr0, target
+```
+
+which is what your code intends.
+
+---
+
+## Expected result after this patch
+
+The expected immediate improvements are:
+
+- GBA games should get past the boot logo more reliably.
+- Thumb-heavy GBA startup code should stop being decoded as unrelated ALU or memory instructions.
+- NDS ARM7 Thumb code should no longer corrupt registers/PC due to bad dispatch.
+- `0x00007FFF` / `0x0000800x` invalid reads should become much less common.
+- You should see valid JIT traces around:
+  - GBA ROM: `08000000`+
+  - GBA IWRAM: `03000000`+
+  - GBA EWRAM: `02000000`+
+  - NDS ARM7 RAM: `03800000`+
+  - NDS ARM9 RAM: `02000000`+
+
+The next correctness issue after this is cycle scheduling: `JitHelp_tick(..., 64)` is fixed-rate rather than instruction-accurate, which can break timers, DMA, audio, and VBlank-sensitive code. But the Thumb decoder must be fixed first, because it can directly execute the wrong instruction semantics.
