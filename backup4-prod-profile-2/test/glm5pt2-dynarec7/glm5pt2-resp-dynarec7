@@ -1,0 +1,162 @@
+# Root Cause: Inverted Branch Conditions
+
+After careful analysis, the primary bug is in three `ppc_bc` calls that use **BO=12** (branch‑if‑CR‑bit‑is‑0, i.e. *bne*) where **BO=4** (branch‑if‑CR‑bit‑is‑1, i.e. *beq*) was intended. This inverts every conditional in the JIT:
+
+* `emitSyncFrom` — when `JitHelp_syncFrom` returns 0 (success), `EQ=1`, but `bc 12,2,+8` is *not taken*, so the success path is skipped and the block returns via the fail epilogue **without ever running compiled code**. The JIT is effectively a no‑op that always falls back.
+* `emitCondSkip` / `patchSkip` — the body of every conditional ARM/Thumb instruction is **skipped when the condition is TRUE** and **executed when FALSE**. This corrupts boot logic and sends PC into wild places (explaining the `0x00007fff` reads — the ARM7 BIOS tail is being fetched because inverted conditionals cause a wild branch near reset).
+
+## The Fix
+
+### 1. `emitSyncFrom` — change BO 12→4
+
+```cpp
+static void emitSyncFrom(Ctx& ctx) {
+    ctx.ldInterp();
+    ctx.E(ppc_addi(TB, 1, (int16_t)FRAME_REGSYNC));
+    ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_CPSR));
+    ctx.call((void*)JitHelp_syncFrom);
+
+    ctx.E(ppc_cmpi(0, TA, 0));
+    ctx.E(ppc_bc(4, 2, 8));               // <-- was 12,2  (beq +8 → success)
+    size_t bFail = ctx.sz();
+    ctx.E(ppc_b(0));
+
+    for (int i = 0; i < 15; i++)
+        ctx.E(ppc_lwz(RA[i], FRAME_REGSYNC + i * 4, 1));
+    ctx.E(ppc_lwz(RCPSR, FRAME_CPSR, 1));
+    size_t bBody = ctx.sz();
+    ctx.E(ppc_b(0));
+
+    {
+        int32_t d = (int32_t)((ctx.sz() - bFail) * 4);
+        ctx.base[bFail] = ppc_b(d);
+    }
+    emitEpilogue(ctx);
+
+    {
+        int32_t d = (int32_t)((ctx.sz() - bBody) * 4);
+        ctx.base[bBody] = ppc_b(d);
+    }
+}
+```
+
+### 2. `emitCondSkip` — change BO 12→4
+
+```cpp
+static size_t emitCondSkip(Ctx& ctx, uint8_t cond) {
+    if (cond == 14 || cond == 15) return SIZE_MAX;
+    ctx.E(ppc_mr(TA, RCPSR));
+    ctx.E(ppc_addi(TB, 0, (int16_t)cond));
+    ctx.call((void*)JitHelp_testCond);
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t idx = ctx.sz();
+    ctx.E(ppc_bc(4, 2, 0));               // <-- was 12,2  (beq after_body)
+    return idx;
+}
+```
+
+### 3. `patchSkip` — change BO 12→4
+
+```cpp
+static void patchSkip(Ctx& ctx, size_t idx) {
+    if (idx == SIZE_MAX) return;
+    int32_t off = (int32_t)((ctx.sz() - idx) * 4);
+    if (off < -32768 || off > 32764) {
+        ctx.overflow = true;
+        return;
+    }
+    ctx.base[idx] = ppc_bc(4, 2, (int16_t)off);   // <-- was 12,2
+}
+```
+
+### Why this works
+
+`ppc_cmpi(0, TA, 0)` sets `CR0.EQ = (TA == 0)`. `JitHelp_testCond` returns 1 when the ARM condition is true, 0 when false. So:
+
+| Condition | TA | EQ | want branch? | BO=4 (beq) | BO=12 (bne) |
+|-----------|----|----|--------------|------------|-------------|
+| true      | 1  | 0  | no (run body) | not taken ✓ | taken ✗ |
+| false     | 0  | 1  | yes (skip body)| taken ✓ | not taken ✗ |
+
+With BO=12 the logic was exactly inverted. After the fix, conditional ARM/Thumb instructions and the `syncFrom` success/fail path behave correctly.
+
+---
+
+# Secondary Issues (fix after the main fix is verified)
+
+## A. `JitHelp_commit` rejects legitimate ARM9 BIOS PCs
+
+```cpp
+if (pc >= 0x80000000u) {
+    g_exitReason[cpu] = EXIT_FALLBACK;
+    return -1;
+}
+```
+
+This was a safety net against wild JIT PCs landing in MEM1, but it also rejects `0xFFFF0000`‑region ARM9 BIOS code and any high mirror. If a game ever branches into ARM9 BIOS (rare with direct boot, but possible with HLE SWI hand‑back paths), the block silently downgrades to FALLBACK forever. Restrict the check to the JIT buffer range instead:
+
+```cpp
+extern uint32_t* codeBuf;
+extern size_t    JIT_WORDS;
+...
+if (pc >= (uint32_t)(uintptr_t)codeBuf &&
+    pc <  (uint32_t)(uintptr_t)(codeBuf + JIT_WORDS)) {
+    g_exitReason[cpu] = EXIT_FALLBACK;
+    return -1;
+}
+```
+
+## B. Thumb ALU `ROR` (case 7) doesn't update C
+
+```cpp
+case 7:
+    ctx.E(ppc_subfic(TA, s, 32));
+    ctx.E(ppc_rlwnm(d, d, TA, 0, 31));
+    setNZ(ctx, d);
+    break;
+```
+
+ARM `ROR Rs` updates C to the last bit shifted out (bit `Rs[4:0]-1` of the source; unchanged if shift==0). Add at least the shift==0 special case and a best‑effort C extraction, or fall back to the interpreter for register‑shift ROR if exact C matters for the game. Many GBA games probe C after `ROR Rm, Rs`, so this is worth getting right.
+
+## C. Per‑instruction cycle accounting
+
+Currently every `runJitNds` tick advances `globalCycles` by 64 regardless of what actually ran. FALLBACK paths run one interpreter instruction and pay zero cycles. Once the main fix lands and BLK_ARMS goes up, add a per‑block cycle accumulator in the prologue/commit (e.g. emit `JitHelp_tick(core, n)` with `n = BLK_ARMS` or the interpreter's returned cycle count for FALLBACK), so the scheduler doesn't drift.
+
+## D. Raise BLK_ARMS once stable
+
+```cpp
+static const size_t BLK_ARMS = 1;        // bump to 16–24 after verification
+static const size_t BLK_WDS  = BLK_ARMS * 280 + 128;
+```
+
+With conditionals fixed, longer blocks become safe. Each block ends naturally on branch/BX/BL/load‑PC anyway, so 16 is a good starting point.
+
+## E. `runJitNds` does not honour CPU halts the way the interpreter does
+
+`Core::updateRun()` is only re‑called when halt state *changes*. If only one CPU is unhalted you still iterate both and skip the halted one inside `runCpu` — that's fine — but you still bill 64 cycles per slice. With both halted, `runCoreNone` is selected, so the JIT path isn't even entered. Just be aware that a one‑sided halt under‑accounts cycles for the still‑running CPU; consider scaling `CYCLES_PER_SLICE` by how many CPUs actually ran.
+
+---
+
+# Verifying the fix
+
+After applying changes 1–3, the symptoms should resolve as follows:
+
+* **NDS white screen / 5–15 FPS** — the JIT was doing nothing; every block returned via the fail epilogue and `runCpu` fell through to one interpreter instruction per block. After the fix, compiled blocks actually execute and the emulator should reach the game's main loop within a second or two.
+* **GBA black screen after logo** — the logo is drawn by the HLE BIOS / boot ROM which runs mostly via FALLBACK; once game code in ROM starts executing with correct conditionals, it should proceed past initialization.
+* **`Invalid read from 0x00007fff`** — these came from PC going wild because inverted conditionals mis‑routed the ARM7 boot stub. With conditionals correct, PC stays in valid ranges.
+
+Add a temporary trace in `runCpu` to confirm blocks are now taking the NORMAL path more often than FALLBACK:
+
+```cpp
+if (reason == EXIT_FALLBACK) {
+    static int fb = 0;
+    if (fb++ < 32) printf("[JIT] FALLBACK cpu%d pc=%08X\n", cpu, expc);
+    ...
+}
+```
+
+You should see FALLBACK counts drop sharply and only appear for genuinely unsupported opcodes (SWI, MRS/MSR with mode field, etc.).
+=====
+Can you implement this for me in full?
+
+Got intercepted by mystery AI A-B
