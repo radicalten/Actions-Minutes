@@ -301,6 +301,13 @@ int JitHelp_commit(Interpreter* interp, int cpu,
     if (!interp || !regs || cpu < 0 || cpu > 1)
         return -1;
 
+    // Safety net: prevent JIT from jumping into Wii MEM1 (PPC code/data)
+    // This catches any JIT miscalculation before it corrupts the interpreter state.
+    if (pc >= 0x80000000u && pc < 0x81800000u) {
+        g_exitReason[cpu] = EXIT_FALLBACK;
+        return -1;
+    }
+
     uint32_t** p = interp->getRegisters();
     if (!p) return -1;
 
@@ -529,27 +536,23 @@ static void emitSyncFrom(Ctx& ctx) {
     ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_CPSR));
     ctx.call((void*)JitHelp_syncFrom);
 
-    // r3 == 0 → success
     ctx.E(ppc_cmpi(0, TA, 0));
-    ctx.E(ppc_bc(12, 2, 8)); // beq +8 → success
+    ctx.E(ppc_bc(12, 2, 8)); // beq +8 -> success
     size_t bFail = ctx.sz();
-    ctx.E(ppc_b(0));         // → fail
+    ctx.E(ppc_b(0));         // -> fail
 
-    // success: load guest regs
     for (int i = 0; i < 15; i++)
         ctx.E(ppc_lwz(RA[i], FRAME_REGSYNC + i * 4, 1));
     ctx.E(ppc_lwz(RCPSR, FRAME_CPSR, 1));
     size_t bBody = ctx.sz();
-    ctx.E(ppc_b(0));         // → body
+    ctx.E(ppc_b(0));         // -> body
 
-    // fail: leave guest alone, return to host (reason stays default FALLBACK)
     {
         int32_t d = (int32_t)((ctx.sz() - bFail) * 4);
         ctx.base[bFail] = ppc_b(d);
     }
     emitEpilogue(ctx);
 
-    // body
     {
         int32_t d = (int32_t)((ctx.sz() - bBody) * 4);
         ctx.base[bBody] = ppc_b(d);
