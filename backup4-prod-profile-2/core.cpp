@@ -10,6 +10,7 @@ extern "C" {
 
 #include "core.h"
 #include "jit_ppc.h"
+#include "debug_log.h"
 
 extern void* Noods_MEM2_Alloc(size_t size);
 extern void  Noods_MEM2_Free(void* ptr);
@@ -230,6 +231,10 @@ void Core::updateRun() {
             newFunc = &Interpreter::runCoreSingle<false, 0>;
     }
 
+    DebugLogStatus("[STATUS] updateRun: jitAvail=%d gba=%d dsi=%d halt0=%d halt1=%d -> func=%p\n",
+        jitAvailable, gbaMode, dsiMode, interpreter[0].halted, interpreter[1].halted,
+        (void*)newFunc);
+
     runFunc = newFunc;
 
     PPCIrqState st = PPCIrqLockByMsr();
@@ -296,6 +301,18 @@ void Core::endFrame() {
     PPCIrqUnlockByMsr(st);
 
     fpsCount++;
+
+    static int hbCounter = 0;
+    if (++hbCounter >= 30) {
+        hbCounter = 0;
+        DebugLogStatus(
+            "[STATUS] fps=%d cycles=%u pc0=%08X pc1=%08X halt0=%d halt1=%d gba=%d dsi=%d\n",
+            fps, globalCycles,
+            interpreter[0].isReady() ? interpreter[0].getActualPC() : 0xFFFFFFFFu,
+            interpreter[1].isReady() ? interpreter[1].getActualPC() : 0xFFFFFFFFu,
+            interpreter[0].halted, interpreter[1].halted,
+            (int)gbaMode, (int)dsiMode);
+    }
 
     if (arm7Hle)
         hleArm7.runFrame();
