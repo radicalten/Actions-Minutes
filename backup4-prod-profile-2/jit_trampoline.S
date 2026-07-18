@@ -10,9 +10,7 @@ executeBlock_asm:
     stw     %r31, 28(%r1)
     stw     %r30, 24(%r1)
 
-    # Force cached alias: set bit 31 of r3
-    oris    %r3, %r3, 0x8000
-
+    /* r3 = blockCode (guaranteed 0x80xxxxxx cached pointer) */
     mtctr   %r3
     bctrl
 
