@@ -59,3 +59,9 @@ CR 49000999 CTR 800644C4 XER 00000000
 STACK DUMP:
 0x80740e84 --> 00000000
 
+##reached the token limit with fix5 will probably do well as the basis fo dynarec 7 tbh behavior same as before with all games booting without crashing, getting stuck on white screen. some like emerald having invalid reads. and the fps counter is slower now at 5-7fps instead. 
+
+all the behavior is the same with the stuck screens. except now I get: Invalid read from 0x00007fff, PC = 0x800ebef4, Invalid read from 0x00008001, PC = 0x800ebe04, Invalid read from 0x00008000, PC = 0x800ebe08, Invalid read from 0x00008003, PC = 0x800ebe04, Invalid read from 0x00008002, PC = 0x800ebe08, Invalid read from 0x00008005, PC = 0x800ebe04
+
+
+
