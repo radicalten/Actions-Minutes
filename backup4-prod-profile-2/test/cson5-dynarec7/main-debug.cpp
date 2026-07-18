@@ -597,7 +597,9 @@ static void InitializeNDS() {
     InitializeSettings();
 
     if (fatInitDefault()) {
-        UpdateFileBrowser(currentDir);
+    DebugLog_Init();
+    DebugLog("FAT mounted, logging started\n");
+    UpdateFileBrowser(currentDir);
     }
 
     const size_t sz = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * sizeof(uint32_t);
