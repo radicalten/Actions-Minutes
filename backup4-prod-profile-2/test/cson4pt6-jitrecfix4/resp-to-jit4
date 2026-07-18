@@ -7687,3 +7687,289 @@ The three bugs fixed and their exact connection to your symptoms:
 | ISI at `0x000E2B04` every run | `JitBlock& slot = cache[bkt]` reference was taken BEFORE `flushJitCache()`, which zeros `codePos` and clears all slots. The old reference still pointed to the same memory location. The block was then written at `codeBuf+0` but `slot.code` was set to `codeBuf+0` which on the next iteration appeared valid because `slot.valid` was still whatever garbage was in that cache entry from before — or alternatively the new block at position 0 was correctly written but then immediately evicted when the next compile call found the buffer nearly full again | `compile()` now re-derives `slot = cache[bkt]` by index AFTER the `flushJitCache()` call, ensuring the write always goes to the correct, freshly-cleared slot |
 | GBA logo regression / no boot | Previous version excluded `pc < 4` from GBA valid range, which blocked the HLE BIOS entry at `0x00000000`. But the real problem was `isReady()` checking `pcData` which can be set before the memory map is fully wired, allowing `getActualPC()` to return 0 and `compile()` to build a block for address 0 using zeroed-out memory | `validPC` for GBA now explicitly excludes address 0 (`pc >= 4u`) so the HLE BIOS entry point always falls through to the interpreter; `isReady()` correctly uses `pcData != nullptr` which is only set by `flushPipeline()` inside `setPC()` inside `init()` |
 | Sequential reads `0x1/0x0, 0x3/0x2...` | When `getActualPC()` returned 0 (before init), `validPC(0, gba=true)` returned true (BIOS range), so `compile()` read Thumb opcodes from address 0, 2, 4... via `memory.read<uint16_t>` which returned the open-bus/uninitialised values producing the sequential address pattern in the error log | Blocked by the combination of `isReady()` check in the run loop and the `pc >= 4u` exclusion in `validPC` for GBA mode |
+
+=============
+
+Ok the GBA boot logo is back but now gba emerald has this crash:
+GPR07 8052F120 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80358280
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+
+The crash is still `PC = LR = 0x000E2B04`, `CTR = 0`. This is the exact same ISI — the PPC CPU is jumping to an ARM address as if it were PPC code. The GBA boot logo working now confirms `isReady()` and `validPC` are correct.
+
+Since the generation check and slot re-derivation are in place, the only remaining way to get `executeBlock_asm` called with an ARM address is if `b->code` itself contains an ARM PC value. Let me trace exactly how this happens:
+
+`0x000E2B04` is in the range `0x08000000..0x0DFFFFFFF`? No — `0x000E2B04` is NOT in GBA ROM range. It is between BIOS (`0x0..0x3FFF`) and EWRAM (`0x02000000+`). This address is **not** in any valid GBA memory region, so `validPC` rejects it. But `compile()` is still being called with it — meaning `interp.getActualPC()` is returning `0x000E2B04 + 8 = 0x000E2B0C` as `*registers[15]`, which means PC was set to `0x000E2B04`.
+
+`0x000E2B04` is the ARM7 entry point of the NDS7 BIOS / firmware stub that runs in GBA mode. When the GBA HLE BIOS calls `SWI 0` (soft reset) or returns from a game, it jumps to this address. The interpreter handles this correctly via the HLE BIOS machinery, but the JIT is calling `setPC(0x000E2B04)` — which writes this ARM address into `*registers[15]`, and then on the next frame `getActualPC()` returns it, `isGoodPC` rejects it (correct), `interpStep` is called, but the interpreter's `runOpcode()` then jumps to `0x000E2B04` which is handled by HLE... except something is calling `executeBlock_asm` with this value directly.
+
+The real bug: **`interp.setPC(exitPC)` is being called with `exitPC = 0x000E2B04` from a JIT block exit, and then on the very next call `getActualPC()` returns `0x000E2B04 - 8 = 0x000E2AFC`, which passes `validPC` for NDS (it's below `0x4000` — wait, no, `0x000E2AFC` is NOT below `0x4000`)**. 
+
+Actually `0x000E2AFC` is `~930KB`. It's not in any valid region. So `isGoodPC` should reject it. But GBA mode uses `validPC(pc, true)` — and `0x000E2AFC` is not in GBA ROM (`0x08000000+`), not EWRAM, not IWRAM, not BIOS. So it IS rejected. Then `interpStep` runs. `interpStep` calls `jitRunOpcode()` which calls `runOpcode()`.
+
+The problem is `runOpcode()` reads `pipeline[0]`, advances PC, etc. — it operates on the current pipeline state. After `setPC(0x000E2B04)` was called (which called `flushPipeline()`), the pipeline was refilled from address `0x000E2B04`. `runOpcode()` executes that opcode correctly through the interpreter. But then the JIT run loop calls `getActualPC()` again which now returns some address inside the GBA game, compiles a block, and that block's `emitSyncFrom` calls `JitHelp_syncFrom` which reads `*registers[15]` = `0x000E2B04 + 8` = `0x000E2B0C` — still the HLE address.
+
+Wait. I need to reconsider. The crash repeats with `CTR=0` which means the `bctrl` in `executeBlock_asm` branched to address `0x000E2B04`. The only way `CTR=0x000E2B04` gets into CTR is if `b->code = 0x000E2B04`. The only way `b->code` can equal an ARM address is if `compile()` returned a `JitBlock` whose `code` field was never written with a valid PPC pointer.
+
+Looking at the cache: `hashPC(0x000E2B04)` — let's compute: `(0x000E2B04 >> 1) & 0x1FFF = 0x000715E2 & 0x1FFF = 0x15E2 & 0x1FFF = 0x15E2`. So bucket `0x15E2`. If that bucket previously held a block for a different armPC, and then `flushJitCache` ran and set `valid=false`, but then the cache lookup in `compile()` correctly misses... and then we compile a new block... the new block's `slot.code = codeBuf + codePos` where `codePos` was just reset to 0 by `flushJitCache`. `codeBuf` is a valid MEM2 address (around `0x91000000` on Wii), definitely not `0x000E2B04`.
+
+So `b->code` cannot be `0x000E2B04` unless... the `slot` pointer itself is wrong. What if `codeBuf` is null? Then `codeBuf + codePos = nullptr + 0 = 0`, and we'd crash at PC=0, not `0x000E2B04`.
+
+**The real answer**: `b` is not null, `b->nW > 0`, but `b->code` points to PPC instructions that themselves jump to `0x000E2B04`. This means the JIT compiled a block containing `emitExit(ctx, 0x000E2B04, EXIT_NORMAL)` where `nextPC = 0x000E2B04`, and `JitHelp_storeExit` stored it in `g_exitPC[1]`. Then the run loop called `interp.setPC(0x000E2B04)` — which is correct ARM behavior. But then `getActualPC()` returns `0x000E2B04 - 8 = 0x000E2AFC`, `isGoodPC(0x000E2AFC, true)` returns false, so `interpStep` is called. `interpStep` runs one opcode via the interpreter. Then `JitHelp_tick` fires. Then on the NEXT call to `runJitGba`, `interp.getActualPC()` is called again — and now the interpreter has advanced PC to some new address which IS in ROM and IS valid, so we compile and run fine.
+
+The crash must be happening because `isGoodPC(exitPC, true)` is returning TRUE for `exitPC = 0x000E2B04`. Let's check: `validPC(0x000E2B04, gba=true)`: `pc = 0x000E2B04 & ~1 = 0x000E2B04`. Is `pc >= 4 && pc < 0x4000`? `0x000E2B04 < 0x4000`? `0x000E2B04 = 928516`. `0x4000 = 16384`. `928516 < 16384`? **NO**. Is it in EWRAM/IWRAM/ROM? No. So `validPC` returns false and `isGoodPC` returns false.
+
+Then `interp.jitRunOpcode()` is called. This calls `runOpcode()`. But `setPC` was NOT called — because `isGoodPC` returned false, we went directly to `interp.jitRunOpcode()` without calling `setPC(exitPC)`. So the interpreter runs with whatever PC it had BEFORE the JIT block executed. The JIT block ran, modified `registers[r0..r14]` and CPSR via `JitHelp_syncTo`, but did NOT update `*registers[15]` (PC). So the interpreter re-executes the same instruction that the JIT just executed — creating an infinite loop that eventually produces wrong state, jumps to `0x000E2B04` through the HLE path, and crashes.
+
+**The fix**: when `isGoodPC(exitPC)` is false AND reason is EXIT_NORMAL, we must still call `setPC(exitPC)` to let the interpreter handle it — because a bad-looking PC might be a valid HLE BIOS entry point. Only skip `setPC` if `exitPC` is completely nonsensical (0 or 0xFFFFFFFF). For EXIT_FALLBACK with a bad PC, something is deeply wrong and we should recover.
+
+```cpp
+// jit_ppc.cpp - only the run loops and validPC need to change
+// Everything else stays identical to the previous version.
+
+// ============================================================
+// PC validity for JIT compilation only.
+// A PC is "compilable" if it points into real mapped ROM/RAM.
+// This is MORE restrictive than "valid ARM address" — HLE BIOS
+// addresses like 0x000E2B04 are valid ARM addresses that the
+// interpreter handles, but the JIT cannot compile them.
+// ============================================================
+static bool compilablePC(uint32_t pc, bool gba) {
+    pc &= ~1u;
+    if (gba) {
+        // Exclude address 0 (HLE BIOS entry) and the entire
+        // 0x0001..0x3FFF range (real BIOS ROM — not JIT-able
+        // because we may be using HLE which has no ROM there).
+        // Include only regions where the JIT can safely fetch opcodes.
+        return (pc >= 0x02000000u && pc < 0x02040000u)   // EWRAM
+            || (pc >= 0x03000000u && pc < 0x03008000u)   // IWRAM
+            || (pc >= 0x08000000u && pc < 0x0E000000u);  // ROM
+    }
+    // NDS — ARM9 ITCM, main RAM, shared WRAM, ARM7 BIOS mirror
+    return (pc < 0x4000u)
+        || (pc >= 0x02000000u && pc < 0x02400000u)
+        || (pc >= 0x03000000u && pc < 0x03800000u)
+        || (pc >= 0xFFFF0000u);
+}
+
+// An exit PC is "handleable" if it is non-zero and non-sentinel.
+// Even if it is not JIT-compilable (e.g. HLE BIOS address),
+// it may be a valid ARM address the interpreter can execute.
+// We must still call setPC() for these so the interpreter runs
+// the right instruction.
+static bool handleablePC(uint32_t pc) {
+    return pc != 0u && pc != 0xFFFFFFFFu;
+}
+
+void runJitNds(Core& core) {
+    for (int cpu = 0; cpu < 2; cpu++) {
+        Interpreter& interp = core.interpreter[cpu];
+        if (interp.halted) continue;
+
+        if (!interp.isReady()) { interp.jitRunOpcode(); continue; }
+
+        uint32_t pc = interp.getActualPC();
+
+        // Only attempt JIT if we can actually compile this PC.
+        // Non-compilable PCs (HLE regions, unmapped) go straight
+        // to the interpreter which knows how to handle them.
+        if (!compilablePC(pc, false)) { interp.jitRunOpcode(); continue; }
+
+        JitBlock* b = compile(&interp, &core, pc, cpu == 1, cpu);
+        if (!b || b->nW == 0) { interp.jitRunOpcode(); continue; }
+
+        uint32_t* code = b->code;
+        executeBlock_asm(code);
+
+        uint32_t exitPC = g_exitPC[cpu];
+        int      reason = g_exitReason[cpu];
+
+        // Always call setPC if the exit PC is any real ARM address,
+        // even if it is not JIT-compilable (e.g. falls into HLE BIOS).
+        // The interpreter will then handle the non-compilable region.
+        if (!handleablePC(exitPC)) {
+            // Completely bogus exit PC — let interpreter recover
+            interp.jitRunOpcode();
+            continue;
+        }
+
+        interp.setPC(exitPC);
+        if (reason == EXIT_FALLBACK) {
+            interp.jitRunOpcode();
+        }
+    }
+    JitHelp_tick(&core);
+}
+
+void runJitGba(Core& core) {
+    Interpreter& interp = core.interpreter[1];
+    if (interp.halted) { JitHelp_tick(&core); return; }
+
+    if (!interp.isReady()) {
+        interp.jitRunOpcode(); JitHelp_tick(&core); return;
+    }
+
+    uint32_t pc = interp.getActualPC();
+
+    if (!compilablePC(pc, true)) {
+        // PC is in a non-JIT region (HLE BIOS, unmapped, etc.)
+        // Run through interpreter which handles these correctly.
+        interp.jitRunOpcode(); JitHelp_tick(&core); return;
+    }
+
+    JitBlock* b = compile(&interp, &core, pc, true, 1);
+    if (!b || b->nW == 0) {
+        interp.jitRunOpcode(); JitHelp_tick(&core); return;
+    }
+
+    uint32_t* code = b->code;
+    executeBlock_asm(code);
+
+    uint32_t exitPC = g_exitPC[1];
+    int      reason = g_exitReason[1];
+
+    if (!handleablePC(exitPC)) {
+        // Bogus exit — recover via interpreter
+        interp.jitRunOpcode();
+    } else {
+        // Set PC unconditionally — even HLE BIOS addresses are
+        // valid ARM destinations that setPC + interpreter handle.
+        interp.setPC(exitPC);
+        if (reason == EXIT_FALLBACK) {
+            interp.jitRunOpcode();
+        }
+    }
+
+    JitHelp_tick(&core);
+}
+```
+
+The compile function's `validPC` call also needs updating to use `compilablePC`:
+
+```cpp
+static JitBlock* compile(Interpreter* interp, Core* core,
+                          uint32_t armPC, bool arm7, int cpuIdx) {
+    // Use compilablePC here — we only JIT real ROM/RAM regions
+    if (!compilablePC(armPC, core->gbaMode)) return nullptr;
+
+    bool   thumb = interp->isThumb();
+    size_t bkt   = hashPC(armPC);
+
+    {
+        JitBlock& slot = cache[bkt];
+        if (slot.valid
+            && slot.armPC == armPC
+            && slot.thumb == thumb
+            && slot.gen   == cacheGen
+            && slot.code  >= codeBuf
+            && slot.code  <  codeBuf + JIT_WORDS)
+            return &slot;
+        if (!slot.valid || slot.gen != cacheGen)
+            slot.valid = false;
+    }
+
+    if (codePos + BLK_WDS >= JIT_WORDS) {
+        flushJitCache();
+    }
+
+    JitBlock& slot = cache[bkt];
+
+    Ctx ctx;
+    ctx.base    = codeBuf + codePos;
+    ctx.cur     = ctx.base;
+    ctx.cap     = JIT_WORDS - codePos;
+    ctx.thumb   = thumb;
+    ctx.arm7    = arm7;
+    ctx.done    = false;
+    ctx.blockPC = armPC;
+    ctx.cpuIdx  = cpuIdx;
+    ctx.interp  = interp;
+    ctx.core    = core;
+
+    emitPrologue(ctx);
+    emitSyncFrom(ctx);
+
+    uint32_t curPC = armPC;
+    int n = 0;
+
+    while (n < (int)BLK_ARMS && !ctx.done) {
+        // Inside the block, use compilablePC for fetch validity.
+        // If PC leaves compilable range mid-block, exit with FALLBACK
+        // so the interpreter handles the non-JIT region.
+        if (!compilablePC(curPC, core->gbaMode)) {
+            emitExit(ctx, curPC, EXIT_FALLBACK);
+            ctx.done = true; break;
+        }
+
+        if (thumb) {
+            uint16_t op = core->memory.read<uint16_t>(arm7, curPC);
+
+            if (((op >> 11) & 0x1F) == 0x1E) {
+                if (!compilablePC(curPC + 2, core->gbaMode)) {
+                    emitExit(ctx, curPC, EXIT_FALLBACK);
+                    ctx.done = true; break;
+                }
+                uint16_t op2 = core->memory.read<uint16_t>(arm7, curPC + 2);
+                uint8_t  bb  = (op2 >> 11) & 0x1F;
+                if (bb == 0x1F || bb == 0x1C) {
+                    emitT_bl(ctx, op, op2, curPC);
+                    curPC += 4; n += 2; continue;
+                }
+            }
+
+            bool ok = dispThumb(ctx, op, curPC);
+            if (!ok) {
+                emitExit(ctx, curPC, EXIT_FALLBACK);
+                ctx.done = true;
+            } else {
+                curPC += 2; n++;
+                uint8_t h = (op >> 12) & 0xF;
+                if (h == 0xD || h == 0xE || h == 0xF) ctx.done = true;
+            }
+        } else {
+            uint32_t op = core->memory.read<uint32_t>(arm7, curPC);
+
+            bool ok = dispARM(ctx, op, curPC);
+            if (!ok) {
+                emitExit(ctx, curPC, EXIT_FALLBACK);
+                ctx.done = true;
+            } else {
+                curPC += 4; n++;
+                uint32_t it = (op >> 25) & 7;
+                if (it == 5)                         ctx.done = true;
+                if ((op & 0x0FFFFFF0) == 0x012FFF10) ctx.done = true;
+                if ((op & 0x0E000000) == 0x0A000000) ctx.done = true;
+            }
+        }
+    }
+
+    if (!ctx.done) emitExit(ctx, curPC, EXIT_NORMAL);
+
+    size_t wds = ctx.sz();
+    if (wds == 0) return nullptr;
+
+    flushICache(ctx.base, wds);
+
+    slot.armPC = armPC;
+    slot.code  = ctx.base;
+    slot.nW    = (uint32_t)wds;
+    slot.gen   = cacheGen;
+    slot.thumb = thumb;
+    slot.valid = true;
+
+    codePos += wds;
+    return &slot;
+}
+```
+
+The key changes and why each one is necessary:
+
+| Change | Why |
+|---|---|
+| Split `validPC` into `compilablePC` and `handleablePC` | `validPC` was doing two different jobs: deciding if we can JIT a PC, and deciding if an exit PC from the JIT is sensible. These are different questions. `0x000E2B04` is a valid ARM address (HLE handles it) but not JIT-compilable |
+| GBA `compilablePC` excludes BIOS range entirely | GBA HLE BIOS does not map real ROM to `0x0..0x3FFF`, so the JIT cannot fetch opcodes from there. Previous code included `pc >= 4 && pc < 0x4000` which still allowed fetching from near-BIOS addresses |
+| Run loop uses `handleablePC` instead of `compilablePC` for exit PC check | The old `isGoodPC` called `validPC` on exit PCs, which rejected `0x000E2B04` and skipped the `setPC` call. This left the interpreter's PC pointing at the last JIT-executed instruction, causing it to re-execute indefinitely |
+| `setPC(exitPC)` called for ALL handleable exit PCs | Even HLE BIOS addresses need `setPC` so that `flushPipeline` refills the pipeline from the right address and the interpreter executes the correct next instruction |
