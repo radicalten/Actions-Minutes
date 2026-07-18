@@ -1,1 +1,274 @@
+TAKEN FROM cson-jit3-fix
+
+OK with this one both nds and gba games still boot to black screen but then they bring down the fps to 1fps for the wii itself. Also emerald still crashes. 
+
+Fix1 info:
+======
+AFter all the changes here once again it compiles. NDS and Most gba games go to black screen but now we get a new error ISI on emerald. 
+
+old new crash behavior: almost identical to before but no thrd is 80356AA0 on gba emerald.
+instead of Thrd 803568E0
+
+With these changes the behavior is largely the same: My code compiles and when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356AA0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+The difference seems to be Thrd 80356AA0 instead of Thrd 803568E0
+
+
+new new crash behavior: almost identical to before but now Thrd is 80356BC0 thrd was 80356AA0 on gba emerald.
+instead of Thrd 803568E0
+
+With these changes the behavior is largely the same: My code compiles and when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 8052DA88 GPR17 07E00000 GPR24 09188900
+GPR02 8012EDF0 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 80545AD0 GPR19 44470202 GPR27 08780138
+GPR04 80545EC0 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80152880 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 8052DA60 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356BC0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+=====
+
+fix2 info:
+With these changes the behavior is largely the same: My code compiles and when launching most ds/gba games I get a blank black screen.
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 8052DD68 GPR17 07E00000 GPR24 09188900
+GPR02 8012EDF0 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 8053DDD0 GPR19 44470202 GPR27 08780138
+GPR04 8054E1C0 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80152B60 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 8052DD60 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356EA0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+======
+fix3 info: this is a promising change some games turn white like mkds and display high framerate 30-60fps DS. others like contra 4 stay black and have 9 wii fps. emerald still broken with ISI. 
+With these changes the behavior a bit different: My code compiles and when launching most ds/gba games I get either a blank white or blank black screen. The fps also varies from 10-60fps
+But when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 8052D7A8 GPR17 07E00000 GPR24 09188900
+GPR02 8012EA50 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 8053D810 GPR19 44470202 GPR27 08780138
+GPR04 8053DC00 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80152580 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 8052D7A0 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80356900
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+===
+this update made things worse as now it gives invalid instruction when launching NDS games: MKDS:
+IntCPU: Unknown instruction 00000000 at PC = 8034fa78  last_PC = 00000000  LR = 8034fa78
+IntCPU: Unknown instruction 00000000 at PC = 8034fa7c  last_PC = 00000000  LR = 8034fa78
+IntCPU: Unknown instruction 00000003 at PC = 8034fa80  last_PC = 00000000  LR = 8034fa78
+IntCPU: Unknown instruction 00000000 at PC = 8034fa84  last_PC = 00000000  LR = 8034fa78
+IntCPU: Unknown instruction 00000000 at PC = 8034fa88  last_PC = 00000000  LR = 8034fa78
+IntCPU: Unknown instruction 00000000 at PC = 8034fa8c  last_PC = 00000000  LR = 8034fa78
+GPR00 00003900 GPR08 00003900 GPR16 80350000 GPR24 FFFFABCD
+...
+PC FFFFDB74 LR 8034FA78 MSR 40009032 Thrd 8034FFA0
+CR 40900492 CTR FFFFFFFF XER 00000000
+STACK DUMP:
+0xffffdb74
+ANDwhen launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 80526E68 GPR17 07E00000 GPR24 09188900
+GPR02 80130010 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 80536ED0 GPR19 44470202 GPR27 08780138
+GPR04 805372C0 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80153C60 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 80526E60 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 8034FFA0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+===
+OK after this change cson4.6 added an assembly file which also did not work but at least I got it to 
+compile after updating my makefile.
+
+After these changes when Launching DS games:
+IntCPU: Unknown instruction 0330a3e0 at PC = 80549398  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 02004020 at PC = 8054939c  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 010032e1 at PC = 805493a0  last_PC = 00000000  LR = 80549354
+Invalid read from 0xffffa011, PC = 0x805493a4
+IntCPU: Unknown instruction f9ffff1a at PC = 805493a8  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 0010a0e1 at PC = 805493ac  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 0300a0e1 at PC = 805493b0  last_PC = 00000000  LR = 80549354
+Invalid read from 0xffffb0e1, PC = 0x805493b4
+IntCPU: Unknown instruction 00006022 at PC = 805493b8  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 00106142 at PC = 805493bc  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 00106142 at PC = 805493bc  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 00c0a0e1 at PC = 805493c8  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 0110a0e3 at PC = 805493cc  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 010050e1 at PC = 805493d0  last_PC = 00000000  LR = 80549354
+Invalid read from 0xffffa081, PC = 0x805493d4
+Invalid read from 0xffffa081, PC = 0x805493d8
+IntCPU: Unknown instruction fbffff8a at PC = 805493dc  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 0140a0e1 at PC = 805493e4  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 0030a0e3 at PC = 805493e8  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 0120a0e1 at PC = 805493ec  last_PC = 00000000  LR = 80549354
+Invalid read from 0x000052e1, PC = 0x805493f0
+Invalid read from 0xffffa091, PC = 0x805493f4
+IntCPU: Unknown instruction 020050e1 at PC = 805493fc  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 0330a3e0 at PC = 80549400  last_PC = 00000000  LR = 80549354
+IntCPU: Unknown instruction 02004020 at PC = 80549404  last_PC = 00000000  LR = 80549354
+GPR00 00003900 GPR08 00003900 GPR16 80350000 GPR24 FFFFABCD
+GPR01 0380FFE3 GPR09 00000000 GPR17 00006E62 GPR25 00000000
+GPR02 0380FD00 GPR10 00004177 GPR18 F40A67BE GPR26 04000000
+GPR03 00000000 GPR11 F40A43BC GPR19 00000000 GPR27 0380FD80
+GPR04 03808EDF FPR12 907943C0 GPR20 67780018 GPR28 02380000
+GPR05 72300000 GPR13 80153B00 GPR21 71F3FD80 GPR29 02380018
+GPR06 00000000 GPR14 63610000 GPR22 00000000 GPR30 600000DF
+GPR07 0000666F G)R15 00000000 GPR23 3DDD256C G)R31 907942EC
+PC FFFFDB74 LR 8054944C MSR 0002B032 Thrd 8034FE40
+CR 20009499 CTR 80064145 XER 00000000
+STACK DUMP:
+0x80543580 --> 000000000
+And when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+GPR01 90211B98 GPR09 80526C68 GPR17 07E00000 GPR24 09188900
+GPR02 80125EF0 GPR10 00000000 GPR18 6E400202 GPR26 89184331
+GPR03 00000001 GPR11 80536D50 GPR19 44470202 GPR27 08780138
+GPR04 80537140 GPR12 00887043 GPR20 D0440202 GPR28 0006040E
+GPR05 FFFFFFFF GPR13 80153B00 GPR21 4E880120 GPR29 0127204D
+GPR06 F4FF1508 GPR14 40190B21 GPR22 46F786FB GPR30 20480078
+GPR07 80526CE0 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 8034F3F40
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+==
+here is the next set of changes after the above update:
+MKDS:
+IntCPU: Unknown instruction 00c0a0e1 at PC = 80549748  last_PC = 00000000  LR = 805496fc
+IntCPU: Unknown instruction 0110a0e3 at PC = 8054974c  last_PC = 00000000  LR = 805496fc
+IntCPU: Unknown instruction 010050e1 at PC = 80549750  last_PC = 00000000  LR = 805496fc
+Invalid read from 0xffffa081, PC = 0x80549754
+Invalid read from 0xffffa081, PC = 0x80549758
+Exception (ISI) occurred!
+GPR00 00000000 GPR08 00000000 GPR16 64735FBC GPR24 00000000
+...
+PC 80543990 LR 805497BC MSR 0002B032 Thrd 80350220
+CR 29099999 CTR 80064144 XER 000000000
+STACK DUMP:
+0x80543990 --> 00000000
+NSMB:
+IntCPU: Unknown instruction 00006022 at PC = 805496b8  last_PC = 00000000  LR = 80549674
+IntCPU: Unknown instruction 00106142 at PC = 805496bc  last_PC = 00000000  LR = 80549674
+IntCPU: Unknown instruction 00c0a0e1 at PC = 805496c8  last_PC = 00000000  LR = 80549674
+Invalid read from 0xffffa081, PC = 0x805496d4
+PC FFFFFFE8 LR 805438C4 MSR 4000B032 Thrd 80350220
+CR 90000999 CTR 80064147 XER 200000000
+DoomGBA:
+Invalid write to 0xffffa0e3, PC = 0x805493f4
+GPR00 00000000 GPR08 00000000 GPR16 00000000 GPR24 00000000
+...
+PC 805493F8 LR 805493B0 MSR 0002B032 Thrd 80350220
+CR 99000929 CTR 80064148 XER 000000000
+STACK DUMP:
+0x805493f8 --? 0x80549398 --> 00000000 --> 0x80069b30 --> 0x8006ac34 --> 0x800b7934
+
+===
+Ok it looks like we have circled back to the start of fix3 info in that once again nds starts white with 30-60fps, gba starts black with 60fps, except for emerald which still crashes. However, this is better than before because even contra4 and others are the full 30-60fps (although they are stuck on the white screen) intead of 1-10fps stuck. 
+
+here is the next set of changes after the above update:
+Most nds games launch and go to the white screen but get stuck there (internal fps display 30-60fps)
+When launching a gba game I get a black screen but it gets stuck there (internal fps display 30-60fps)
+Invalid read from 0x00000000, PC = 0x800e73f4
+Invalid read from 0x00000004, PC = 0x800e73fc
+Invalid read from 0x00000008, PC = 0x800e7404
+Invalid read from 0x0000000c, PC = 0x800e7408
+Invalid read from 0x00000010, PC = 0x800e745c
+Invalid read from 0x00000014, PC = 0x800e745c
+Invalid read from 0x00000018, PC = 0x800e7494
+Invalid read from 0x0000001a, PC = 0x800e73a4
+Invalid read from 0x00000019, PC = 0x800e73a8
+And emerald gba crashes with: 
+And when launching certain gba games I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+GPR07 80527720 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80350860
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+===
+Same as above "Ok it looks like we have circled back to the start of fix3 info in that once again nds starts white with 30-60fps, gba starts black with 60fps, except for emerald which still crashes. However, this is better than before because even contra4 and others are the full 30-60fps (although they are stuck on the white screen) intead of 1-10fps stuck. "
+Harder to makeout changes:
+Most nds games launch and go to the white screen but get stuck there (internal fps display 30-60fps)
+When launching a gba game I get a black screen but it gets stuck there (internal fps display 30-60fps)
+Also when launching a gba game I get: 
+Attempted to load a discarded value
+Invalid read from 0x00000000, PC = 0x800e6bf4
+Invalid read from 0x00000004, PC = 0x800e6bfc
+Invalid read from 0x00000008, PC = 0x800e6c04
+Invalid read from 0x0000000c, PC = 0x800e6c08
+Invalid read from 0x00000010, PC = 0x800e6c5c
+Invalid read from 0x00000014, PC = 0x800e6c5c
+Invalid read from 0x00000018, PC = 0x800e6c94
+Invalid read from 0x0000001a, PC = 0x800e6ba4
+Invalid read from 0x00000019, PC = 0x800e6ba8
+And when launching emerald gba I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+GPR07 80527720 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80350080
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+
+#I hit the token limit. this will have to be the new fix4 prompt.
+
+===
+fix4 info: after providing fix 4 info we are same behavior as before.
+Same white/black nds/gba screen on launch behavior. Here are the error codes:
+NDS ACWW:
+Invalid read from 0xffffffff, PC = 0x800e6c74
+Invalid read from 0x00000001, PC = 0x800e6b84
+Invalid read from 0x00000000, PC = 0x800e6b88
+Invalid read from 0x00000003, PC = 0x800e6b84
+Invalid read from 0x00000002, PC = 0x800e6b88
+Invalid read from 0x00000005, PC = 0x800e6b84
+Invalid read from 0x00000004, PC = 0x800e6b88
+Invalid read from 0x00000007, PC = 0x800e6b84
+Invalid read from 0x00000006, PC = 0x800e6b88
+Invalid read from 0x00000009, PC = 0x800e6b84
+Invalid read from 0x00000008, PC = 0x800e6b88
+Invalid read from 0x0000000b, PC = 0x800e6b84
+Invalid read from 0x0000000a, PC = 0x800e6b88
+Invalid read from 0x0000000d, PC = 0x800e6b84
+GBADoom:
+Attempted to load a discarded value
+And when launching emerald gba I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+GPR07 80526F20 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80350050
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+
 
