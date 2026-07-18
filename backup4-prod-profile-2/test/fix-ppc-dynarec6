@@ -3,7 +3,6 @@ Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? 
 Most nds games launch and go to the white screen but get stuck there (internal fps display 30-60fps)
 When launching a gba game I get the gba boot logo then a black screen but it gets stuck there at the black screen (internal fps display 30-60fps)
 And when launching emerald gba I get this: Exception (ISI) occurred!
-...
 GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
 GPR01 90211B98 GPR09 8052F4B8 GPR17 07E00000 GPR25 09188900
 GPR03 00000001 GPR11 8052F510 GPR19 44470202 GPR27 89184331
