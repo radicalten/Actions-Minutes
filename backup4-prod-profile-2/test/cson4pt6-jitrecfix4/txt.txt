@@ -297,5 +297,11 @@ STACK DUMP:
 
 =====
 THis change appeared to be a regression as the gba logo no longer loads and emerald still crashes but with a new error code. nds still white screen.
+emerald crash:
+GPR07 80527F0A0 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80358200
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
 
 
