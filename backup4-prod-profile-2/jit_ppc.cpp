@@ -126,7 +126,7 @@ static inline uint32_t ppc_mtctr(uint8_t s){return ppc_mtspr(9,s);}
 static inline uint32_t ppc_mtlr (uint8_t s){return ppc_mtspr(8,s);}
 static inline uint32_t ppc_mflr (uint8_t t){return ppc_mfspr(t,8);}
 static inline uint32_t ppc_mtxer(uint8_t s){return ppc_mtspr(1,s);}
-static inline uint32_t ppc_mfxer(uint8_t t){return ppc_mfspr(t,1)}
+static inline uint32_t ppc_mfxer(uint8_t t){return ppc_mfspr(t,1);}
 static inline uint32_t ppc_mfcr (uint8_t t){return (31u<<26)|((uint32_t)t<<21)|(19u<<1);}
 static inline uint32_t ppc_mtcrf(uint8_t fxm,uint8_t s)
     {return (31u<<26)|((uint32_t)s<<21)|((uint32_t)(fxm&0xFF)<<12)|(144u<<1);}
