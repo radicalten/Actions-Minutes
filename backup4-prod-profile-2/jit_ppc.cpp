@@ -1146,7 +1146,7 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
     if (loadPC) {
         ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
         ctx.E(ppc_cmpi(0, TA, 1));
-        ctx.E(ppc_bc(4, 2, 8)); // bne +8
+        ctx.E(ppc_bc(12, 2, 8)); // beq +8 -> wrotePC is true
         size_t b = ctx.sz();
         ctx.E(ppc_b(0));
         emitCommitExitDyn(ctx, EXIT_NORMAL);
@@ -1492,7 +1492,7 @@ static bool emitT_pushPop(Ctx& ctx, uint16_t op, uint32_t curPC) {
     if (((op >> 11) & 1) && ((op >> 8) & 1)) {
         ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
         ctx.E(ppc_cmpi(0, TA, 1));
-        ctx.E(ppc_bc(4, 2, 8));
+        ctx.E(ppc_bc(12, 2, 8)); // beq +8 -> wrotePC is true
         size_t b = ctx.sz();
         ctx.E(ppc_b(0));
         emitCommitExitDyn(ctx, EXIT_NORMAL);
