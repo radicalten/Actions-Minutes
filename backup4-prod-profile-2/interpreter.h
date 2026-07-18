@@ -9,9 +9,6 @@ class HleBios;
 
 class Interpreter {
 public:
-    // Execute exactly one opcode through the interpreter pipeline.
-    // Called by the JIT run loop for fallback and for opcodes the
-    // JIT does not handle.  PC must already be set via setPC().
     int jitRunOpcode();
 
     HleBios *bios  = nullptr;
@@ -47,12 +44,21 @@ public:
         return *registers[15] - (isThumb() ? 4u : 8u);
     }
 
+    // Returns true when the interpreter has been fully initialised and
+    // getActualPC() will return a sensible value.  The JIT must not
+    // attempt to compile or execute until this returns true.
+    //
+    // We check pcData because it is set inside flushPipeline(), which is
+    // called from setPC(), which is called from init() / directBoot().
+    // Before init() runs, pcData is nullptr (default member initialiser).
+    bool isReady() const { return pcData != nullptr; }
+
     void setPC(uint32_t newPC);
 
     int handleHleIrq();
 
     uint8_t  readIme()    { return ime; }
-    uint32_t readIe()     { return ie;  }
+    uint32_t readIe()     { return ie; }
     uint32_t readIrf()    { return irf; }
     uint8_t  readPostFlg(){ return postFlg; }
 
@@ -63,16 +69,6 @@ public:
 
     uint32_t** getRegisters() { return registers; }
     uint32_t&  getCpsrRef()   { return cpsr; }
-
-    // Returns true once init() has wired up the register pointers and
-    // memory map.  The JIT must not read getActualPC() before this.
-    bool isReady() const {
-        // registers[15] is set to &registersUsr[15] inside init(); before
-        // that it is nullptr.  pcData is set inside flushPipeline() which is
-        // called from setPC() which is called from init() / directBoot().
-        // Checking registers[15] != nullptr is the earliest safe gate.
-        return registers[15] != nullptr;
-    }
 
     static size_t offset_halted() {
         Interpreter* p = reinterpret_cast<Interpreter*>(0);
@@ -103,7 +99,7 @@ private:
     Core *core;
     bool  arm7;
 
-    uint8_t  *pcData   = nullptr;
+    uint8_t  *pcData   = nullptr;   // set by flushPipeline(); null until init()
     uint32_t  pipeline[2] = {};
 
     uint32_t *registers[32]    = {};
@@ -115,7 +111,7 @@ private:
     uint32_t  registersUnd[2]  = {};
 
     uint32_t  cpsr = 0, *spsr = nullptr;
-    uint32_t  spsrFiq = 0, spsrSvc = 0, spsrAbt = 0, spsrIrq = 0, spsrUnd = 0;
+    uint32_t  spsrFiq=0, spsrSvc=0, spsrAbt=0, spsrIrq=0, spsrUnd=0;
 
     uint32_t  cycles   = 0;
     bool      dsiCycle = false;
@@ -140,7 +136,6 @@ private:
 
     int unkArm  (uint32_t opcode);
     int unkThumb(uint16_t opcode);
-
     int32_t clampQ(int64_t value);
 
     uint32_t lli(uint32_t opcode); uint32_t llr(uint32_t opcode);
