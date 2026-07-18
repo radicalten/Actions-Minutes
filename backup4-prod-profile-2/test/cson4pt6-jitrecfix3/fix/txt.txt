@@ -214,8 +214,8 @@ STACK DUMP:
 ===
 Same as above "Ok it looks like we have circled back to the start of fix3 info in that once again nds starts white with 30-60fps, gba starts black with 60fps, except for emerald which still crashes. However, this is better than before because even contra4 and others are the full 30-60fps (although they are stuck on the white screen) intead of 1-10fps stuck. "
 Harder to makeout changes:
-NDS and GBA games have the same stuck on white/black screen behavior from before.
-When launching a gba game I get: 
+When launching NDS or GBA games the screen gets stuck in pure white for NDS or pure black for GBA. 
+Also when launching a gba game I get: 
 Attempted to load a discarded value
 Invalid read from 0x00000000, PC = 0x800e6bf4
 Invalid read from 0x00000004, PC = 0x800e6bfc
@@ -236,5 +236,5 @@ STACK DUMP:
 0x000e2b04 --> 0x000e2b04 --> 00000000
 
 
-
+#I hit the token limit. this will have to be the new fix4 prompt.
 
