@@ -1679,7 +1679,7 @@ static JitBlock* compile(Interpreter* interp, Core* core,
             }
         } else {
             uint32_t op = core->memory.read<uint32_t>(arm7, curPC);
-            iif (!dispARM(ctx, op, curPC)) {
+            if (!dispARM(ctx, op, curPC)) {
             if (g_dbgFB < 4000) {
             DebugLog("[JIT] arm FB pc=%08X op=%08X\n", curPC, op);
             g_dbgFB++;
