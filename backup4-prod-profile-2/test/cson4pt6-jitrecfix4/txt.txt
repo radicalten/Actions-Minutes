@@ -310,3 +310,6 @@ PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 80358280
 CR 22887494 CTR 00000000 XER 00000000
 STACK DUMP:
 0x000e2b04 --> 0x000e2b04 --> 00000000
+
+
+##Hit the token limit right here again, will need to make fix5 to progress. 
