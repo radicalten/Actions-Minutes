@@ -41,7 +41,7 @@ public:
     uint32_t getPC() { return *registers[15]; }
 
     uint32_t getActualPC() {
-        return *registers[15] - (isThumb() ? 4u : 8u);
+        return *registers[15] - (isThumb() ? 2u : 4u);
     }
 
     // Returns true when the interpreter has been fully initialised and
