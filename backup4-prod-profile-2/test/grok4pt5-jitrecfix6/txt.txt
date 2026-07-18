@@ -1,1 +1,1 @@
-
+Grok 4.5 jit_ppc-fix2.cpp fixed the emerald crash! it still does not play the rom, but it does play the gba start logo which is an improvement. 
