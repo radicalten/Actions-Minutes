@@ -1,1 +1,22 @@
+The changes applied in the first generation here (dynarec7 glm5.2 + gpt5.6) did not fix anything or change anything here are the new invalid reads:
 
+The behavior is the same as before with the stuck white/black screens and the gba logo appearing. here are the new errors:
+ACWW NDS:
+Invalid read from 0xffffffff, PC = 0x800ec394
+Invalid read from 0x00000001, PC = 0x800ec2a4
+Invalid read from 0x00000000, PC = 0x800ec2a8
+Invalid read from 0x00000003, PC = 0x800ec2a4
+Invalid read from 0x00000003, PC = 0x800ec2a4
+Invalid read from 0x00000002, PC = 0x800ec2a8
+Invalid read from 0x00000005, PC = 0x800ec2a4
+...
+gbaEmerald:
+Attempted to load a discarded value
+Invalid read from 0x00007fff, PC = 0x800ec394
+Invalid read from 0x00008001, PC = 0x800ec2a4
+Invalid read from 0x00008000, PC = 0x800ec2a8
+Invalid read from 0x00008003, PC = 0x800ec2a4
+Invalid read from 0x00008002, PC = 0x800ec2a8
+Invalid read from 0x00008005, PC = 0x800ec2a4
+Invalid read from 0x00008004, PC = 0x800ec2a8
+...
