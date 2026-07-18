@@ -9,7 +9,10 @@ class HleBios;
 
 class Interpreter {
 public:
+    // Called by the JIT run loop to execute exactly one opcode
+    // after the interpreter's PC has been set via setPC().
     int jitRunOpcode();
+
     HleBios *bios = nullptr;
     uint32_t entryAddr = 0;
     uint8_t halted = 0;
@@ -59,6 +62,10 @@ public:
 
     uint32_t** getRegisters()  { return registers; }
     uint32_t&  getCpsrRef()    { return cpsr; }
+
+    // True if the interpreter's memory map is ready for JIT use.
+    // The JIT must not call getActualPC() or compile() until this returns true.
+    bool isReady() const { return pcData != nullptr; }
 
     static size_t offset_halted() {
         Interpreter* p = reinterpret_cast<Interpreter*>(0);
