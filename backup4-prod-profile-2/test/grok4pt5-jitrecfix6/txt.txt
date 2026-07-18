@@ -11,3 +11,51 @@ Invalid read from 0x00000014, PC = 0x800eb87c
 Invalid read from 0x00000018, PC = 0x800eb8b4
 Invalid read from 0x0000001a, PC = 0x800eb7c4
 Invalid read from 0x00000019, PC = 0x800eb7c8
+
+=====
+The fix3 update broke some things, the gba boot logo still comes up but afterwards the rom immediately crashes. now nds roms crash immediatelly too.
+MKDS:
+IntCPU: Unknown instruction 00000000 at PC = 805390bc  last_PC = 00000000  LR = 80538ff0
+IntCPU: Unknown instruction 00000000 at PC = 805390c0  last_PC = 00000000  LR = 80538ff0
+IntCPU: Unknown instruction 00000000 at PC = 805390c4  last_PC = 00000000  LR = 80538ff0
+IntCPU: Unknown instruction 00000000 at PC = 805390c8  last_PC = 00000000  LR = 80538ff0
+...
+Exception (ISI) occurred!
+PC 0174292C LR 80538FF0 MSR 40009032 Thrd 8033FD40
+CR 49000999 CTR 800644C3 XER 00000000
+STACK DUMP:
+0x0174292c
+gbaDoom:
+Attempted to load a discarded value
+gba boot logo plays
+IntCPU: Unknown instruction 00000000 at PC = 80538f3c  last_PC = 00000000  LR = 80538e70
+IntCPU: Unknown instruction 00000000 at PC = 80538f40  last_PC = 00000000  LR = 80538e70
+IntCPU: Unknown instruction 00000000 at PC = 80538f44  last_PC = 00000000  LR = 80538e70
+IntCPU: Unknown instruction 00000000 at PC = 80538f48  last_PC = 00000000  LR = 80538e70
+IntCPU: Unknown instruction 00000000 at PC = 80538f4c  last_PC = 00000000  LR = 80538e70
+...
+Exception (ISI) occurred!
+PC 80744474 LR 80740EE8 MSR 0002B032 Thrd 8033FD40
+CR 49009949 CTR 800644C1 XER 20000000
+STACK DUMP:
+0x80744474 --> 00000000
+gbaEmerald:
+Attempted to load a discarded value
+Invalid read from 0x00000000, PC = 0x800e2c94
+Invalid read from 0x00000004, PC = 0x800e2c9c
+Invalid read from 0x00000008, PC = 0x800e2ca4
+Invalid read from 0x0000000c, PC = 0x800e2ca8
+Invalid read from 0x00000010, PC = 0x800e2cfc
+Invalid read from 0x00000014, PC = 0x800e2cfc
+Invalid read from 0x00000018, PC = 0x800e2d34
+...
+Gba logo loads
+IntCPU: Unknown instruction 00000000 at PC = 80538f7c  last_PC = 00000000  LR = 80538eb0
+IntCPU: Unknown instruction 00000000 at PC = 80538f84  last_PC = 00000000  LR = 80538eb0
+IntCPU: Unknown instruction 00000000 at PC = 80538f88  last_PC = 00000000  LR = 80538eb0
+Exception (ISI) occurred!
+PC 80740E84 LR 80538EB0 MSR 00029032 Thrd 8033FD40
+CR 49000999 CTR 800644C4 XER 00000000
+STACK DUMP:
+0x80740e84 --> 00000000
+
