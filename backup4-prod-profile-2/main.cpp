@@ -40,6 +40,7 @@
 #include "core.h"
 #include "settings.h"
 #include "console_ui.h"
+#include "debug_log.h"
 
 extern "C" {
     #include <tuxedo/thread.h>
@@ -121,6 +122,66 @@ void operator delete(void* p, size_t) noexcept {
 void operator delete[](void* p, size_t) noexcept {
     if (!p) return;
     if (!IsMem2Ptr(p)) free(p);
+}
+
+// ---------------------------------------------------------------------------
+// SD-card debug logging. Every call opens, writes, flushes and closes the
+// file so content survives a hard hang or crash (no buffered data lost).
+// ---------------------------------------------------------------------------
+static bool g_debugTraceReady   = false;
+static bool g_debugStatusReady  = false;
+static int  g_debugTraceBudget  = 4000;  // dense JIT/CPU trace
+static int  g_debugStatusBudget = 3000;  // sparse heartbeat, lasts much longer
+
+static const char* DEBUG_TRACE_PATH  = "sd:/noods/debug_trace.log";
+static const char* DEBUG_STATUS_PATH = "sd:/noods/debug_status.log";
+
+void DebugLog_Init() {
+    FILE* f1 = fopen(DEBUG_TRACE_PATH, "w");
+    if (f1) {
+        fprintf(f1, "=== NooDS-Wii JIT/CPU trace log ===\n");
+        fclose(f1);
+        g_debugTraceReady = true;
+    }
+
+    FILE* f2 = fopen(DEBUG_STATUS_PATH, "w");
+    if (f2) {
+        fprintf(f2, "=== NooDS-Wii status log ===\n");
+        fclose(f2);
+        g_debugStatusReady = true;
+    }
+}
+
+void DebugLog(const char* fmt, ...) {
+    if (!g_debugTraceReady || g_debugTraceBudget <= 0) return;
+
+    FILE* f = fopen(DEBUG_TRACE_PATH, "a");
+    if (!f) return;
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+
+    fflush(f);
+    fclose(f);
+    g_debugTraceBudget--;
+}
+
+void DebugLogStatus(const char* fmt, ...) {
+    if (!g_debugStatusReady || g_debugStatusBudget <= 0) return;
+
+    FILE* f = fopen(DEBUG_STATUS_PATH, "a");
+    if (!f) return;
+
+    va_list args;
+    va_start(args, fmt);
+    vfprintf(f, fmt, args);
+    va_end(args);
+
+    fflush(f);
+    fclose(f);
+    g_debugStatusBudget--;
 }
 
 static Core*     ndsCore   = nullptr;
@@ -536,7 +597,9 @@ static void InitializeNDS() {
     InitializeSettings();
 
     if (fatInitDefault()) {
-        UpdateFileBrowser(currentDir);
+    DebugLog_Init();
+    DebugLog("FAT mounted, logging started\n");
+    UpdateFileBrowser(currentDir);
     }
 
     const size_t sz = NDS_SCREEN_WIDTH * NDS_SCREEN_HEIGHT * sizeof(uint32_t);
