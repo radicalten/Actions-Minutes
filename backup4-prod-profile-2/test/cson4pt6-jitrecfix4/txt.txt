@@ -270,5 +270,31 @@ CR 22887494 CTR 00000000 XER 00000000
 STACK DUMP:
 0x000e2b04 --> 0x000e2b04 --> 00000000
 
+=====
+This surprisingly made progress the GBA logo plays on gbaDoom and SMW GBA. However GBA emerald still crashes and NDS roms still whitescreen.
+New behavior, now some gba roms boot to the logo slowly, however the rom itself does not load afterwards. 
+NDS ACWW:
+Invalid read from 0xffffffff, PC = 0x800e6e14
+Invalid read from 0x00000001, PC = 0x800e6d24
+Invalid read from 0x00000000, PC = 0x800e6d28
+Invalid read from 0x00000003, PC = 0x800e6d24
+Invalid read from 0x00000002, PC = 0x800e6d28
+Invalid read from 0x00000005, PC = 0x800e6d24
+Invalid read from 0x00000004, PC = 0x800e6d28
+Invalid read from 0x00000007, PC = 0x800e6d24
+Invalid read from 0x00000006, PC = 0x800e6d28
+Invalid read from 0x00000009, PC = 0x800e6d24
+gbaDoom:
+Attempted to load a discarded value
+And when launching emerald gba I get this: Exception (ISI) occurred!
+GPR00 000E2B04 GPR08 00000009 GPR16 0004060C GPR24 000E0101
+...
+GPR07 80527060 GPR15 0AF700FD GPR23 254A0006 GPR31 012146F7
+PC 000E2B04 LR 000E2B04 MSR 40009032 Thrd 803501C0
+CR 22887494 CTR 00000000 XER 00000000
+STACK DUMP:
+0x000e2b04 --> 0x000e2b04 --> 00000000
+
+
 
 
