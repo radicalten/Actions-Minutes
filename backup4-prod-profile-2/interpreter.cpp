@@ -20,6 +20,7 @@
 
 #include "core.h"
 #include <tuxedo/thread.h>
+#include "debug_log.h"
 
 Interpreter::Interpreter(Core *core, bool arm7): core(core), arm7(arm7) {
     // Initialize the registers for user mode
@@ -304,7 +305,8 @@ void Interpreter::interrupt() {
 }
 
 int Interpreter::exception(uint8_t vector) {
-    // Forward the call to HLE BIOS if enabled, unless on ARM9 with the exception address changed
+    DebugLog("[EXC] vector=%02X pc=%08X sp=%08X lr=%08X cpsr=%08X\n",
+              vector, getActualPC(), *registers[13], *registers[14], cpsr);
     if (bios && (arm7 || core->cp15.exceptionAddr))
         return bios->execute(vector, registers);
 
