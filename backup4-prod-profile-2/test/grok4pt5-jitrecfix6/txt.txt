@@ -1,1 +1,13 @@
 Grok 4.5 jit_ppc-fix2.cpp fixed the emerald crash! it still does not play the rom, but it does play the gba start logo which is an improvement. 
+
+Great! The emerald rom no longer crashes. Instead when loading gba emerald we get (the logo loads after these errors then stays stuck on blackscreen while fps counter goes up):
+attempted to load a discarded value
+Invalid read from 0x00000000, PC = 0x800eb814
+Invalid read from 0x00000004, PC = 0x800eb81c
+Invalid read from 0x00000008, PC = 0x800eb824
+Invalid read from 0x0000000c, PC = 0x800eb828
+Invalid read from 0x00000010, PC = 0x800eb87c
+Invalid read from 0x00000014, PC = 0x800eb87c
+Invalid read from 0x00000018, PC = 0x800eb8b4
+Invalid read from 0x0000001a, PC = 0x800eb7c4
+Invalid read from 0x00000019, PC = 0x800eb7c8
