@@ -1,11 +1,5 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway
-// Fixed revision 5:
-// 1. CPSR flag helpers corrected (N/Z/C/V bit positions + XER CA)
-// 2. Shifter "preserve C" extracts ARM C from bit2 correctly
-// 3. Spin bursts no longer call tickInline (keeps dual-CPU IPC alive)
-// 4. NDS cycle pacing accounts for ARM7 at half weight
-// 5. GBA HALT still advances floor cycles so VBlank IRQ fires
-// 6. MSR control-field still falls back to interpreter (banked regs)
+// Debug revision: dense, level-gated logging for flag/CPSR/mem/spin issues
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -25,6 +19,54 @@ extern "C" {
 #include <ogc/system.h>
 }
 
+// =============================================================================
+// DEBUG CONTROLS — tune these while bisecting
+// =============================================================================
+// 0 = silent (ship)
+// 1 = init/status/spin/compile-fail + periodic CPU summary
+// 2 = + block enter/exit, fallback ops, cond results (sampled)
+// 3 = + flag before/after on S-bit DP, CPSR commit deltas
+// 4 = + every mem helper access (VERY heavy — short runs only)
+#ifndef JIT_DBG_LEVEL
+#define JIT_DBG_LEVEL 2
+#endif
+
+// Only log cpu0, cpu1, or both (-1)
+#ifndef JIT_DBG_CPU
+#define JIT_DBG_CPU (-1)
+#endif
+
+// Sample period for high-frequency paths (every Nth event)
+#ifndef JIT_DBG_SAMPLE
+#define JIT_DBG_SAMPLE 64
+#endif
+
+// Max unique fallback opcodes to print fully
+#ifndef JIT_DBG_FB_MAX
+#define JIT_DBG_FB_MAX 256
+#endif
+
+// Ring of recent block exits kept for crash context
+#ifndef JIT_DBG_RING
+#define JIT_DBG_RING 32
+#endif
+
+#define JITD(level, ...) \
+    do { if ((level) <= JIT_DBG_LEVEL) DebugLog(__VA_ARGS__); } while (0)
+
+#define JITD_CPU(level, cpu, ...) \
+    do { \
+        if ((level) <= JIT_DBG_LEVEL && \
+            (JIT_DBG_CPU < 0 || JIT_DBG_CPU == (cpu))) \
+            DebugLog(__VA_ARGS__); \
+    } while (0)
+
+static inline bool jitSample(uint32_t& ctr) {
+    return (++ctr % (uint32_t)JIT_DBG_SAMPLE) == 0;
+}
+
+// =============================================================================
+
 static const int EXIT_NORMAL   = 0;
 static const int EXIT_FALLBACK = 1;
 
@@ -38,15 +80,11 @@ static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 static const int ITERS_NDS = 32;
 static const int ITERS_GBA = 32;
 
-// Floor: one scanline worth of cycles per runJit* call.
-// NDS: 355*6 = 2130 ARM9 cycles
-// GBA: 308*4 = 1232 cycles
 static const uint32_t FLOOR_CYCLES_NDS = 2130;
 static const uint32_t FLOOR_CYCLES_GBA = 1232;
 
-// Spin detection
 static const uint32_t SPIN_THRESH = 6;
-static const int      SPIN_STEPS  = 16;  // interpret-only burst; main loop ticks
+static const int      SPIN_STEPS  = 16;
 
 // ── Frame layout ──────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
@@ -67,13 +105,83 @@ static_assert(FRAME_SAVE + 18*4 == FRAME_CORE, "save map");
 static_assert(FRAME_REGSYNC + 15*4 == FRAME_CPSR, "regsync map");
 static_assert(FRAME_PC + 4 <= FRAME_SIZE,       "pc fits");
 
-// ── Debug ─────────────────────────────────────────────────────────────
-static const size_t FB_LOG_MAX = 512;
-struct FbEntry { uint32_t pc; uint32_t op; };
+// ── Debug state ───────────────────────────────────────────────────────
+static const size_t FB_LOG_MAX = JIT_DBG_FB_MAX;
+struct FbEntry { uint32_t pc; uint32_t op; bool thumb; };
 static FbEntry  g_fbLog[FB_LOG_MAX];
 static size_t   g_fbLogCount  = 0;
 static uint32_t g_totalFB[2]  = {};
 static uint32_t g_totalJIT[2] = {};
+static uint32_t g_totalNorm[2]= {};
+static uint32_t g_totalSpin[2]= {};
+static uint32_t g_sampleCtr[8]= {};
+
+struct ExitRingEntry {
+    uint32_t enterPC, exitPC, cpsr, insnCount;
+    int cpu, reason;
+    bool thumb;
+};
+static ExitRingEntry g_exitRing[JIT_DBG_RING];
+static uint32_t      g_exitRingPos = 0;
+
+static void exitRingPush(int cpu, uint32_t enter, uint32_t exit,
+                         int reason, uint32_t cpsr, uint32_t nins, bool thumb) {
+    ExitRingEntry& e = g_exitRing[g_exitRingPos % JIT_DBG_RING];
+    e.enterPC = enter; e.exitPC = exit; e.cpsr = cpsr;
+    e.insnCount = nins; e.cpu = cpu; e.reason = reason; e.thumb = thumb;
+    g_exitRingPos++;
+}
+
+static void exitRingDump(const char* tag) {
+    JITD(1, "[JIT] === exit ring (%s) last %u ===\n", tag,
+         g_exitRingPos < JIT_DBG_RING ? g_exitRingPos : (uint32_t)JIT_DBG_RING);
+    uint32_t n = g_exitRingPos < JIT_DBG_RING ? g_exitRingPos : (uint32_t)JIT_DBG_RING;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t idx = (g_exitRingPos - n + i) % JIT_DBG_RING;
+        const ExitRingEntry& e = g_exitRing[idx];
+        JITD(1, "[JIT]  ring[%u] cpu%d %08X->%08X r=%d cpsr=%08X n=%u %s\n",
+             i, e.cpu, e.enterPC, e.exitPC, e.reason, e.cpsr, e.insnCount,
+             e.thumb ? "T" : "A");
+    }
+}
+
+static const char* cpsrFlagsStr(uint32_t cpsr, char* buf, size_t n) {
+    // NZCV IFT mode
+    snprintf(buf, n, "%c%c%c%c %s%s mode=%02X",
+             (cpsr & 0x80000000u) ? 'N' : 'n',
+             (cpsr & 0x40000000u) ? 'Z' : 'z',
+             (cpsr & 0x20000000u) ? 'C' : 'c',
+             (cpsr & 0x10000000u) ? 'V' : 'v',
+             (cpsr & 0x80u) ? "I" : "i",
+             (cpsr & 0x20u) ? "T" : "A",
+             cpsr & 0x1Fu);
+    return buf;
+}
+
+static void logRegs(int cpu, Interpreter& interp, const char* tag) {
+    if (JIT_DBG_LEVEL < 3) return;
+    if (JIT_DBG_CPU >= 0 && JIT_DBG_CPU != cpu) return;
+    uint32_t** r = interp.getRegisters();
+    if (!r) return;
+    char fl[32];
+    cpsrFlagsStr(interp.getCpsrRef(), fl, sizeof fl);
+    JITD_CPU(3, cpu,
+        "[JIT] %s cpu%d PC=%08X CPSR=%08X [%s]\n",
+        tag, cpu, interp.isReady() ? interp.getActualPC() : 0u,
+        interp.getCpsrRef(), fl);
+    if (r[0] && r[1] && r[2] && r[3])
+        JITD_CPU(3, cpu, "[JIT]   r0=%08X r1=%08X r2=%08X r3=%08X\n",
+                 *r[0], *r[1], *r[2], *r[3]);
+    if (r[4] && r[5] && r[6] && r[7])
+        JITD_CPU(3, cpu, "[JIT]   r4=%08X r5=%08X r6=%08X r7=%08X\n",
+                 *r[4], *r[5], *r[6], *r[7]);
+    if (r[8] && r[9] && r[10] && r[11])
+        JITD_CPU(3, cpu, "[JIT]   r8=%08X r9=%08X r10=%08X r11=%08X\n",
+                 *r[8], *r[9], *r[10], *r[11]);
+    if (r[12] && r[13] && r[14])
+        JITD_CPU(3, cpu, "[JIT]   r12=%08X sp=%08X lr=%08X\n",
+                 *r[12], *r[13], *r[14]);
+}
 
 static bool fbAlreadyLogged(uint32_t pc, uint32_t op) {
     for (size_t i = 0; i < g_fbLogCount; i++)
@@ -86,10 +194,15 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
     if (g_fbLogCount < FB_LOG_MAX) {
         g_fbLog[g_fbLogCount].pc = pc;
         g_fbLog[g_fbLogCount].op = op;
+        g_fbLog[g_fbLogCount].thumb = thumb;
         g_fbLogCount++;
     }
-    if (thumb) DebugLog("[JIT] thumb FB cpu%d pc=%08X op=%04X\n", cpu, pc, op);
-    else       DebugLog("[JIT] arm   FB cpu%d pc=%08X op=%08X\n", cpu, pc, op);
+    if (thumb)
+        JITD_CPU(1, cpu, "[JIT] thumb FB cpu%d pc=%08X op=%04X (uniq=%zu)\n",
+                 cpu, pc, op & 0xFFFF, g_fbLogCount);
+    else
+        JITD_CPU(1, cpu, "[JIT] arm   FB cpu%d pc=%08X op=%08X (uniq=%zu)\n",
+                 cpu, pc, op, g_fbLogCount);
 }
 
 // ── Loop detector ─────────────────────────────────────────────────────
@@ -301,7 +414,7 @@ static size_t hashPC(uint32_t pc){return(pc>>1)&(CSIZ-1);}
 void flushJitCache(){
     codePos=0;++cacheGen;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
-    DebugLog("[JIT] cache flushed gen=%u\n",cacheGen);
+    JITD(1, "[JIT] cache flushed gen=%u\n", cacheGen);
 }
 
 static void flushICache(uint32_t* p,size_t nW){
@@ -335,7 +448,10 @@ struct Ctx {
     }
     void call(void* fn){
         uint32_t a=(uint32_t)(uintptr_t)fn;
-        if(a<0x80000000u||a>=0x81800000u){overflow=true;return;}
+        if(a<0x80000000u||a>=0x81800000u){
+            JITD(1, "[JIT] call() bad addr %08X — overflow\n", a);
+            overflow=true;return;
+        }
         uint16_t hi=(uint16_t)(a>>16),lo=(uint16_t)(a&0xFFFF);
         E(ppc_addis(RCALL,0,(int16_t)hi));
         if(lo)E(ppc_ori(RCALL,RCALL,lo));
@@ -355,48 +471,97 @@ extern "C" {
 int JitHelp_testCond(uint32_t cpsr,uint32_t cond){
     const uint32_t N=(cpsr>>31)&1u,Z=(cpsr>>30)&1u,
                    C=(cpsr>>29)&1u,V=(cpsr>>28)&1u;
+    int r;
     switch(cond&15u){
-        case  0:return(int)Z;
-        case  1:return(int)(Z^1u);
-        case  2:return(int)C;
-        case  3:return(int)(C^1u);
-        case  4:return(int)N;
-        case  5:return(int)(N^1u);
-        case  6:return(int)V;
-        case  7:return(int)(V^1u);
-        case  8:return(int)(C&(Z^1u));
-        case  9:return(int)((C^1u)|Z);
-        case 10:return N==V;
-        case 11:return N!=V;
-        case 12:return(Z==0u&&N==V);
-        case 13:return(Z==1u||N!=V);
-        case 14:return 1;
-        default:return 0;
+        case  0:r=(int)Z; break;
+        case  1:r=(int)(Z^1u); break;
+        case  2:r=(int)C; break;
+        case  3:r=(int)(C^1u); break;
+        case  4:r=(int)N; break;
+        case  5:r=(int)(N^1u); break;
+        case  6:r=(int)V; break;
+        case  7:r=(int)(V^1u); break;
+        case  8:r=(int)(C&(Z^1u)); break;
+        case  9:r=(int)((C^1u)|Z); break;
+        case 10:r=N==V; break;
+        case 11:r=N!=V; break;
+        case 12:r=(Z==0u&&N==V); break;
+        case 13:r=(Z==1u||N!=V); break;
+        case 14:r=1; break;
+        default:r=0; break;
     }
+#if JIT_DBG_LEVEL >= 3
+    if (jitSample(g_sampleCtr[0])) {
+        char fl[32];
+        cpsrFlagsStr(cpsr, fl, sizeof fl);
+        static const char* cn[16] = {
+            "EQ","NE","CS","CC","MI","PL","VS","VC",
+            "HI","LS","GE","LT","GT","LE","AL","NV"
+        };
+        DebugLog("[JIT] testCond cond=%s(%u) cpsr=%08X [%s] -> %d\n",
+                 cn[cond&15u], cond&15u, cpsr, fl, r);
+    }
+#endif
+    return r;
 }
 
 int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
-    if(!interp||!regs||!outCPSR)return -1;
-    if(!interp->isReady())return -1;
+    if(!interp||!regs||!outCPSR){
+        JITD(1, "[JIT] syncFrom NULL args\n");
+        return -1;
+    }
+    if(!interp->isReady()){
+        JITD(2, "[JIT] syncFrom not ready\n");
+        return -1;
+    }
     uint32_t** p=interp->getRegisters();
-    if(!p)return -1;
+    if(!p){
+        JITD(1, "[JIT] syncFrom no register pointers\n");
+        return -1;
+    }
     for(int i=0;i<15;i++){
-        if(!p[i])return -1;
+        if(!p[i]){
+            JITD(1, "[JIT] syncFrom p[%d] NULL\n", i);
+            return -1;
+        }
         regs[i]=*p[i];
     }
     *outCPSR=interp->getCpsrRef();
+#if JIT_DBG_LEVEL >= 3
+    if (jitSample(g_sampleCtr[1])) {
+        char fl[32];
+        cpsrFlagsStr(*outCPSR, fl, sizeof fl);
+        DebugLog("[JIT] syncFrom cpsr=%08X [%s] r0=%08X r1=%08X sp=%08X lr=%08X\n",
+                 *outCPSR, fl, regs[0], regs[1], regs[13], regs[14]);
+    }
+#endif
     return 0;
 }
 
-// CPSR written before setPC so flushPipeline sees correct thumb bit
 int JitHelp_commit(Interpreter* interp,int cpu,
                    uint32_t* regs,uint32_t cpsr,
                    uint32_t pc,int reason){
-    if(!interp||!regs||cpu<0||cpu>1)return -1;
+    if(!interp||!regs||cpu<0||cpu>1){
+        JITD(1, "[JIT] commit bad args interp=%p regs=%p cpu=%d\n",
+             (void*)interp, (void*)regs, cpu);
+        return -1;
+    }
     uint32_t** p=interp->getRegisters();
-    if(!p)return -1;
+    if(!p){
+        JITD(1, "[JIT] commit no register pointers cpu%d\n", cpu);
+        return -1;
+    }
+
+#if JIT_DBG_LEVEL >= 3
+    uint32_t oldCpsr = interp->getCpsrRef();
+    uint32_t oldPC   = interp->isReady() ? interp->getActualPC() : 0;
+#endif
+
     for(int i=0;i<15;i++){
-        if(!p[i])return -1;
+        if(!p[i]){
+            JITD(1, "[JIT] commit p[%d] NULL cpu%d\n", i, cpu);
+            return -1;
+        }
         *p[i]=regs[i];
     }
     interp->getCpsrRef()=cpsr;
@@ -404,15 +569,115 @@ int JitHelp_commit(Interpreter* interp,int cpu,
     g_exitCPSR[cpu]  =cpsr;
     g_exitReason[cpu]=reason;
     interp->setPC(pc);
+
+#if JIT_DBG_LEVEL >= 3
+    if (jitSample(g_sampleCtr[2]) || reason == EXIT_FALLBACK) {
+        char flo[32], fln[32];
+        cpsrFlagsStr(oldCpsr, flo, sizeof flo);
+        cpsrFlagsStr(cpsr, fln, sizeof fln);
+        uint32_t delta = oldCpsr ^ cpsr;
+        DebugLog("[JIT] commit cpu%d reason=%d pc %08X->%08X\n",
+                 cpu, reason, oldPC, pc);
+        DebugLog("[JIT]   cpsr %08X [%s] -> %08X [%s] delta=%08X\n",
+                 oldCpsr, flo, cpsr, fln, delta);
+        if (delta & 0xF0000000u) {
+            DebugLog("[JIT]   FLAG DELTA: %s%s%s%s\n",
+                     (delta & 0x80000000u) ? "N " : "",
+                     (delta & 0x40000000u) ? "Z " : "",
+                     (delta & 0x20000000u) ? "C " : "",
+                     (delta & 0x10000000u) ? "V " : "");
+        }
+        if (delta & 0x1Fu) {
+            DebugLog("[JIT]   MODE DELTA: %02X -> %02X\n",
+                     oldCpsr & 0x1Fu, cpsr & 0x1Fu);
+        }
+        if (delta & 0x20u) {
+            DebugLog("[JIT]   THUMB BIT TOGGLED\n");
+        }
+    }
+#endif
     return 0;
 }
 
-uint32_t JitHelp_r32(Core*c,int a,uint32_t ad){return c?c->memory.read<uint32_t>((bool)a,ad):0;}
-uint16_t JitHelp_r16(Core*c,int a,uint32_t ad){return c?c->memory.read<uint16_t>((bool)a,ad):0;}
-uint8_t  JitHelp_r8 (Core*c,int a,uint32_t ad){return c?c->memory.read<uint8_t> ((bool)a,ad):0;}
-void JitHelp_w32(Core*c,int a,uint32_t ad,uint32_t v){if(c)c->memory.write<uint32_t>((bool)a,ad,v);}
-void JitHelp_w16(Core*c,int a,uint32_t ad,uint16_t v){if(c)c->memory.write<uint16_t>((bool)a,ad,v);}
-void JitHelp_w8 (Core*c,int a,uint32_t ad,uint8_t  v){if(c)c->memory.write<uint8_t> ((bool)a,ad,v);}
+// Memory helpers with optional tracing + IO spotlight (VRAM/IO/palette)
+static inline bool isInterestingAddr(uint32_t ad) {
+    // IO, VRAM, palette, OAM — text corruption often shows here
+    return (ad >= 0x04000000u && ad < 0x05000000u) ||
+           (ad >= 0x05000000u && ad < 0x07000000u) ||
+           (ad >= 0x06000000u && ad < 0x07000000u) ||
+           (ad >= 0x07000000u && ad < 0x08000000u);
+}
+
+uint32_t JitHelp_r32(Core*c,int a,uint32_t ad){
+    uint32_t v = c ? c->memory.read<uint32_t>((bool)a,ad) : 0;
+#if JIT_DBG_LEVEL >= 4
+    if (jitSample(g_sampleCtr[3]) || isInterestingAddr(ad))
+        DebugLog("[JIT] r32 cpu%d [%08X]=%08X\n", a, ad, v);
+#elif JIT_DBG_LEVEL >= 2
+    if (isInterestingAddr(ad) && jitSample(g_sampleCtr[3]))
+        DebugLog("[JIT] r32-io cpu%d [%08X]=%08X\n", a, ad, v);
+#endif
+    return v;
+}
+uint16_t JitHelp_r16(Core*c,int a,uint32_t ad){
+    uint16_t v = c ? c->memory.read<uint16_t>((bool)a,ad) : 0;
+#if JIT_DBG_LEVEL >= 4
+    if (jitSample(g_sampleCtr[3]) || isInterestingAddr(ad))
+        DebugLog("[JIT] r16 cpu%d [%08X]=%04X\n", a, ad, v);
+#elif JIT_DBG_LEVEL >= 2
+    if (isInterestingAddr(ad) && jitSample(g_sampleCtr[3]))
+        DebugLog("[JIT] r16-io cpu%d [%08X]=%04X\n", a, ad, v);
+#endif
+    return v;
+}
+uint8_t  JitHelp_r8 (Core*c,int a,uint32_t ad){
+    uint8_t v = c ? c->memory.read<uint8_t>((bool)a,ad) : 0;
+#if JIT_DBG_LEVEL >= 4
+    if (jitSample(g_sampleCtr[3]) || isInterestingAddr(ad))
+        DebugLog("[JIT] r8  cpu%d [%08X]=%02X\n", a, ad, v);
+#endif
+    return v;
+}
+void JitHelp_w32(Core*c,int a,uint32_t ad,uint32_t v){
+#if JIT_DBG_LEVEL >= 4
+    if (jitSample(g_sampleCtr[4]) || isInterestingAddr(ad))
+        DebugLog("[JIT] w32 cpu%d [%08X]=%08X\n", a, ad, v);
+#elif JIT_DBG_LEVEL >= 2
+    if (isInterestingAddr(ad) && jitSample(g_sampleCtr[4]))
+        DebugLog("[JIT] w32-io cpu%d [%08X]=%08X\n", a, ad, v);
+#endif
+    // Spotlight: VRAM / BG map writes (text corruption)
+#if JIT_DBG_LEVEL >= 1
+    if (ad >= 0x06000000u && ad < 0x06020000u) {
+        if (jitSample(g_sampleCtr[5]))
+            DebugLog("[JIT] VRAM w32 cpu%d [%08X]=%08X\n", a, ad, v);
+    }
+#endif
+    if(c)c->memory.write<uint32_t>((bool)a,ad,v);
+}
+void JitHelp_w16(Core*c,int a,uint32_t ad,uint16_t v){
+#if JIT_DBG_LEVEL >= 4
+    if (jitSample(g_sampleCtr[4]) || isInterestingAddr(ad))
+        DebugLog("[JIT] w16 cpu%d [%08X]=%04X\n", a, ad, v);
+#elif JIT_DBG_LEVEL >= 2
+    if (isInterestingAddr(ad) && jitSample(g_sampleCtr[4]))
+        DebugLog("[JIT] w16-io cpu%d [%08X]=%04X\n", a, ad, v);
+#endif
+#if JIT_DBG_LEVEL >= 1
+    if (ad >= 0x06000000u && ad < 0x06020000u) {
+        if (jitSample(g_sampleCtr[5]))
+            DebugLog("[JIT] VRAM w16 cpu%d [%08X]=%04X\n", a, ad, v);
+    }
+#endif
+    if(c)c->memory.write<uint16_t>((bool)a,ad,v);
+}
+void JitHelp_w8 (Core*c,int a,uint32_t ad,uint8_t  v){
+#if JIT_DBG_LEVEL >= 4
+    if (jitSample(g_sampleCtr[4]) || isInterestingAddr(ad))
+        DebugLog("[JIT] w8  cpu%d [%08X]=%02X\n", a, ad, v);
+#endif
+    if(c)c->memory.write<uint8_t> ((bool)a,ad,v);
+}
 
 int JitHelp_armBlock(Core* core,int arm7,uint32_t op,
                      uint32_t* regs,uint32_t pcForR15,
@@ -422,13 +687,21 @@ int JitHelp_armBlock(Core* core,int arm7,uint32_t op,
     const bool w=(op>>21)&1,l=(op>>20)&1;
     const uint8_t  rn  =(op>>16)&0xF;
     const uint16_t list=(uint16_t)(op&0xFFFF);
-    if(S||rn>14||!list)return -1;
+    if(S||rn>14||!list){
+        JITD(2, "[JIT] armBlock reject S=%d rn=%u list=%04X\n", (int)S, rn, list);
+        return -1;
+    }
     int n=0;
     for(int i=0;i<16;i++)if(list&(1u<<i))n++;
     const uint32_t base=regs[rn];
     uint32_t addr,wb;
     if(u){wb=base+(uint32_t)n*4u;addr=p?base+4u:base;}
     else {wb=base-(uint32_t)n*4u;addr=p?wb      :wb+4u;}
+#if JIT_DBG_LEVEL >= 3
+    if (jitSample(g_sampleCtr[6]))
+        DebugLog("[JIT] armBlock %s rn=r%u base=%08X list=%04X p=%d u=%d w=%d\n",
+                 l?"LDM":"STM", rn, base, list, (int)p,(int)u,(int)w);
+#endif
     int wrotePC=0;
     if(l){
         for(int i=0;i<16;i++){
@@ -518,6 +791,25 @@ void JitHelp_tick(Core* core,uint32_t cycles){
         if(e.task>=0&&e.task<MAX_TASKS&&core->tasks[e.task].fn)
             core->tasks[e.task]();
     }
+}
+
+// Debug-only: software flag reference to compare against JIT CPSR
+// Not called from emitted code by default — available for future hooks.
+uint32_t JitHelp_refFlagsNZCV_add(uint32_t a, uint32_t b, uint32_t res, uint32_t oldCpsr) {
+    uint32_t f = oldCpsr & ~0xF0000000u;
+    if (res & 0x80000000u) f |= 0x80000000u;
+    if (res == 0)          f |= 0x40000000u;
+    if (res < a)           f |= 0x20000000u; // unsigned carry out
+    if ((~(a ^ b) & (a ^ res)) & 0x80000000u) f |= 0x10000000u;
+    return f;
+}
+uint32_t JitHelp_refFlagsNZCV_sub(uint32_t a, uint32_t b, uint32_t res, uint32_t oldCpsr) {
+    uint32_t f = oldCpsr & ~0xF0000000u;
+    if (res & 0x80000000u) f |= 0x80000000u;
+    if (res == 0)          f |= 0x40000000u;
+    if (a >= b)            f |= 0x20000000u; // ARM C = NOT borrow
+    if (((a ^ b) & (a ^ res)) & 0x80000000u) f |= 0x10000000u;
+    return f;
 }
 
 } // extern "C"
@@ -624,11 +916,8 @@ static void patchSkip(Ctx& ctx,size_t idx){
 //   ARM V = bit3 (0x10000000)
 // ═══════════════════════════════════════════════════════════════════════
 static void setNZ(Ctx& ctx, uint8_t r){
-    // clear N and Z (bits 0 and 1)
     ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 2, 31));
-    // N = sign bit of r
     ctx.E(ppc_rlwimi(RCPSR, r, 0, 0, 0));
-    // Z from CR6.EQ (bit 26 of mfcr) → bit 1: rotate left by 7
     ctx.E(ppc_cmpi(6, r, 0));
     ctx.E(ppc_mfcr(TA));
     ctx.E(ppc_rlwinm(TA, TA, 7, 1, 1));
@@ -636,43 +925,38 @@ static void setNZ(Ctx& ctx, uint8_t r){
 }
 
 static void setC_xer(Ctx& ctx){
-    // XER CA lives in bit 2 — identical value to ARM C
     ctx.E(ppc_mfxer(TA));
-    ctx.E(ppc_rlwinm(TA, TA, 0, 2, 2));          // isolate CA
-    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));     // clear C (bit 2)
+    ctx.E(ppc_rlwinm(TA, TA, 0, 2, 2));
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));
     ctx.E(ppc_or(RCPSR, RCPSR, TA));
 }
 
 static void setV_add(Ctx& ctx, uint8_t res, uint8_t a, uint8_t b){
-    // V = sign bit of (res^a) & (res^b)
     ctx.E(ppc_xor(TE, res, a));
     ctx.E(ppc_xor(TF, res, b));
     ctx.E(ppc_and(TE, TE, TF));
-    ctx.E(ppc_rlwinm(TE, TE, 3, 3, 3));           // bit0 → bit3 (V)
-    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 4, 2));     // clear V
+    ctx.E(ppc_rlwinm(TE, TE, 3, 3, 3));
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 4, 2));
     ctx.E(ppc_or(RCPSR, RCPSR, TE));
 }
 
 static void setV_sub(Ctx& ctx, uint8_t res, uint8_t a, uint8_t b){
-    // V = sign bit of (a^b) & (a^res)
     ctx.E(ppc_xor(TE, a, b));
     ctx.E(ppc_xor(TF, a, res));
     ctx.E(ppc_and(TE, TE, TF));
-    ctx.E(ppc_rlwinm(TE, TE, 3, 3, 3));           // bit0 → bit3 (V)
-    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 4, 2));     // clear V
+    ctx.E(ppc_rlwinm(TE, TE, 3, 3, 3));
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 4, 2));
     ctx.E(ppc_or(RCPSR, RCPSR, TE));
 }
 
 static void setC_imm(Ctx& ctx, uint8_t cr){
-    // cr is 0/1 in LSB → ARM C in bit 2
     ctx.E(ppc_rlwinm(TA, cr, 2, 2, 2));
-    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));     // clear C
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));
     ctx.E(ppc_or(RCPSR, RCPSR, TA));
 }
 
 static void primeCarry(Ctx& ctx){
-    // ARM C (bit 2) → 0/1 in LSB, then addic -1 primes XER[CA]
-    ctx.E(ppc_rlwinm(TA, RCPSR, 29, 31, 31));     // bit2 → bit31
+    ctx.E(ppc_rlwinm(TA, RCPSR, 29, 31, 31));
     ctx.E(ppc_addic(0, TA, -1));
 }
 
@@ -682,7 +966,7 @@ static void primeCarry(Ctx& ctx){
 static void sLslI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
     if(i==0){
         if(d!=s) ctx.E(ppc_mr(d,s));
-        if(sc) ctx.E(ppc_rlwinm(TC, RCPSR, 29, 31, 31));  // preserve C as 0/1
+        if(sc) ctx.E(ppc_rlwinm(TC, RCPSR, 29, 31, 31));
     }else if(i<32){
         if(sc) ctx.E(ppc_rlwinm(TC, s, (uint8_t)i, 31, 31));
         ctx.E(ppc_rlwinm(d, s, (uint8_t)i, 0, (uint8_t)(31-i)));
@@ -717,15 +1001,14 @@ static void sAsrI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
         ctx.E(ppc_srawi(d, s, (uint8_t)i));
     }else{
         if(d!=s) ctx.E(ppc_mr(d,s));
-        if(sc) ctx.E(ppc_rlwinm(TC, RCPSR, 29, 31, 31));  // preserve C
+        if(sc) ctx.E(ppc_rlwinm(TC, RCPSR, 29, 31, 31));
     }
 }
 
 static void sRorI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
     if(i==0){
-        // RRX
-        if(sc) ctx.E(ppc_rlwinm(TC, s, 0, 31, 31));       // old bit0 → C
-        ctx.E(ppc_rlwinm(TA, RCPSR, 2, 0, 0));             // old C → bit0
+        if(sc) ctx.E(ppc_rlwinm(TC, s, 0, 31, 31));
+        ctx.E(ppc_rlwinm(TA, RCPSR, 2, 0, 0));
         ctx.E(ppc_rlwinm(d, s, 31, 1, 31));
         ctx.E(ppc_or(d, d, TA));
     }else{
@@ -933,13 +1216,9 @@ static bool emitMul(Ctx& ctx,uint32_t op){
     patchSkip(ctx,si);return true;
 }
 
-// ── MSR/MRS ──────────────────────────────────────────────────────────
-// MSR with any control bits (mask & 0x7 != 0) changes CPU mode and swaps
-// banked registers. Fall back to interpreter. Only flags-only MSR is safe.
 static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
 
-    // MRS Rd, CPSR
     if((op&0x0FBF0FFF)==0x010F0000){
         uint8_t rd=(op>>12)&0xF;if(rd==15)return false;
         size_t si=emitCondSkip(ctx,cond);
@@ -948,29 +1227,23 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         return true;
     }
 
-    // MRS Rd, SPSR — always fall back
     if((op&0x0FBF0FFF)==0x014F0000) return false;
 
     uint8_t mask=(op>>16)&0xF;
-
-    // Control bits involved → interpreter must do banked register swap
     if(mask & 0x7) return false;
 
-    // mask == 0x8: flags field only (bits 31:24)
-    // MSR CPSR_f, #imm
     if((op&0x0DB0F000)==0x0320F000){
         uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
         if(rot)imm=(imm>>rot)|(imm<<(32-rot));
         imm&=0xFF000000u;
         size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));  // clear bits 31:24
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
         ctx.li(TA,imm);
         ctx.E(ppc_or(RCPSR,RCPSR,TA));
         patchSkip(ctx,si);
         return true;
     }
 
-    // MSR CPSR_f, Rm
     if((op&0x0DB0FFF0)==0x0120F000){
         uint8_t rm=op&0xF;if(rm==15)return false;
         size_t si=emitCondSkip(ctx,cond);
@@ -981,7 +1254,6 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         return true;
     }
 
-    // MSR SPSR_f — fall back
     return false;
 }
 
@@ -1256,6 +1528,10 @@ static JitBlock* compile(Interpreter* interp,Core* core,
     ctx.cap=JIT_WORDS-codePos;if(ctx.cap>BLK_WDS)ctx.cap=BLK_WDS;
     ctx.thumb=thumb;ctx.arm7=arm7;ctx.blockPC=armPC;
     ctx.cpuIdx=cpuIdx;ctx.interp=interp;ctx.core=core;ctx.insnCount=0;
+
+    JITD_CPU(2, cpuIdx, "[JIT] compile cpu%d pc=%08X %s cpsr=%08X\n",
+             cpuIdx, armPC, thumb?"thumb":"arm", interp->getCpsrRef());
+
     emitPrologue(ctx);emitSyncFrom(ctx);
     uint32_t curPC=armPC;int n=0;
     while(n<(int)BLK_ARMS&&!ctx.done&&!ctx.overflow){
@@ -1288,18 +1564,24 @@ static JitBlock* compile(Interpreter* interp,Core* core,
     }
     if(!ctx.done&&!ctx.overflow)emitCommitExit(ctx,curPC,EXIT_NORMAL);
     if(ctx.overflow||ctx.sz()<16){
-        DebugLog("[JIT] compile FAIL pc=%08X overflow=%d sz=%zu\n",armPC,(int)ctx.overflow,ctx.sz());
+        JITD(1, "[JIT] compile FAIL pc=%08X overflow=%d sz=%zu\n",
+             armPC,(int)ctx.overflow,ctx.sz());
         return nullptr;
     }
     if(ctx.base[ctx.sz()-1]!=ppc_blr()){
-        DebugLog("[JIT] compile no-BLR pc=%08X\n",armPC);
+        JITD(1, "[JIT] compile no-BLR pc=%08X sz=%zu last=%08X\n",
+             armPC, ctx.sz(), ctx.base[ctx.sz()-1]);
         return nullptr;
     }
     size_t wds=ctx.sz();flushICache(ctx.base,wds);
     JitBlock& slot=cache[bkt];
     slot.armPC=armPC;slot.code=ctx.base;slot.nW=(uint32_t)wds;
     slot.gen=cacheGen;slot.thumb=thumb;slot.insnCount=(uint32_t)ctx.insnCount;slot.valid=true;
-    codePos+=wds;return &slot;
+    codePos+=wds;
+
+    JITD_CPU(2, cpuIdx, "[JIT] compile OK cpu%d pc=%08X nIns=%d ppcW=%zu\n",
+             cpuIdx, armPC, ctx.insnCount, wds);
+    return &slot;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1327,6 +1609,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     const uint32_t cycPerInsn=arm7?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
 
     if(!interp.isReady()){
+        JITD_CPU(2, cpu, "[JIT] cpu%d not ready — interpret\n", cpu);
         interp.jitRunOpcode();
         return cycPerInsn;
     }
@@ -1334,6 +1617,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     uint32_t pc=interp.getActualPC();
 
     if(pc==0xFFFFFFFFu){
+        JITD_CPU(1, cpu, "[JIT] cpu%d PC=FFFFFFFF — interpret\n", cpu);
         interp.jitRunOpcode();
         return cycPerInsn;
     }
@@ -1341,7 +1625,10 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     if(!validPC(pc,gba)){
         static uint32_t lastBadPC[2]={0u,0u};
         if(pc!=lastBadPC[cpu]){
-            DebugLog("[JIT] cpu%d bad PC %08X\n",cpu,pc);
+            JITD(1, "[JIT] cpu%d bad PC %08X cpsr=%08X\n",
+                 cpu, pc, interp.getCpsrRef());
+            logRegs(cpu, interp, "badPC");
+            exitRingDump("badPC");
             lastBadPC[cpu]=pc;
         }
         interp.jitRunOpcode();
@@ -1351,9 +1638,12 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     g_exitReason[cpu]=EXIT_FALLBACK;
     g_exitPC[cpu]    =pc;
 
+    uint32_t cpsrBefore = interp.getCpsrRef();
+
     JitBlock* b=compile(&interp,&core,pc,arm7,cpu);
     if(!b||!b->code||b->nW<16||
        b->code<codeBuf||b->code+b->nW>codeBuf+JIT_WORDS){
+        JITD_CPU(2, cpu, "[JIT] cpu%d compile miss pc=%08X — interpret\n", cpu, pc);
         interp.jitRunOpcode();
         return cycPerInsn;
     }
@@ -1362,10 +1652,42 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
     const int      reason=g_exitReason[cpu];
     const uint32_t expc  =g_exitPC[cpu];
+    const uint32_t cpsrAfter = interp.getCpsrRef();
     g_totalJIT[cpu]++;
 
-    DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
-             cpu,pc,expc,reason,interp.getCpsrRef());
+    exitRingPush(cpu, pc, expc, reason, cpsrAfter,
+                 b->insnCount, b->thumb);
+
+    // Sampled block trace
+    if (JIT_DBG_LEVEL >= 2 && jitSample(g_sampleCtr[7])) {
+        char flb[32], fla[32];
+        cpsrFlagsStr(cpsrBefore, flb, sizeof flb);
+        cpsrFlagsStr(cpsrAfter,  fla, sizeof fla);
+        JITD_CPU(2, cpu,
+            "[JIT] cpu%d %08X -> %08X r=%d n=%u %s\n",
+            cpu, pc, expc, reason, b->insnCount, b->thumb?"T":"A");
+        JITD_CPU(2, cpu,
+            "[JIT]   cpsr %08X [%s] -> %08X [%s] xor=%08X\n",
+            cpsrBefore, flb, cpsrAfter, fla, cpsrBefore ^ cpsrAfter);
+    }
+
+    // Always log fallback at level 1 (throttled per-pc via fbLogOnce already)
+    if (reason == EXIT_FALLBACK && JIT_DBG_LEVEL >= 2) {
+        char fl[32];
+        cpsrFlagsStr(cpsrAfter, fl, sizeof fl);
+        JITD_CPU(2, cpu,
+            "[JIT] FB-EXIT cpu%d at %08X cpsr=%08X [%s]\n",
+            cpu, expc, cpsrAfter, fl);
+    }
+
+    // Flag sanity: mode bits should almost never change inside a JIT block
+    // (MSR control falls back). If they do, something clobbered CPSR.
+    if ((cpsrBefore & 0x1Fu) != (cpsrAfter & 0x1Fu)) {
+        JITD(1, "[JIT] !! MODE CHANGE in JIT cpu%d %02X->%02X pc %08X->%08X r=%d\n",
+             cpu, cpsrBefore & 0x1Fu, cpsrAfter & 0x1Fu, pc, expc, reason);
+        logRegs(cpu, interp, "modeChange");
+        exitRingDump("modeChange");
+    }
 
     LoopState& ls=s_loop[cpu];
 
@@ -1376,22 +1698,21 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
             ls.fbCount++;
             if(ls.fbCount==SPIN_THRESH && !ls.fbDumped){
                 ls.fbDumped=true;
-                DebugLog("[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
-                         cpu, expc, interp.getCpsrRef(), (int)interp.isThumb());
+                g_totalSpin[cpu]++;
+                JITD(1, "[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
+                     cpu, expc, interp.getCpsrRef(), (int)interp.isThumb());
+                logRegs(cpu, interp, "spin");
                 int stride=interp.isThumb()?2:4;
                 for(int k=-2;k<=4;k++){
                     uint32_t a=expc+(uint32_t)(k*stride);
                     uint32_t w=interp.isThumb()
                         ?(uint32_t)core.memory.read<uint16_t>(arm7,a)
                         :core.memory.read<uint32_t>(arm7,a);
-                    DebugLog("[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
+                    JITD(1, "[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
                 }
-                uint32_t** regs=interp.getRegisters();
-                if(regs)for(int i=0;i<15;i++)if(regs[i])DebugLog("[JIT]   r%d=%08X\n",i,*regs[i]);
+                exitRingDump("spin");
             }
             if(ls.fbCount >= SPIN_THRESH){
-                // Interpret only — NO tickInline.
-                // Main loop (runJitNds/Gba) interleaves CPUs and ticks once.
                 const int steps = SPIN_STEPS;
                 for(int i=0;i<steps;i++){
                     if(interp.halted) break;
@@ -1399,8 +1720,8 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                     if(interp.halted) break;
                     uint32_t newPC = interp.getActualPC();
                     if(newPC != expc){
-                        DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",
-                                 cpu, newPC, i+1);
+                        JITD(1, "[JIT] SPIN cpu%d escaped to %08X after %d steps\n",
+                             cpu, newPC, i+1);
                         ls.fbPC=0xFFFFFFFFu; ls.fbCount=0; ls.fbDumped=false;
                         resetNormSpin(ls);
                         break;
@@ -1410,7 +1731,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
             }
         }else{
             if(ls.fbDumped)
-                DebugLog("[JIT] SPIN cpu%d escaped to %08X\n", cpu, expc);
+                JITD(1, "[JIT] SPIN cpu%d escaped to %08X\n", cpu, expc);
             ls.fbPC = expc;
             ls.fbCount = 1;
             ls.fbDumped = false;
@@ -1419,17 +1740,19 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
         return cycPerInsn;
 
     }else{
+        g_totalNorm[cpu]++;
         ls.fbPC=0xFFFFFFFFu; ls.fbCount=0; ls.fbDumped=false;
 
         if(normSpinDetect(ls, pc, expc)){
             const uint32_t spinA = ls.normBurstPC;
             const uint32_t spinB = ls.normBurstExit;
 
-            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",
-                     cpu, spinA, spinB);
+            JITD(1, "[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",
+                 cpu, spinA, spinB);
+            logRegs(cpu, interp, "normSpin");
             ls.normBursting = true;
+            g_totalSpin[cpu]++;
 
-            // Interpret only — NO tickInline (preserves dual-CPU IPC timing)
             const int steps = SPIN_STEPS;
             bool escaped = false;
             for(int i=0;i<steps;i++){
@@ -1438,15 +1761,15 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                 if(interp.halted){ escaped=true; break; }
                 uint32_t newPC = interp.getActualPC();
                 if(newPC!=spinA && newPC!=spinB){
-                    DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
-                             cpu, spinA, newPC, i+1);
+                    JITD(1, "[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                         cpu, spinA, newPC, i+1);
                     escaped = true;
                     break;
                 }
             }
             resetNormSpin(ls);
             if(!escaped)
-                DebugLog("[JIT] NORM SPIN cpu%d still at %08X\n", cpu, spinA);
+                JITD(1, "[JIT] NORM SPIN cpu%d still at %08X\n", cpu, spinA);
 
             return (uint32_t)steps * cycPerInsn;
         }
@@ -1462,15 +1785,41 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 static uint32_t g_statusTick=0;
 static void logStatus(Core& core){
     g_statusTick++;
-    if((g_statusTick&0x3FF)!=0)return;
-    DebugLog("[JIT] STATUS jit0=%u fb0=%u jit1=%u fb1=%u pos=%zu gen=%u\n",
-             g_totalJIT[0],g_totalFB[0],g_totalJIT[1],g_totalFB[1],codePos,cacheGen);
-    DebugLog("[JIT] STATUS pc0=%08X pc1=%08X h0=%d h1=%d fps=%d cyc=%u\n",
-             core.interpreter[0].isReady()?core.interpreter[0].getActualPC():0u,
-             core.interpreter[1].isReady()?core.interpreter[1].getActualPC():0u,
-             (int)core.interpreter[0].halted,
-             (int)core.interpreter[1].halted,
-             core.fps,core.globalCycles);
+    // level1: every ~1024 runJit calls; level2+: every 256
+    uint32_t mask = (JIT_DBG_LEVEL >= 2) ? 0xFFu : 0x3FFu;
+    if((g_statusTick & mask) != 0) return;
+
+    char fl0[32], fl1[32];
+    uint32_t pc0 = core.interpreter[0].isReady() ? core.interpreter[0].getActualPC() : 0u;
+    uint32_t pc1 = core.interpreter[1].isReady() ? core.interpreter[1].getActualPC() : 0u;
+    uint32_t c0  = core.interpreter[0].getCpsrRef();
+    uint32_t c1  = core.interpreter[1].getCpsrRef();
+    cpsrFlagsStr(c0, fl0, sizeof fl0);
+    cpsrFlagsStr(c1, fl1, sizeof fl1);
+
+    JITD(1, "[JIT] STATUS jit0=%u fb0=%u norm0=%u spin0=%u | jit1=%u fb1=%u norm1=%u spin1=%u\n",
+         g_totalJIT[0], g_totalFB[0], g_totalNorm[0], g_totalSpin[0],
+         g_totalJIT[1], g_totalFB[1], g_totalNorm[1], g_totalSpin[1]);
+    JITD(1, "[JIT] STATUS pos=%zu gen=%u uniqFB=%zu fps=%d cyc=%u gba=%d\n",
+         codePos, cacheGen, g_fbLogCount, core.fps, core.globalCycles, (int)core.gbaMode);
+    JITD(1, "[JIT] STATUS pc0=%08X h0=%d cpsr0=%08X [%s]\n",
+         pc0, (int)core.interpreter[0].halted, c0, fl0);
+    JITD(1, "[JIT] STATUS pc1=%08X h1=%d cpsr1=%08X [%s]\n",
+         pc1, (int)core.interpreter[1].halted, c1, fl1);
+
+    // Dump unique fallback summary occasionally
+    if ((g_statusTick & 0xFFF) == 0 && g_fbLogCount > 0) {
+        JITD(1, "[JIT] === unique fallbacks (%zu) ===\n", g_fbLogCount);
+        size_t show = g_fbLogCount < 32 ? g_fbLogCount : 32;
+        for (size_t i = 0; i < show; i++) {
+            if (g_fbLog[i].thumb)
+                JITD(1, "[JIT]  FB[%zu] T %08X op=%04X\n",
+                     i, g_fbLog[i].pc, g_fbLog[i].op & 0xFFFF);
+            else
+                JITD(1, "[JIT]  FB[%zu] A %08X op=%08X\n",
+                     i, g_fbLog[i].pc, g_fbLog[i].op);
+        }
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1479,13 +1828,10 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    // ARM9 is master clock. ARM7 runs at half rate relative to ARM9 domain.
-    // Interleave both CPUs every iteration, then tick once.
     uint32_t acc = 0;
     for(int i = 0; i < ITERS_NDS; i++){
-        uint32_t c9 = runCpu(core, 0, false); // ARM9
-        uint32_t c7 = runCpu(core, 1, false); // ARM7
-        // globalCycles is ARM9-domain: full ARM9 + half-weight ARM7
+        uint32_t c9 = runCpu(core, 0, false);
+        uint32_t c7 = runCpu(core, 1, false);
         acc += c9 + (c7 / 2);
     }
 
@@ -1497,12 +1843,9 @@ void runJitNds(Core& core){
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    // GBA mode: only cpu1 runs. cpu0 is permanently halted (halt bit 2).
-    // Always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
     uint32_t acc = 0;
     for(int i = 0; i < ITERS_GBA; i++){
         if(core.interpreter[1].halted){
-            // Time still passes while HALTed waiting for IRQ
             acc += CYCLES_PER_INSN_ARM7;
             continue;
         }
@@ -1533,7 +1876,12 @@ bool initJit(Core* core){
     g_fbLogCount=0;
     g_totalFB[0]=g_totalFB[1]=0;
     g_totalJIT[0]=g_totalJIT[1]=0;
+    g_totalNorm[0]=g_totalNorm[1]=0;
+    g_totalSpin[0]=g_totalSpin[1]=0;
     g_statusTick=0;
+    g_exitRingPos=0;
+    memset(g_sampleCtr, 0, sizeof g_sampleCtr);
+    memset(g_exitRing, 0, sizeof g_exitRing);
     s_loop[0]={};s_loop[1]={};
     for(int j=0;j<4;j++){s_loop[0].normHist[j]=0xFFFFFFFFu;s_loop[1].normHist[j]=0xFFFFFFFFu;}
     s_loop[0].fbPC=s_loop[1].fbPC=0xFFFFFFFFu;
@@ -1548,17 +1896,30 @@ bool initJit(Core* core){
     DCFlushRange(codeBuf,JIT_BYTES);
     ICInvalidateRange(codeBuf,JIT_BYTES);
     g_jitLive=true;
-    printf("[JIT] ready buf=%p (%zuKB) tramp=%p BLK_ARMS=%zu\n",
-           (void*)codeBuf,JIT_BYTES>>10,(void*)tr,BLK_ARMS);
-    DebugLog("[JIT] init buf=%p tramp=%p BLK_ARMS=%zu\n",
-             (void*)codeBuf,(void*)tr,BLK_ARMS);
+    printf("[JIT] ready buf=%p (%zuKB) tramp=%p BLK_ARMS=%zu DBG=%d\n",
+           (void*)codeBuf,JIT_BYTES>>10,(void*)tr,BLK_ARMS, JIT_DBG_LEVEL);
+    JITD(1, "[JIT] init buf=%p tramp=%p BLK_ARMS=%zu DBG_LEVEL=%d SAMPLE=%d CPU=%d\n",
+         (void*)codeBuf,(void*)tr,BLK_ARMS, JIT_DBG_LEVEL, JIT_DBG_SAMPLE, JIT_DBG_CPU);
     if(core)core->setRunFunc(core->gbaMode?runJitGba:runJitNds);
     return true;
 }
 
 void shutdownJit(Core* core){
-    DebugLog("[JIT] shutdown fb0=%u fb1=%u jit0=%u jit1=%u\n",
-             g_totalFB[0],g_totalFB[1],g_totalJIT[0],g_totalJIT[1]);
+    JITD(1, "[JIT] shutdown fb0=%u fb1=%u jit0=%u jit1=%u norm0=%u norm1=%u spin0=%u spin1=%u\n",
+         g_totalFB[0],g_totalFB[1],g_totalJIT[0],g_totalJIT[1],
+         g_totalNorm[0],g_totalNorm[1],g_totalSpin[0],g_totalSpin[1]);
+    exitRingDump("shutdown");
+    if (g_fbLogCount) {
+        JITD(1, "[JIT] === final unique fallbacks (%zu) ===\n", g_fbLogCount);
+        for (size_t i = 0; i < g_fbLogCount && i < 64; i++) {
+            if (g_fbLog[i].thumb)
+                JITD(1, "[JIT]  FB[%zu] T %08X op=%04X\n",
+                     i, g_fbLog[i].pc, g_fbLog[i].op & 0xFFFF);
+            else
+                JITD(1, "[JIT]  FB[%zu] A %08X op=%08X\n",
+                     i, g_fbLog[i].pc, g_fbLog[i].op);
+        }
+    }
     g_jitLive=false;
     if(core)core->setRunFunc(core->gbaMode
         ?static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true,0>)
@@ -1568,9 +1929,13 @@ void shutdownJit(Core* core){
 }
 
 void invalidateJitRange(uint32_t start,uint32_t end){
+    int n=0;
     for(size_t i=0;i<CSIZ;i++)
-        if(cache[i].valid&&cache[i].armPC>=start&&cache[i].armPC<end)
-            cache[i].valid=false;
+        if(cache[i].valid&&cache[i].armPC>=start&&cache[i].armPC<end){
+            cache[i].valid=false; n++;
+        }
+    if (n)
+        JITD(2, "[JIT] invalidate %08X-%08X blocks=%d\n", start, end, n);
 }
 
 } // namespace JitPpc
