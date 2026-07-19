@@ -1325,5 +1325,6 @@ FAT mounted, logging started
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 
 
+###reached the token limit already. wasn't exactly productive? could use this as the base of dynarec12 but it doesn't seem any better than dynarec11...
 
 
