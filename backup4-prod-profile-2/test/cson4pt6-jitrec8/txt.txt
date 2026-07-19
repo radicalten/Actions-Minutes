@@ -2,3 +2,4 @@ Cson4.6 first attempt at a fix was not successful. same behavior as before with 
 
 HOLD ON. HOLD THE PHONE! Rock wrestler boots now. amazing. ok let's analyze carefully. 
 
+Turns out rockwrestler worked with the 439 fix7 version too. hmm guess I hadn't checked rockwrestler in quite a few versions. 
