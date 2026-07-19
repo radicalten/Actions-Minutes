@@ -21,19 +21,7 @@ FAT mounted, logging started
 [JIT] arm   FB cpu1 pc=0380074C op=E121F003
 [JIT] arm   FB cpu0 pc=02002D4C op=EE130F10
 [JIT] arm   FB cpu0 pc=02002D54 op=EE150F10
-[JIT] arm   FB cpu0 pc=02002D5C op=EE150F30
-[JIT] arm   FB cpu0 pc=02002D64 op=EE150F50
-[JIT] arm   FB cpu0 pc=02002D6C op=EE150F70
-[JIT] arm   FB cpu0 pc=02002D74 op=EE160F10
-[JIT] arm   FB cpu0 pc=02002D7C op=EE160F11
-[JIT] arm   FB cpu0 pc=02002D84 op=EE160F12
-[JIT] arm   FB cpu0 pc=02002D8C op=EE160F13
-[JIT] arm   FB cpu0 pc=02002D94 op=EE160F14
-[JIT] arm   FB cpu0 pc=02002D9C op=EE160F15
-[JIT] arm   FB cpu0 pc=02002DA4 op=EE160F16
-[JIT] arm   FB cpu0 pc=02002DAC op=EE160F17
-[JIT] arm   FB cpu0 pc=02002DB4 op=EE190F11
-[JIT] arm   FB cpu0 pc=02002DBC op=EE190F31
+...
 [JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
 [JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
 [JIT] SPIN cpu1=03800728 giveup=64, yielding
@@ -71,32 +59,6 @@ FAT mounted, logging started
 [JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
 [JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
 [JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=02000270 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 02000270->02000274 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=02000270 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 02000270->02000274 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=020001B4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001B4->020001B8 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=020001B4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001B4->020001B8 at k=0
-[JIT] DEADLOCK cpu0=020001B4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001B4->020001B8 at k=0
 [JIT] SPIN cpu1=03800728 giveup=64, yielding
 ...
 [JIT] SPIN cpu0=020001B4 giveup=64, yielding
