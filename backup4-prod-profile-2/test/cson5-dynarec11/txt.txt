@@ -1181,5 +1181,149 @@ FAT mounted, logging started
 [JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
 [JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=45 cyc=47181092
 
+==========================
+fix updated logs, fps back to 27-28 on rockwrestler.
+rockwrestler.nds logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f820
+[STATUS] fps=1 cycles=16807806 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=28 cycles=33755462 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=28 cycles=50702402 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=28 cycles=67649342 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549b20 tramp=0x800a0400 BLK_ARMS=8
+[JIT] cpu0 02000100 -> 02002D2C r=0 cpsr=000000DF
+[JIT] cpu1 03800100 -> 038002C0 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] cpu0 02002D2C -> 02002D34 r=1 cpsr=000000DF
+[JIT] cpu1 038002C0 -> 038002EC r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10
+[JIT] cpu0 02002D38 -> 02002D3C r=1 cpsr=000000DF
+[JIT] arm   FB cpu1 pc=038002FC op=E121F003
+[JIT] cpu1 038002EC -> 038002FC r=1 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D44 op=EE120F30
+[JIT] cpu0 02002D40 -> 02002D44 r=1 cpsr=000000DF
+[JIT] arm   FB cpu1 pc=03800304 op=E121F004
+[JIT] cpu1 03800300 -> 03800304 r=1 cpsr=000000D2
+[JIT] arm   FB cpu0 pc=02002D4C op=EE130F10
+...
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] cpu0 020001E8 -> 020001E4 r=0 cpsr=800000DF
+[JIT] cpu1 0380072C -> 03800728 r=0 cpsr=200000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] cpu1 0380072C -> 03800728 r=0 cpsr=200000DF
+[JIT] cpu0 020001E8 -> 020001E4 r=0 cpsr=800000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+gbadoom.gba logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f820
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] fps=0 cycles=8343104 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=0 cycles=16769984 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] fps=0 cycles=25196869 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=1 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+...
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006faf8
+[STATUS] fps=32 cycles=311762470 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=32 cycles=320314422 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=68 cycles=328866378 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=68 cycles=337418330 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+FAT mounted, logging started
+[JIT] init buf=0x80549a60 tramp=0x800a0400 BLK_ARMS=8
+[JIT] cache flushed gen=1
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=1261568
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=2523136
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=3784704
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=5046272
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=6307840
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+...
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=22708224
+[EXC] vector=18 pc=00002BBA sp=03007EA4 lr=00002BAF cpsr=6000007F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=24397299
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=26966028
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00001E4C sp=03007E7C lr=00001DF9 cpsr=2000005F
+[EXC] vector=18 pc=000020B4 sp=03007E7C lr=00000FCC cpsr=8000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=28932305
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[EXC] vector=18 pc=000020A8 sp=03007E7C lr=00000FCC cpsr=8000005F
+...
+[JIT] NORM SPIN cpu1 detected at 08000192->08000192, bursting
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] NORM SPIN cpu1 detected at 08000192->08000192, bursting
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] NORM SPIN cpu1 detected at 08000192->08000192, bursting
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+
+
 
 
