@@ -238,3 +238,47 @@ JIT] GBA SPIN cpu1 at 08000192, running interpreter
 [JIT] NORM SPIN cpu1 detected at 08000192->08000192, bursting
 [JIT] GBA SPIN cpu1 at 08000192, running interpreter
 
+===========
+Every update gets worse. now rockwrestler is 8fps. 
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006ec40
+[STATUS] fps=7 cycles=32576488 pc0=FFFFFFFF pc1=02380140 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=8 cycles=65398888 pc0=FFFFFFFF pc1=02380140 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=8 cycles=98221288 pc0=FFFFFFFF pc1=02380140 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=8 cycles=131043688 pc0=FFFFFFFF pc1=02380140 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=8 cycles=163866088 pc0=FFFFFFFF pc1=02380140 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549820 tramp=0x800a01e0 BLK_ARMS=8
+[JIT] arm   FB cpu0 pc=02000A5C op=EE110F10
+[JIT] arm   FB cpu0 pc=02000A68 op=EE010F10
+[JIT] arm   FB cpu0 pc=02000A70 op=EE070F15
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] DEADLOCK cpu0=02000924 cpu1=02380020 — interleaving
+[JIT] DEADLOCK cpu0 escaped 02000924->02000928 at k=0
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] DEADLOCK cpu0=02000924 cpu1=02380020 — interleaving
+[JIT] DEADLOCK cpu0 escaped 02000924->02000928 at k=0
+[JIT] SPIN cpu1=02380020, running cpu0 interp
