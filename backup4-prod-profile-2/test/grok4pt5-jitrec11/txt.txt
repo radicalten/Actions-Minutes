@@ -1,1 +1,1 @@
-
+first change was bad made rockwrestler rom text disappear. asked it to add more debug logs for round 2. 
