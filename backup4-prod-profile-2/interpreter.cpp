@@ -529,3 +529,21 @@ void Interpreter::setPC(uint32_t newPC) {
     *registers[15] = newPC;
     flushPipeline();
 }
+
+void Interpreter::commitFromJit(uint32_t* regs, uint32_t newCpsr, uint32_t newPC) {
+    // Step 1: Write r0-r14 into the CURRENT mode's register slots.
+    // getRegisters() returns pointers valid for the current (pre-switch) mode.
+    uint32_t** p = registers;
+    for (int i = 0; i < 15; i++) {
+        if (p[i]) *p[i] = regs[i];
+    }
+    
+    // Step 2: Apply the new CPSR properly, which handles mode switching
+    // (swapping banked registers) via swapRegisters internally.
+    // We use setCpsr which is the correct internal path.
+    setCpsr(newCpsr);
+    
+    // Step 3: Set the new PC. At this point the register pointers are
+    // correct for the new mode, so flushPipeline will work correctly.
+    setPC(newPC);
+}
