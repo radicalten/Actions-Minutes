@@ -1,1 +1,105 @@
 first change was bad made rockwrestler rom text disappear. asked it to add more debug logs for round 2. 
+
+
+===
+round 2 logs, text on rockwrestler still invisible:
+rockwrestler.nds
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x80070abc
+[STATUS] fps=28 cycles=16654470 pc0=020001E4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=28 cycles=33460170 pc0=020001E8 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=28 cycles=50265870 pc0=020001E4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x8054b8a0 tramp=0x800a1a00 BLK_ARMS=8 DBG_LEVEL=2 SAMPLE=64 CPU=-1
+[JIT] compile cpu0 pc=02000100 arm cpsr=000000DF
+[JIT] compile OK cpu0 pc=02000100 nIns=1 ppcW=132
+[JIT] compile cpu1 pc=03800100 arm cpsr=000000DF
+[JIT] compile OK cpu1 pc=03800100 nIns=1 ppcW=132
+[JIT] compile cpu0 pc=02002D2C arm cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10 (uniq=1)
+[JIT] compile OK cpu0 pc=02002D2C nIns=2 ppcW=146
+[JIT] FB-EXIT cpu0 at 02002D34 cpsr=000000DF [nzcv IA mode=1F]
+[JIT] compile cpu1 pc=038002C0 arm cpsr=000000DF
+[JIT] compile OK cpu1 pc=038002C0 nIns=3 ppcW=148
+[JIT] compile cpu0 pc=02002D38 arm cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10 (uniq=2)
+[JIT] compile OK cpu0 pc=02002D38 nIns=1 ppcW=145
+[JIT] FB-EXIT cpu0 at 02002D3C cpsr=000000DF [nzcv IA mode=1F]
+...
+NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] cpu1 03800728 -> 03800728 r=0 n=2 A
+[JIT]   cpsr 200000DF [nzCv IA mode=1F] -> 200000DF [nzCv IA mode=1F] xor=00000000
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] cpu1 0380072C -> 03800728 r=0 n=1 A
+...
+[JIT]   cpsr 200000DF [nzCv IA mode=1F] -> 200000DF [nzCv IA mode=1F] xor=00000000
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] w32-io cpu0 [06805AC0]=56B556B5
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] cpu1 03800728 -> 03800728 r=0 n=2 A
+[JIT]   cpsr 200000DF [nzCv IA mode=1F] -> 200000DF [nzCv IA mode=1F] xor=00000000
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+gbatestsuite.gba
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x80070abc
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x80070d9c
+[STATUS] fps=1 cycles=8343104 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=1 cycles=16769984 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x80070d9c
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+...
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x80070d9c
+[STATUS] fps=58 cycles=311711046 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=58 cycles=320137926 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=63 cycles=328564806 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=63 cycles=336991686 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=62 cycles=345418566 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x8054b820 tramp=0x800a1a00 BLK_ARMS=8 DBG_LEVEL=2 SAMPLE=64 CPU=-1
+[JIT] cache flushed gen=1
+[JIT] cpu1 not ready — interpret
+[JIT] cpu1 not ready — interpret
+[JIT] cpu1 not ready — interpret
+[JIT] cpu1 not ready — interpret
