@@ -2857,3 +2857,5 @@ FAT mounted, logging started
 [JIT] cpu1 02380024 -> 02380024 r=1 cpsr=800000DF
 [JIT] cpu0 02000924 -> 02000928 r=0 cpsr=8000001F
 [JIT] cpu1 02380028 -> 02380020 r=0 cpsr=800000DF
+
+### hit the token limit right here which is too bad as it is such a quality debug log. time for dynarec9.
