@@ -30,15 +30,6 @@ FAT mounted, logging started
 [JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
 [JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
 [JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] SPIN cpu1=03800728 giveup=64, yielding
-[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
-[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
-[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
 ...
 [JIT] SPIN cpu0=020001B4 giveup=64, yielding
 [JIT] SPIN cpu0=020001B4 giveup=64, yielding
@@ -68,16 +59,7 @@ FAT mounted, logging started
 [JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
 [JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=3784704
 [JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=5046272
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=6307840
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=7569408
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=8830976
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=10092544
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+...
 [JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=11354112
 [EXC] vector=18 pc=00002BBA sp=03007EA4 lr=00002BAF cpsr=6000007F
 [EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
