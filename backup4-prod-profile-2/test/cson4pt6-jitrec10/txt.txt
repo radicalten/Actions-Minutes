@@ -584,3 +584,7 @@ fix3 seemed to merely reduce fps to 20fps in rockwrestler from 28fps. no other c
 Oh and the debug text is gone. bad update tbh.
 
 #token limit reached here. plan to revert back to fix2. put back interpreter.h/cpp backup and place fix2 as dynarec11. plus I am out of prompt usage today anyway.
+
+
+==
+playing with rockwrestler on fix2 it seems again the ARM7 red/green light idea where the light goes out due to IPC is a good idea. it gives Timeout occasionally on IPCSYNC, IPCFIFO, and IPCFIFO IRQ which is clearly affecting things. need to incorprate that into dynarec 11 initial Q. 
