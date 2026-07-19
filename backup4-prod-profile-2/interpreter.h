@@ -27,6 +27,7 @@ public:
     template <bool, int> static void runCoreSingle(Core &core);
     static void runCoreNds(Core &core);
     static void runCoreDsi(Core &core);
+    void commitFromJit(uint32_t* regs, uint32_t newCpsr, uint32_t newPC);
 
     uint16_t getOpcode16();
     uint32_t getOpcode32();
