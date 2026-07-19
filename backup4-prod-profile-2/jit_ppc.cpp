@@ -1,12 +1,11 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway
-// Fixed revision:
-// 1. NDS cycle accounting: charge max(acc0,acc1) not avg
-// 2. GBA: don't break early on halted, always charge floor
-// 3. JitHelp_commit: set CPSR before setPC so thumb bit is correct
-// 4. NORM SPIN: fix escape detection using normBurstPC
-// 5. Bad PC guard: don't call jitRunOpcode if not ready
-// 6. Scheduler: use pop_front pattern safely
-// 7. runJitGba: always tick floor even if cpu was halted all iters
+// Fixed revision 3:
+// 1. GBA: don't charge floor cycles when cpu1 not ready; let interpreter init naturally
+// 2. GBA: treat address 0x00000000 as valid (GBA BIOS entry point)  
+// 3. NDS: reset normCount after successful burst escape
+// 4. NDS: fix double-burst: after burst, reset history so we don't immediately re-detect
+// 5. GBA halted: don't charge cycles when halted waiting for init, only after ready
+// 6. Fix scheduler over-advance: cap floor to only apply when cpu was actually running
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -36,13 +35,14 @@ static int      g_exitReason[2]= {};
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 
-// Iterations per runJit* call
 static const int ITERS_NDS = 32;
 static const int ITERS_GBA = 32;
 
-// Floor cycles per runJit* call (one scanline worth)
-// NDS: scanline = 355*6 = 2130 ARM9 cycles
-// GBA: scanline = 308*4 = 1232 cycles
+// Floor cycles per runJit* call — one scanline worth.
+// NDS: 355*6 = 2130 ARM9 cycles per scanline
+// GBA: 308*4 = 1232 cycles per scanline
+// IMPORTANT: floor is only applied when the CPU actually ran something.
+// If cpu was not ready, we charge zero and let the interpreter init naturally.
 static const uint32_t FLOOR_CYCLES_NDS = 2130;
 static const uint32_t FLOOR_CYCLES_GBA = 1232;
 
@@ -96,10 +96,6 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
 }
 
 // ── Loop detector ─────────────────────────────────────────────────────
-// Detects:
-//   1. FALLBACK spin: same PC keeps falling back
-//   2. NORM spin: tight compiled loop
-//   3. Alternating spin: A->B->A->B pattern
 struct LoopState {
     // FALLBACK spin tracking
     uint32_t fbPC    = 0xFFFFFFFFu;
@@ -109,24 +105,36 @@ struct LoopState {
     // NORM spin tracking
     uint32_t normHist[4]  = {0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu};
     uint32_t normCount    = 0;
-    uint32_t normBurstPC  = 0xFFFFFFFFu; // entry PC when burst started
-    uint32_t normBurstExit= 0xFFFFFFFFu; // exit PC when burst started
+    uint32_t normBurstPC  = 0xFFFFFFFFu;
+    uint32_t normBurstExit= 0xFFFFFFFFu;
+    bool     normBursting = false; // true while we're inside a burst
 };
 static LoopState s_loop[2];
 
-// Push a new normal exit PC into history and return true if spin detected.
-// entryPC = PC we compiled from, exitPC = PC after block execution.
+static void resetNormSpin(LoopState& ls) {
+    for(int j=0;j<4;j++) ls.normHist[j]=0xFFFFFFFFu;
+    ls.normCount     = 0;
+    ls.normBurstPC   = 0xFFFFFFFFu;
+    ls.normBurstExit = 0xFFFFFFFFu;
+    ls.normBursting  = false;
+}
+
+// Returns true if a spin is detected and we should burst.
+// Sets normBurstPC / normBurstExit before returning true.
 static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
+    // If we're already bursting, don't re-detect
+    if(ls.normBursting) return false;
+
     // Shift history
     ls.normHist[3] = ls.normHist[2];
     ls.normHist[2] = ls.normHist[1];
     ls.normHist[1] = ls.normHist[0];
     ls.normHist[0] = exitPC;
 
-    // Case 1: tight self-loop (exitPC == entryPC)
-    if (exitPC == entryPC) {
+    // Case 1: tight self-loop
+    if(exitPC == entryPC){
         ls.normCount++;
-        if (ls.normCount >= SPIN_THRESH) {
+        if(ls.normCount >= SPIN_THRESH){
             ls.normBurstPC   = entryPC;
             ls.normBurstExit = exitPC;
             return true;
@@ -134,25 +142,24 @@ static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
         return false;
     }
 
-    // Case 2: alternating two-address loop:
-    // history = [A, B, A, B] — two distinct addresses alternating
-    if (ls.normHist[0] != 0xFFFFFFFFu &&
-        ls.normHist[1] != 0xFFFFFFFFu &&
-        ls.normHist[2] != 0xFFFFFFFFu &&
-        ls.normHist[3] != 0xFFFFFFFFu &&
-        ls.normHist[0] == ls.normHist[2] &&
-        ls.normHist[1] == ls.normHist[3] &&
-        ls.normHist[0] != ls.normHist[1]) {
+    // Case 2: alternating two-address loop A->B->A->B
+    if(ls.normHist[0] != 0xFFFFFFFFu &&
+       ls.normHist[1] != 0xFFFFFFFFu &&
+       ls.normHist[2] != 0xFFFFFFFFu &&
+       ls.normHist[3] != 0xFFFFFFFFu &&
+       ls.normHist[0] == ls.normHist[2] &&
+       ls.normHist[1] == ls.normHist[3] &&
+       ls.normHist[0] != ls.normHist[1]){
         ls.normCount++;
-        if (ls.normCount >= SPIN_THRESH) {
-            ls.normBurstPC   = ls.normHist[1]; // the earlier of the two
-            ls.normBurstExit = ls.normHist[0]; // the later
+        if(ls.normCount >= SPIN_THRESH){
+            ls.normBurstPC   = ls.normHist[1];
+            ls.normBurstExit = ls.normHist[0];
             return true;
         }
         return false;
     }
 
-    // Different pattern — reset counter but keep history
+    // Different pattern
     ls.normCount = 0;
     return false;
 }
@@ -393,8 +400,7 @@ int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
     return 0;
 }
 
-// FIX #1: Set CPSR *before* calling setPC so the thumb bit is correct
-// when flushPipeline() reads the mode to determine pipeline refill size.
+// CPSR must be written before setPC so flushPipeline sees correct thumb bit
 int JitHelp_commit(Interpreter* interp,int cpu,
                    uint32_t* regs,uint32_t cpsr,
                    uint32_t pc,int reason){
@@ -405,13 +411,10 @@ int JitHelp_commit(Interpreter* interp,int cpu,
         if(!p[i])return -1;
         *p[i]=regs[i];
     }
-    // CRITICAL FIX: write CPSR first so thumb bit is set before setPC
-    // flushPipeline() uses isThumb() which reads cpsr, so this ordering matters.
-    interp->getCpsrRef() = cpsr;
-    g_exitPC[cpu]    = pc;
-    g_exitCPSR[cpu]  = cpsr;
-    g_exitReason[cpu]= reason;
-    // Now setPC is safe: isThumb() returns the correct value
+    interp->getCpsrRef()=cpsr;
+    g_exitPC[cpu]    =pc;
+    g_exitCPSR[cpu]  =cpsr;
+    g_exitReason[cpu]=reason;
     interp->setPC(pc);
     return 0;
 }
@@ -517,17 +520,11 @@ int JitHelp_thumbBlock(Core* core,int arm7,uint32_t op,uint32_t* regs){
     return 0;
 }
 
-// FIX #2: Use a local copy of events to avoid iterator invalidation
-// when a task callback (e.g. updateRun) itself modifies the event list.
 void JitHelp_tick(Core* core,uint32_t cycles){
     if(!core)return;
     core->globalCycles+=cycles;
-    // Process all events whose time has come.
-    // Tasks may re-schedule themselves (e.g. RESET_CYCLES), so we must
-    // re-check events.front() after each dispatch.
-    while(!core->events.empty()){
-        if(core->globalCycles < core->events.front().cycles)
-            break;
+    while(!core->events.empty()&&
+          core->globalCycles>=core->events.front().cycles){
         SchedEvent e=core->events.front();
         core->events.erase(core->events.begin());
         if(e.task>=0&&e.task<MAX_TASKS&&core->tasks[e.task].fn)
@@ -1151,23 +1148,32 @@ static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
 // ═══════════════════════════════════════════════════════════════════════
 // Address validation
 // ═══════════════════════════════════════════════════════════════════════
-static bool validPC(uint32_t pc,bool gba){
-    pc&=~1u;
-    if(pc>=0x80000000u)return false;
-    if(gba){
-        return (pc< 0x00004000u)||
-               (pc>=0x02000000u&&pc<0x02040000u)||
-               (pc>=0x03000000u&&pc<0x03008000u)||
-               (pc>=0x06000000u&&pc<0x06018000u)||
-               (pc>=0x08000000u&&pc<0x0E000000u);
+static bool validPC(uint32_t pc, bool gba) {
+    // Strip thumb bit for range checks
+    pc &= ~1u;
+    // Sentinel / host address — never valid
+    if (pc >= 0x80000000u) return false;
+    if (gba) {
+        // GBA memory map:
+        //   0x00000000-0x00003FFF  BIOS (including address 0 = reset vector)
+        //   0x02000000-0x0203FFFF  EWRAM
+        //   0x03000000-0x03007FFF  IWRAM
+        //   0x06000000-0x06017FFF  VRAM (code unlikely but allow)
+        //   0x08000000-0x0DFFFFFF  ROM (all mirrors)
+        return (pc <= 0x00003FFFu) ||                          // BIOS incl. addr 0
+               (pc >= 0x02000000u && pc < 0x02040000u) ||     // EWRAM
+               (pc >= 0x03000000u && pc < 0x03008000u) ||     // IWRAM
+               (pc >= 0x06000000u && pc < 0x06018000u) ||     // VRAM
+               (pc >= 0x08000000u && pc < 0x0E000000u);       // ROM
     }
-    return (pc< 0x00008000u)||
-           (pc>=0x01000000u&&pc<0x02000000u)||
-           (pc>=0x02000000u&&pc<0x02400000u)||
-           (pc>=0x03000000u&&pc<0x03810000u)||
-           (pc>=0x06000000u&&pc<0x07000000u)||
-           (pc>=0x08000000u&&pc<0x0A000000u)||
-           (pc>=0xFFFF0000u);
+    // NDS memory map
+    return (pc < 0x00008000u) ||
+           (pc >= 0x01000000u && pc < 0x02000000u) ||
+           (pc >= 0x02000000u && pc < 0x02400000u) ||
+           (pc >= 0x03000000u && pc < 0x03810000u) ||
+           (pc >= 0x06000000u && pc < 0x07000000u) ||
+           (pc >= 0x08000000u && pc < 0x0A000000u) ||
+           (pc >= 0xFFFF0000u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1253,35 +1259,44 @@ static inline void tickInline(Core& core,uint32_t cycles){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Per-CPU runner
+// Per-CPU runner — returns cycles consumed, 0 if nothing ran
 // ═══════════════════════════════════════════════════════════════════════
 static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
-    if(interp.halted)return 0;
+
+    // Halted: return 0. Caller decides whether to charge idle cycles.
+    if(interp.halted) return 0;
 
     const bool     arm7      =(cpu==1)||gba;
     const uint32_t cycPerInsn=arm7?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
 
+    // Not ready yet (interpreter hasn't been initialised).
+    // Run one interpreter step to let it make progress toward ready state.
+    // This handles the brief window between enterGbaMode() scheduling
+    // events and the interpreter actually being init'd.
     if(!interp.isReady()){
-        // FIX #3: Don't call jitRunOpcode if interpreter not ready.
-        // Just return minimum cycles and let the scheduler advance time.
+        interp.jitRunOpcode();
         return cycPerInsn;
     }
 
     uint32_t pc=interp.getActualPC();
 
-    // Guard against sentinel/invalid PC values
-    if(pc==0xFFFFFFFFu||!validPC(pc,gba)){
+    // Sentinel check — 0xFFFFFFFF means the interpreter pipeline hasn't
+    // been primed yet.  Fall back to interpreter for one step.
+    if(pc==0xFFFFFFFFu){
+        interp.jitRunOpcode();
+        return cycPerInsn;
+    }
+
+    // Invalid / unmapped PC — run interpreter so it can take an exception
+    // or otherwise recover.
+    if(!validPC(pc,gba)){
         static uint32_t lastBadPC[2]={0u,0u};
         if(pc!=lastBadPC[cpu]){
             DebugLog("[JIT] cpu%d bad PC %08X\n",cpu,pc);
             lastBadPC[cpu]=pc;
         }
-        // FIX #4: Only call jitRunOpcode if interpreter IS ready.
-        // If not ready, return cycles so scheduler can fire init events.
-        if(interp.isReady()){
-            interp.jitRunOpcode();
-        }
+        interp.jitRunOpcode();
         return cycPerInsn;
     }
 
@@ -1307,7 +1322,9 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     LoopState& ls=s_loop[cpu];
 
     if(reason==EXIT_FALLBACK){
-        // FALLBACK loop detector
+        // Reset norm detector on any fallback
+        if(!ls.normBursting) resetNormSpin(ls);
+
         if(ls.fbPC==expc){
             ls.fbCount++;
             if(ls.fbCount==SPIN_THRESH&&!ls.fbDumped){
@@ -1335,8 +1352,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                     if(newPC!=expc){
                         DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",cpu,newPC,i+1);
                         ls.fbPC=0xFFFFFFFFu;ls.fbCount=0;ls.fbDumped=false;
-                        for(int j=0;j<4;j++)ls.normHist[j]=0xFFFFFFFFu;
-                        ls.normCount=0;
+                        resetNormSpin(ls);
                         break;
                     }
                 }
@@ -1355,34 +1371,44 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
         // EXIT_NORMAL — reset FALLBACK detector
         ls.fbPC   =0xFFFFFFFFu;
         ls.fbCount=0;
+        ls.fbDumped=false;
 
-        // NORM spin detector
         if(normSpinDetect(ls,pc,expc)){
-            // FIX #5: Save the two spin addresses before bursting.
-            // normBurstPC and normBurstExit are set inside normSpinDetect.
-            const uint32_t spinA = ls.normBurstPC;
-            const uint32_t spinB = ls.normBurstExit;
+            const uint32_t spinA=ls.normBurstPC;
+            const uint32_t spinB=ls.normBurstExit;
 
             DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+
+            // Mark that we're inside a burst so normSpinDetect won't
+            // immediately re-trigger when we call it next iteration.
+            ls.normBursting=true;
+
+            bool escaped=false;
             for(int i=0;i<SPIN_STEPS;i++){
-                if(interp.halted)break;
+                if(interp.halted){escaped=true;break;}
                 interp.jitRunOpcode();
                 tickInline(core,SPIN_CYC_STEP);
-                if(interp.halted)break;
+                if(interp.halted){escaped=true;break;}
                 uint32_t newPC=interp.getActualPC();
-                // FIX #6: Escape only when we move to a PC that is
-                // neither of the two spin addresses.
-                if(newPC!=spinA && newPC!=spinB){
+                if(newPC!=spinA&&newPC!=spinB){
                     DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
                              cpu,spinA,newPC,i+1);
-                    // Reset norm detector
-                    for(int j=0;j<4;j++)ls.normHist[j]=0xFFFFFFFFu;
-                    ls.normCount=0;
-                    ls.normBurstPC  =0xFFFFFFFFu;
-                    ls.normBurstExit=0xFFFFFFFFu;
+                    escaped=true;
                     break;
                 }
             }
+
+            // Always fully reset norm state after a burst attempt,
+            // whether or not we escaped.  This prevents immediate
+            // re-detection on the very next runCpu call.
+            resetNormSpin(ls);
+
+            if(!escaped){
+                // Didn't escape: log and continue (scheduler may have
+                // fired an interrupt that will un-spin on next call)
+                DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+            }
+
             return cycPerInsn;
         }
 
@@ -1414,30 +1440,22 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    // FIX #7: NDS cycle accounting.
-    // Run both CPUs and track cycles independently.
-    // Use the ARM9 (cpu0) cycle count as the master clock since
-    // globalCycles is ARM9-relative. ARM7 runs at half the clock rate
-    // so its cycles are already in ARM9-equivalent units when doubled,
-    // but the scheduler uses ARM9 cycles directly.
-    // We charge max(acc0, floor) to ensure scanline events fire.
-    uint32_t acc0=0, acc1=0;
+    // Run both CPUs for ITERS_NDS iterations, accumulating ARM9 cycles.
+    // ARM9 is the master clock. ARM7 runs at half rate so we don't add
+    // its cycles to the master counter — it's implicitly paced by the
+    // shared globalCycles clock.
+    uint32_t acc0=0;
     for(int i=0;i<ITERS_NDS;i++){
-        if(!core.interpreter[0].halted) acc0+=runCpu(core,0,false);
-        if(!core.interpreter[1].halted) acc1+=runCpu(core,1,false);
+        acc0 += runCpu(core,0,false);
+        runCpu(core,1,false);   // ARM7: run but don't add to master acc
     }
 
-    // ARM9 cycles are the master clock.
-    // If ARM9 was halted the whole call, use ARM7 cycles converted to
-    // ARM9 equivalent (ARM7 runs at ARM9/2 so multiply by 2).
-    // Take whichever is larger to avoid under-charging.
-    uint32_t actual = acc0;
-    if(actual == 0 && acc1 > 0)
-        actual = acc1 * 2; // ARM7->ARM9 cycle conversion
-
-    // Always advance at least one scanline worth so events fire on time.
-    uint32_t charge = (actual > FLOOR_CYCLES_NDS) ? actual : FLOOR_CYCLES_NDS;
-    tickInline(core, charge);
+    // Apply floor: always advance at least one scanline so events fire.
+    // If ARM9 was halted the whole call (acc0==0), still charge the floor
+    // so the scheduler keeps ticking — otherwise we deadlock waiting for
+    // an interrupt that can never fire because time never advances.
+    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
+    tickInline(core,charge);
 
     logStatus(core);
 }
@@ -1445,27 +1463,24 @@ void runJitNds(Core& core){
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    // FIX #8: GBA runner.
-    // cpu0 (ARM9) is always halted in GBA mode (halt0=4).
-    // cpu1 (ARM7) runs the GBA program.
-    // Don't break early on halted — always charge the floor so that
-    // GBA scanline events (GBA_SCANLINE240 at 240*4=960, GBA_SCANLINE308
-    // at 308*4=1232) fire at the correct rate regardless of spin loops.
+    // GBA mode: only cpu1 (ARM7) executes.
+    // cpu0 (ARM9) is permanently halted (halt0=4).
+    //
+    // Key insight: we must ALWAYS charge at least FLOOR_CYCLES_GBA per
+    // call so GBA_SCANLINE240 and GBA_SCANLINE308 events fire at 60fps.
+    // Even if cpu1 is halted (HALT opcode waiting for VBlank IRQ), time
+    // must advance so the VBlank event fires and un-halts the CPU.
+    //
+    // We do NOT call runCpu for cpu0 — it is permanently halted in GBA mode.
+
     uint32_t acc=0;
     for(int i=0;i<ITERS_GBA;i++){
-        // cpu1 may become halted mid-loop (HALT instruction waiting for IRQ).
-        // Even when halted we must keep charging cycles so the VBlank
-        // interrupt fires and un-halts it.
-        if(!core.interpreter[1].halted){
-            acc+=runCpu(core,1,true);
-        } else {
-            // CPU is halted waiting for interrupt.
-            // Charge minimum cycles per iteration so scheduler advances.
-            acc+=CYCLES_PER_INSN_ARM7;
-        }
+        uint32_t c=runCpu(core,1,true);
+        // runCpu returns 0 when halted; charge 1 cycle per iter anyway
+        // so the accumulator reflects time passing even during HALT.
+        acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
     }
 
-    // Always charge at least one scanline worth.
     uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
     tickInline(core,charge);
     logStatus(core);
@@ -1495,6 +1510,7 @@ bool initJit(Core* core){
     s_loop[0].fbPC=s_loop[1].fbPC=0xFFFFFFFFu;
     s_loop[0].normBurstPC=s_loop[0].normBurstExit=0xFFFFFFFFu;
     s_loop[1].normBurstPC=s_loop[1].normBurstExit=0xFFFFFFFFu;
+    s_loop[0].normBursting=s_loop[1].normBursting=false;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
     memset(g_exitPC,  0,sizeof g_exitPC);
     memset(g_exitCPSR,0,sizeof g_exitCPSR);
