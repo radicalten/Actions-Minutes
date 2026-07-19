@@ -1,5 +1,5 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 4:
+// Fixed revision 5:
 // 1. MSR: implement full control-field (mask=1,3,9,b,f) mode switches via fallback
 //    The key fix: MSR with control bits must be handled — emit fallback so
 //    interpreter does the mode switch with correct banked register swap.
@@ -9,6 +9,14 @@
 //    was clobbering state; fix by always falling back MSR with control bits.
 // 4. NDS cycle accounting: ARM7 cycles must pace correctly relative to ARM9.
 // 5. GBA: when burst escapes and immediately re-enters, use longer burst window.
+// 6. Cycle pacing rewrite: chargeFor() only fast-forwards the scheduler clock
+//    to the next event when the master CPU is genuinely halted; otherwise the
+//    clock is charged exactly what was executed. ARM7 is now paced against
+//    ARM9 via a running cycle "debt" counter instead of running once per
+//    ARM9 loop iteration unconditionally (restores the 2:1 clock ratio).
+// 7. Spin-burst live-lock fix: coStepCompanion() steps the *other* CPU during
+//    the fallback-spin and norm-spin burst loops, so cross-CPU handshakes
+//    (IPCSYNC/IPCFIFO) waited on by a spinning CPU can actually complete.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -34,6 +42,7 @@ static const int EXIT_FALLBACK = 1;
 static uint32_t g_exitPC[2]    = {};
 static uint32_t g_exitCPSR[2]  = {};
 static int      g_exitReason[2]= {};
+static uint32_t g_arm7Debt     = 0;   // ARM9-clock-domain cycles owed to ARM7 (NDS mode)
 
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
@@ -1023,7 +1032,7 @@ static bool emitT_imm8(Ctx& ctx,uint16_t op){
         case 0:ctx.li(p,imm);setNZ(ctx,p);return true;
         case 1:ctx.li(TA,imm);ctx.E(ppc_mr(TB,p));ctx.E(ppc_subfc(TC,TA,TB));setNZ(ctx,TC);setC_xer(ctx);setV_sub(ctx,TC,TB,TA);return true;
         case 2:ctx.li(TA,imm);ctx.E(ppc_mr(TB,p));ctx.E(ppc_addc(p,TB,TA));setNZ(ctx,p);setC_xer(ctx);setV_add(ctx,p,TB,TA);return true;
-        case 3:ctx.li(TA,imm);ctx.E(ppc_mr(TB,p));ctx.E(ppc_subfc(p,TA,TB));setNZ(ctx,p);setC_xer(ctx);setV_sub(ctx,p,TB,TA);return true;
+        case 3:ctx.li(TA,imm);ctx.E(ppc_mr(TB,p));ctx.E(ppc_subfc(p,TA,TB));setNZ(ctx,p);setC_xer(ctx);setV_sub(ctx,p,TA,TB);return true;
     }
     return false;
 }
@@ -1284,6 +1293,42 @@ static inline void tickInline(Core& core,uint32_t cycles){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// Companion-CPU co-stepping (prevents live-lock during spin bursts)
+//
+// When a CPU is detected spin-waiting (e.g. on IPCSYNC/IPCFIFO or a
+// shared-memory flag written by the other CPU), the burst loop below
+// must also give the *other* CPU a chance to run — otherwise the two
+// CPUs deadlock: cpu A spins waiting for cpu B, but cpu B never gets to
+// execute because all runCpu() time is spent single-stepping cpu A's
+// burst loop.
+// ═══════════════════════════════════════════════════════════════════════
+static inline void coStepCompanion(Core& core,int cpu,bool gba){
+    if(gba) return; // GBA mode only has one active CPU (ARM7)
+    Interpreter& other=core.interpreter[1-cpu];
+    if(!other.halted) other.jitRunOpcode();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Cycle-charge pacing
+//
+// Only fast-forward the scheduler clock to the next pending event when
+// the master-clock CPU for this mode is genuinely idle (halted). While
+// the CPU is actively executing, charge exactly the real cycles consumed
+// (never less than 1) so the hardware clock cannot outrun actual
+// instruction throughput. This prevents timer/HBlank/VBlank/IPC events
+// from firing far more often (in emulated time) than the CPU is actually
+// able to keep up with.
+// ═══════════════════════════════════════════════════════════════════════
+static inline uint32_t chargeFor(Core& core,uint32_t acc,uint32_t floorCycles,bool idle){
+    if(!idle) return acc?acc:1;
+    if(core.events.empty()) return floorCycles;
+    uint32_t next=core.events.front().cycles;
+    if(next<=core.globalCycles) return 1;
+    uint32_t toNext=next-core.globalCycles;
+    return toNext<floorCycles?toNext:floorCycles;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
 // Per-CPU runner
 // ═══════════════════════════════════════════════════════════════════════
 static uint32_t runCpu(Core& core,int cpu,bool gba){
@@ -1361,6 +1406,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                     if(interp.halted)break;
                     interp.jitRunOpcode();
                     tickInline(core,SPIN_CYC_STEP);
+                    coStepCompanion(core,cpu,gba);
                     if(interp.halted)break;
                     uint32_t newPC=interp.getActualPC();
                     if(newPC!=expc){
@@ -1398,6 +1444,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                 if(interp.halted){escaped=true;break;}
                 interp.jitRunOpcode();
                 tickInline(core,SPIN_CYC_STEP);
+                coStepCompanion(core,cpu,gba);
                 if(interp.halted){escaped=true;break;}
                 uint32_t newPC=interp.getActualPC();
                 if(newPC!=spinA&&newPC!=spinB){
@@ -1445,19 +1492,40 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    // Run both CPUs. ARM9 is master clock.
-    // ARM7 runs at half the clock rate, so one ARM7 cycle = 2 ARM9 cycles.
-    // We run them interleaved: for each ARM9 step, do one ARM7 step.
-    // globalCycles counts ARM9 cycles.
+    // ARM9 is the master clock. ARM7 runs at half rate (1 ARM7 cycle ==
+    // 2 ARM9 cycles), paced via a running "debt" counter rather than being
+    // executed once per ARM9 loop-iteration unconditionally (which used to
+    // let ARM7 run at effectively the same rate as ARM9, desyncing anything
+    // timing-sensitive such as IPCSYNC/IPCFIFO).
     uint32_t acc0=0;
+
     for(int i=0;i<ITERS_NDS;i++){
-        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
-        runCpu(core,1,false);          // ARM7: runs but doesn't add to acc
+        if(!core.interpreter[0].halted){
+            uint32_t c0=runCpu(core,0,false);
+            acc0+=c0;
+            g_arm7Debt+=c0;
+        }else{
+            // ARM9 idle this slot: still give ARM7 a nominal cycle ration
+            // so it can keep making progress (it may be the CPU that ARM9
+            // is waiting on to satisfy a handshake).
+            g_arm7Debt+=CYCLES_PER_INSN_ARM9;
+        }
+
+        while(g_arm7Debt>=2 && !core.interpreter[1].halted){
+            uint32_t c1=runCpu(core,1,false);
+            if(c1==0){g_arm7Debt=0;break;}
+            uint32_t arm9Equiv=c1*2;
+            g_arm7Debt=(g_arm7Debt>arm9Equiv)?(g_arm7Debt-arm9Equiv):0;
+        }
     }
 
-    // Always advance at least one scanline so events fire on time.
-    // If both CPUs were halted, still advance so IRQs can fire.
-    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
+    // Only fast-forward the clock to the next scheduled event when the
+    // master CPU (ARM9) is actually halted — never while it's making real
+    // progress, or the hardware clock will outrun execution and events
+    // (timers/HBlank/VBlank/IPC) will fire far too often relative to real
+    // CPU throughput.
+    bool idle=core.interpreter[0].halted;
+    uint32_t charge=chargeFor(core,acc0,FLOOR_CYCLES_NDS,idle);
     tickInline(core,charge);
     logStatus(core);
 }
@@ -1465,18 +1533,16 @@ void runJitNds(Core& core){
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    // GBA mode: only cpu1 (ARM7) runs. cpu0 is permanently halted.
-    // Must always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
+    // GBA mode: only cpu1 (ARM7) runs; it is the master clock here.
     uint32_t acc=0;
     for(int i=0;i<ITERS_GBA;i++){
         uint32_t c=runCpu(core,1,true);
-        // When halted (HALT opcode waiting for IRQ), charge 1 cycle so
-        // the accumulator reflects time passing — otherwise the floor
-        // never gets reached and the VBlank IRQ never fires.
-        acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
+        acc+=c;
+        if(core.interpreter[1].halted)break; // nothing more to do until an event/IRQ
     }
 
-    uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
+    bool idle=core.interpreter[1].halted;
+    uint32_t charge=chargeFor(core,acc,FLOOR_CYCLES_GBA,idle);
     tickInline(core,charge);
     logStatus(core);
 }
@@ -1506,6 +1572,7 @@ bool initJit(Core* core){
     s_loop[0].normBurstPC=s_loop[0].normBurstExit=0xFFFFFFFFu;
     s_loop[1].normBurstPC=s_loop[1].normBurstExit=0xFFFFFFFFu;
     s_loop[0].normBursting=s_loop[1].normBursting=false;
+    g_arm7Debt=0;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
     memset(g_exitPC,  0,sizeof g_exitPC);
     memset(g_exitCPSR,0,sizeof g_exitCPSR);
