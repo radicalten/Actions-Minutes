@@ -28,7 +28,7 @@ static uint32_t g_pendingCycles[2]  = {};
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 
-// ── Frame layout (256-byte frame, EABI) ─────────────────────────────────
+// ── Frame layout ─────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
 static const int FRAME_LR_OFF  = FRAME_SIZE + 4;
 static const int FRAME_SAVE    = 16;
@@ -42,19 +42,18 @@ static const int FRAME_REGSYNC = 112;
 static const int FRAME_CPSR    = 172;
 static const int FRAME_PC      = 176;
 
-static_assert(FRAME_SIZE % 16 == 0,           "frame align");
+static_assert(FRAME_SIZE % 16 == 0,            "frame align");
 static_assert(FRAME_SAVE + 18*4 == FRAME_CORE, "save map");
 static_assert(FRAME_REGSYNC + 15*4 == FRAME_CPSR, "regsync");
-static_assert(FRAME_PC + 4 <= FRAME_SIZE,      "pc fits");
+static_assert(FRAME_PC + 4 <= FRAME_SIZE,       "pc fits");
 
-// ── Debug counters ───────────────────────────────────────────────────────
-// Per-PC fallback log: only log each (pc,op) pair once to avoid floods.
+// ── Debug state ──────────────────────────────────────────────────────
 static const size_t FB_LOG_MAX = 512;
 struct FbEntry { uint32_t pc; uint32_t op; };
 static FbEntry  g_fbLog[FB_LOG_MAX];
-static size_t   g_fbLogCount = 0;
-static uint32_t g_totalFB[2] = {};   // total fallbacks per cpu
-static uint32_t g_totalJIT[2]= {};   // total JIT executions per cpu
+static size_t   g_fbLogCount  = 0;
+static uint32_t g_totalFB[2]  = {};
+static uint32_t g_totalJIT[2] = {};
 
 static bool fbAlreadyLogged(uint32_t pc, uint32_t op) {
     for (size_t i = 0; i < g_fbLogCount; i++)
@@ -75,10 +74,15 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
         DebugLog("[JIT] arm   FB cpu%d pc=%08X op=%08X\n", cpu, pc, op);
 }
 
+// ── Loop detector state ──────────────────────────────────────────────
+static uint32_t s_loopPC[2]     = {0xFFFFFFFFu, 0xFFFFFFFFu};
+static uint32_t s_loopCount[2]  = {};
+static bool     s_loopDumped[2] = {};
+
 namespace JitPpc {
 
 // ═══════════════════════════════════════════════════════════════════════
-// PPC instruction encoders
+// PPC encoders
 // ═══════════════════════════════════════════════════════════════════════
 static inline uint32_t ppc_blr()  { return 0x4E800020u; }
 static inline uint32_t ppc_bctr(bool lk=false) {
@@ -189,7 +193,6 @@ static int emit_li32(uint32_t* out,uint8_t rt,uint32_t v) {
     return 2;
 }
 
-// ARM r0-r14 → PPC r14-r28; CPSR → r29
 static const uint8_t RA[15]={14,15,16,17,18,19,20,21,22,23,24,25,26,27,28};
 static const uint8_t RCPSR=29;
 static const uint8_t TA=3,TB=4,TC=5,TD=6,TE=7,TF=8,TG=9;
@@ -441,6 +444,31 @@ void JitHelp_tick(Core* core,uint32_t cycles){
     }
 }
 
+// ── New helper: run N interpreter steps and tick, used for fallback
+//   spin loops so the scheduler gets to run and ARM9 can signal ARM7.
+void JitHelp_interpBurst(Core* core, Interpreter* interp,
+                          int arm7, uint32_t pc, uint32_t cpsr,
+                          int steps, uint32_t cyclesPerStep) {
+    if (!core || !interp) return;
+    interp->setPC(pc);
+    for (int i = 0; i < steps; i++) {
+        if (interp->halted) break;
+        interp->jitRunOpcode();
+        core->globalCycles += cyclesPerStep;
+        while (!core->events.empty() &&
+               core->globalCycles >= core->events.front().cycles) {
+            SchedEvent e = core->events.front();
+            core->events.erase(core->events.begin());
+            if (e.task >= 0 && e.task < MAX_TASKS && core->tasks[e.task].fn)
+                core->tasks[e.task]();
+        }
+    }
+    // Update exit state so runCpu knows where we ended up
+    g_exitPC[arm7 ? 1 : 0]     = interp->getActualPC();
+    g_exitCPSR[arm7 ? 1 : 0]   = interp->getCpsrRef();
+    g_exitReason[arm7 ? 1 : 0] = EXIT_NORMAL; // already advanced
+}
+
 } // extern "C"
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -472,12 +500,9 @@ static void emitSyncFrom(Ctx& ctx){
     ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
     ctx.E(ppc_addi(TC,1,(int16_t)FRAME_CPSR));
     ctx.call((void*)JitHelp_syncFrom);
-
     ctx.E(ppc_cmpi(0,TA,0));
     size_t bOk=ctx.sz();
-    ctx.E(ppc_bc(12,2,0));  // beq → success
-
-    // Failure: set EXIT_FALLBACK and return
+    ctx.E(ppc_bc(12,2,0));
     ctx.li(TA,(uint32_t)(uintptr_t)g_exitReason);
     ctx.E(ppc_lwz(TB,FRAME_CPUIDX,1));
     ctx.E(ppc_rlwinm(TB,TB,2,0,29));
@@ -485,8 +510,6 @@ static void emitSyncFrom(Ctx& ctx){
     ctx.E(ppc_addi(TB,0,EXIT_FALLBACK));
     ctx.E(ppc_stw(TB,0,TA));
     emitEpilogue(ctx);
-
-    // Success: patch branch, load regs
     {int32_t d=(int32_t)((ctx.sz()-bOk)*4);ctx.base[bOk]=ppc_bc(12,2,(int16_t)d);}
     for(int i=0;i<15;i++) ctx.E(ppc_lwz(RA[i],FRAME_REGSYNC+i*4,1));
     ctx.E(ppc_lwz(RCPSR,FRAME_CPSR,1));
@@ -534,7 +557,7 @@ static size_t emitCondSkip(Ctx& ctx,uint8_t cond){
     ctx.call((void*)JitHelp_testCond);
     ctx.E(ppc_cmpi(0,TA,0));
     size_t idx=ctx.sz();
-    ctx.E(ppc_bc(12,2,0));  // beq skip (cond false)
+    ctx.E(ppc_bc(12,2,0));
     return idx;
 }
 static void patchSkip(Ctx& ctx,size_t idx){
@@ -632,7 +655,7 @@ static void sAsrI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
     }
 }
 static void sRorI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i==0){ // RRX
+    if(i==0){
         if(sc)ctx.E(ppc_rlwinm(TC,s,0,31,31));
         ctx.E(ppc_rlwinm(TA,RCPSR,2,0,0));
         ctx.E(ppc_rlwinm(d,s,31,1,31));
@@ -795,28 +818,20 @@ static bool emitBX(Ctx& ctx,uint32_t op,uint32_t curPC){
     return true;
 }
 
-static bool emitBranch(Ctx& ctx, uint32_t op, uint32_t curPC) {
-    // BX Rm
-    if ((op & 0x0FFFFFF0) == 0x012FFF10) return emitBX(ctx, op, curPC);
-    // BLX Rm — fall back (needs Thumb switch + link)
-    if ((op & 0x0FFFFFF0) == 0x012FFF30) return false;
-    // B / BL
-    if ((op & 0x0E000000) != 0x0A000000) return false;
-
-    uint8_t cond = (op >> 28) & 0xF;
-    if (cond == 15) return false;
-    bool lk = (op >> 24) & 1;
-    int32_t off = (int32_t)(op << 8) >> 6;
-    uint32_t tgt = curPC + 8u + (uint32_t)off;
-
-    size_t si = emitCondSkip(ctx, cond);
-    if (lk) ctx.li(RA[14], curPC + 4);
-    emitCommitExit(ctx, tgt, EXIT_NORMAL);
-    if (si != SIZE_MAX) {
-        patchSkip(ctx, si);
-        emitCommitExit(ctx, curPC + 4, EXIT_NORMAL);
-    }
-    ctx.done = true;
+static bool emitBranch(Ctx& ctx,uint32_t op,uint32_t curPC){
+    if((op&0x0FFFFFF0)==0x012FFF10)return emitBX(ctx,op,curPC);
+    if((op&0x0FFFFFF0)==0x012FFF30)return false;
+    if((op&0x0E000000)!=0x0A000000)return false;
+    uint8_t cond=(op>>28)&0xF;
+    if(cond==15)return false;
+    bool lk=(op>>24)&1;
+    int32_t off=(int32_t)(op<<8)>>6;
+    uint32_t tgt=curPC+8u+(uint32_t)off;
+    size_t si=emitCondSkip(ctx,cond);
+    if(lk)ctx.li(RA[14],curPC+4);
+    emitCommitExit(ctx,tgt,EXIT_NORMAL);
+    if(si!=SIZE_MAX){patchSkip(ctx,si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);}
+    ctx.done=true;
     return true;
 }
 
@@ -832,7 +847,6 @@ static bool emitLS(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t rn=(op>>16)&0xF;
     uint8_t rd=(op>>12)&0xF;
     if(rd==15)return false;
-    // rn==15 only for immediate-offset pre-indexed no-writeback
     if(rn==15&&(!immO||!pre||wb))return false;
     if(!immO&&((op&0xF)==15||((op>>4)&1)))return false;
 
@@ -851,7 +865,6 @@ static bool emitLS(Ctx& ctx,uint32_t op,uint32_t curPC){
     }
 
     if(rn==15){
-        // Fold PC-relative address statically
         uint32_t base=ctx.thumb?(curPC+4):(curPC+8);
         if(!by)base&=~3u;
         uint32_t ea=up?base+(op&0xFFF):base-(op&0xFFF);
@@ -939,87 +952,56 @@ static bool emitMul(Ctx& ctx,uint32_t op){
     return true;
 }
 
-static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t) {
-    uint8_t cond = (op >> 28) & 0xF;
-    if (cond == 15) return false;
+static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
+    uint8_t cond=(op>>28)&0xF;
+    if(cond==15)return false;
 
-    // MRS Rd, CPSR  — 0x010F0000
-    if ((op & 0x0FBF0FFF) == 0x010F0000) {
-        uint8_t rd = (op >> 12) & 0xF;
-        if (rd == 15) return false;
-        size_t si = emitCondSkip(ctx, cond);
-        ctx.E(ppc_mr(RA[rd], RCPSR));
-        patchSkip(ctx, si);
-        return true;
+    // MRS Rd, CPSR
+    if((op&0x0FBF0FFF)==0x010F0000){
+        uint8_t rd=(op>>12)&0xF;
+        if(rd==15)return false;
+        size_t si=emitCondSkip(ctx,cond);
+        ctx.E(ppc_mr(RA[rd],RCPSR));
+        patchSkip(ctx,si);return true;
     }
+    // MRS Rd, SPSR -- needs banked regs
+    if((op&0x0FBF0FFF)==0x014F0000)return false;
 
-    // MRS Rd, SPSR  — 0x014F0000 — needs banked regs, fall back
-    if ((op & 0x0FBF0FFF) == 0x014F0000) return false;
+    uint8_t mask=(op>>16)&0xF;
 
-    uint8_t mask = (op >> 16) & 0xF;
-
-    // MSR with immediate operand
-    if ((op & 0x0DB0F000) == 0x0320F000) {
-        uint32_t imm = op & 0xFF;
-        uint32_t rot = ((op >> 8) & 0xF) * 2;
-        if (rot) imm = (imm >> rot) | (imm << (32 - rot));
-
-        if (mask == 0x8) {
-            // flags field only (NZCV) — safe to do inline
-            imm &= 0xFF000000u;
-            size_t si = emitCondSkip(ctx, cond);
-            ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 8, 31));  // clear NZCV
-            ctx.li(TA, imm);
-            ctx.E(ppc_or(RCPSR, RCPSR, TA));
-            patchSkip(ctx, si);
-            return true;
+    // MSR immediate
+    if((op&0x0DB0F000)==0x0320F000){
+        uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
+        if(rot)imm=(imm>>rot)|(imm<<(32-rot));
+        if(mask==0x8){
+            // flags only
+            imm&=0xFF000000u;
+            size_t si=emitCondSkip(ctx,cond);
+            ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
+            ctx.li(TA,imm);ctx.E(ppc_or(RCPSR,RCPSR,TA));
+            patchSkip(ctx,si);return true;
         }
-
-        if (mask == 0x1 || mask == 0x9) {
-            // c field (and possibly f) — mode change via immediate
-            // Only safe to inline if the mode bits are a known ARM mode
-            // and we're not changing to user mode (which would drop privileges)
-            uint8_t newMode = imm & 0x1F;
-            // Allowed modes we can handle: SVC=0x13, IRQ=0x12, FIQ=0x11,
-            //                              ABT=0x17, UND=0x1B, SYS=0x1F
-            // USR=0x10 changes banked regs — fall back
-            if (newMode == 0x10) return false;  // USR mode — complex
-            // For other modes, fall back to interpreter to handle
-            // banked register swaps correctly
-            return false;
-        }
+        // c/x/s fields or mode changes -- fall back to interpreter
         return false;
     }
 
-    // MSR with register operand
-    if ((op & 0x0DB0FFF0) == 0x0120F000) {
-        uint8_t rm = op & 0xF;
-        if (rm == 15) return false;
-
-        if (mask == 0x8) {
-            // flags only — safe
-            size_t si = emitCondSkip(ctx, cond);
-            ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 8, 31));
-            ctx.E(ppc_rlwinm(TA, RA[rm], 0, 0, 7));
-            ctx.E(ppc_or(RCPSR, RCPSR, TA));
-            patchSkip(ctx, si);
-            return true;
+    // MSR register
+    if((op&0x0DB0FFF0)==0x0120F000){
+        uint8_t rm=op&0xF;
+        if(rm==15)return false;
+        if(mask==0x8){
+            // flags only
+            size_t si=emitCondSkip(ctx,cond);
+            ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
+            ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));
+            ctx.E(ppc_or(RCPSR,RCPSR,TA));
+            patchSkip(ctx,si);return true;
         }
-
-        if (mask == 0xF) {
-            // All fields — but only safe if not changing mode
-            // Fall back to interpreter to handle banked regs
-            return false;
-        }
-
-        if (mask == 0x1 || mask == 0x9) {
-            // c field — mode change, fall back
-            return false;
-        }
+        // mode changes -- fall back
         return false;
     }
 
-    // MSR SPSR — always fall back (needs banked SPSR)
+    // MSR SPSR -- fall back
     return false;
 }
 
@@ -1044,7 +1026,7 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     ctx.call((void*)JitHelp_armBlock);
     ctx.E(ppc_cmpi(0,TA,0));
     size_t bOk=ctx.sz();
-    ctx.E(ppc_bc(12,0,0));  // bge → ok
+    ctx.E(ppc_bc(12,0,0));
     emitReload(ctx);
     emitCommitExit(ctx,curPC,EXIT_FALLBACK);
     {int32_t d=(int32_t)((ctx.sz()-bOk)*4);ctx.base[bOk]=ppc_bc(12,0,(int16_t)d);}
@@ -1063,42 +1045,36 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     return true;
 }
 
-static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
-    uint8_t cond = (op >> 28) & 0xF;
-    if (cond == 15) return false;
+// ── dispARM: BX/BLX checked BEFORE MRS/MSR to avoid misrouting ───────
+static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
+    uint8_t cond=(op>>28)&0xF;
+    if(cond==15)return false;
 
     // SWI
-    if ((op & 0x0F000000) == 0x0F000000) return false;
+    if((op&0x0F000000)==0x0F000000)return false;
 
-    // BX / BLX register — must be checked BEFORE the MRS/MSR 0x0F900000 test
-    // because BX encoding 0x012FFF10 satisfies (op&0x0F900000)==0x01000000
-    if ((op & 0x0FFFFFF0) == 0x012FFF10 ||
-        (op & 0x0FFFFFF0) == 0x012FFF30)
-        return emitBranch(ctx, op, curPC);
+    // BX / BLX register -- must come before MRS/MSR check
+    // because 0x012FFF1x satisfies (op&0x0F900000)==0x01000000
+    if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)
+        return emitBranch(ctx,op,curPC);
 
-    // MRS / MSR family (but not BX which was caught above)
-    if ((op & 0x0F900000) == 0x01000000) {
-        if (emitMrsMsr(ctx, op, curPC)) return true;
+    // MRS / MSR
+    if((op&0x0F900000)==0x01000000){
+        if(emitMrsMsr(ctx,op,curPC))return true;
         return false;
     }
 
-    uint32_t it = (op >> 25) & 7;
-    switch (it) {
+    uint32_t it=(op>>25)&7;
+    switch(it){
         case 0:
-            if ((op & 0x0FC000F0) == 0x00000090) return emitMul(ctx, op);
-            if ((op & 0x0E000090) == 0x00000090) return emitLSExtra(ctx, op, curPC);
-            return emitDP(ctx, op, curPC);
-        case 1:
-            return emitDP(ctx, op, curPC);
-        case 2:
-        case 3:
-            return emitLS(ctx, op, curPC);
-        case 4:
-            return emitBlockXfer(ctx, op, curPC);
-        case 5:
-            return emitBranch(ctx, op, curPC);
-        default:
-            return false;
+            if((op&0x0FC000F0)==0x00000090)return emitMul(ctx,op);
+            if((op&0x0E000090)==0x00000090)return emitLSExtra(ctx,op,curPC);
+            return emitDP(ctx,op,curPC);
+        case 1:return emitDP(ctx,op,curPC);
+        case 2:case 3:return emitLS(ctx,op,curPC);
+        case 4:return emitBlockXfer(ctx,op,curPC);
+        case 5:return emitBranch(ctx,op,curPC);
+        default:return false;
     }
 }
 
@@ -1510,8 +1486,18 @@ static JitBlock* compile(Interpreter* interp,Core* core,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Per-CPU runner
+// Per-CPU runner with loop detector and spin-loop burst
 // ═══════════════════════════════════════════════════════════════════════
+
+// How many interpreter steps to run in burst mode when a spin loop
+// is detected, and how many cycles to charge per step.
+// The burst lets the scheduler fire events so the other CPU can
+// send an IPC signal to break the loop.
+static const int     SPIN_BURST_STEPS      = 32;
+static const uint32_t SPIN_BURST_CYCLES    = 4;  // cycles per step during burst
+// After this many consecutive fallbacks at the same PC we enter burst mode.
+static const uint32_t SPIN_DETECT_THRESH   = 6;
+
 static void runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
     if(interp.halted)return;
@@ -1526,7 +1512,6 @@ static void runCpu(Core& core,int cpu,bool gba){
 
     uint32_t pc=interp.getActualPC();
     if(!validPC(pc,gba)){
-        // Log invalid PC once
         static uint32_t lastBadPC[2]={0xFFFFFFFFu,0xFFFFFFFFu};
         if(pc!=lastBadPC[cpu]){
             DebugLog("[JIT] cpu%d invalid PC %08X, interpreter step\n",cpu,pc);
@@ -1553,35 +1538,116 @@ static void runCpu(Core& core,int cpu,bool gba){
 
     const int      reason=g_exitReason[cpu];
     const uint32_t expc  =g_exitPC[cpu];
+    g_totalJIT[cpu]++;
 
-    // Per-step trace log (matches original format)
     DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
              cpu,pc,expc,reason,interp.getCpsrRef());
 
+    // ── Loop detector ────────────────────────────────────────────────
     if(reason==EXIT_FALLBACK){
+        if(s_loopPC[cpu]==expc){
+            s_loopCount[cpu]++;
+
+            // First time: dump context so we know what instruction it is
+            if(s_loopCount[cpu]==SPIN_DETECT_THRESH&&!s_loopDumped[cpu]){
+                s_loopDumped[cpu]=true;
+                DebugLog("[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
+                         cpu,expc,interp.getCpsrRef(),(int)interp.isThumb());
+                int stride=interp.isThumb()?2:4;
+                for(int k=-2;k<=4;k++){
+                    uint32_t a=expc+(uint32_t)(k*stride);
+                    uint32_t w=interp.isThumb()
+                        ?(uint32_t)core.memory.read<uint16_t>(arm7,a)
+                        :core.memory.read<uint32_t>(arm7,a);
+                    DebugLog("[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
+                }
+                uint32_t** regs=interp.getRegisters();
+                if(regs){
+                    for(int i=0;i<15;i++)
+                        if(regs[i])
+                            DebugLog("[JIT]   r%d=%08X\n",i,*regs[i]);
+                }
+            }
+
+            // Burst mode: run a block of interpreter steps WITH scheduler
+            // ticks so the other CPU can signal us via IPC/IRQ.
+            if(s_loopCount[cpu]>=SPIN_DETECT_THRESH){
+                // Run burst steps directly, ticking scheduler after each
+                interp.setPC(expc);
+                for(int i=0;i<SPIN_BURST_STEPS;i++){
+                    if(interp.halted)break;
+                    interp.jitRunOpcode();
+                    // Tick scheduler after every step so events fire
+                    core.globalCycles+=SPIN_BURST_CYCLES;
+                    while(!core.events.empty()&&
+                          core.globalCycles>=core.events.front().cycles){
+                        SchedEvent e=core.events.front();
+                        core.events.erase(core.events.begin());
+                        if(e.task>=0&&e.task<MAX_TASKS&&core.tasks[e.task].fn)
+                            core.tasks[e.task]();
+                    }
+                    // If we escaped the loop, stop burst
+                    uint32_t newPC=interp.getActualPC();
+                    if(newPC!=expc){
+                        DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",
+                                 cpu,newPC,i+1);
+                        s_loopPC[cpu]    =0xFFFFFFFFu;
+                        s_loopCount[cpu] =0;
+                        s_loopDumped[cpu]=false;
+                        g_pendingCycles[cpu]+=(uint32_t)(i+1)*
+                            (gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9);
+                        return;
+                    }
+                }
+                // Still in loop after burst -- charge cycles and return
+                // so the other CPU gets to run
+                g_pendingCycles[cpu]+=SPIN_BURST_STEPS*
+                    (gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9);
+                return;
+            }
+
+        } else {
+            // Different PC -- reset detector
+            s_loopPC[cpu]    =expc;
+            s_loopCount[cpu] =1;
+            if(s_loopDumped[cpu]){
+                DebugLog("[JIT] SPIN cpu%d escaped to %08X\n",cpu,expc);
+                s_loopDumped[cpu]=false;
+            }
+        }
+
+        // Normal single-step fallback
         if(validPC(expc,gba))interp.setPC(expc);
         interp.jitRunOpcode();
+
+    }
+    // EXIT_NORMAL: commit already called setPC, reset loop detector
+    else{
+        if(s_loopPC[cpu]==pc){
+            s_loopPC[cpu]    =0xFFFFFFFFu;
+            s_loopCount[cpu] =0;
+        }
     }
 
     g_pendingCycles[cpu]+=gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Periodic status log (called from runJitNds/Gba)
+// Periodic status log
 // ═══════════════════════════════════════════════════════════════════════
 static uint32_t g_statusTick=0;
-static void logStatus(Core& core,bool gba){
+static void logStatus(Core& core){
     g_statusTick++;
-    if((g_statusTick&0x3FF)!=0)return;  // every 1024 calls
-    DebugLog("[JIT] STATUS jit0=%u fb0=%u jit1=%u fb1=%u codePos=%zu gen=%u\n",
+    if((g_statusTick&0x3FF)!=0)return;
+    DebugLog("[JIT] STATUS jit0=%u fb0=%u jit1=%u fb1=%u pos=%zu gen=%u\n",
              g_totalJIT[0],g_totalFB[0],g_totalJIT[1],g_totalFB[1],
              codePos,cacheGen);
-    DebugLog("[JIT] STATUS pc0=%08X pc1=%08X halt0=%d halt1=%d fps=%d\n",
-             core.interpreter[0].getActualPC(),
-             core.interpreter[1].getActualPC(),
+    DebugLog("[JIT] STATUS pc0=%08X pc1=%08X h0=%d h1=%d fps=%d cyc=%u\n",
+             core.interpreter[0].isReady()?core.interpreter[0].getActualPC():0u,
+             core.interpreter[1].isReady()?core.interpreter[1].getActualPC():0u,
              (int)core.interpreter[0].halted,
              (int)core.interpreter[1].halted,
-             core.fps);
+             core.fps,core.globalCycles);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1597,7 +1663,7 @@ void runJitNds(Core& core){
     uint32_t cyc=(g_pendingCycles[0]+g_pendingCycles[1])/2;
     if(cyc<1)cyc=1;
     JitHelp_tick(&core,cyc);
-    logStatus(core,false);
+    logStatus(core);
 }
 
 void runJitGba(Core& core){
@@ -1610,7 +1676,7 @@ void runJitGba(Core& core){
     uint32_t cyc=g_pendingCycles[1];
     if(cyc<1)cyc=1;
     JitHelp_tick(&core,cyc);
-    logStatus(core,true);
+    logStatus(core);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1634,6 +1700,9 @@ bool initJit(Core* core){
     g_totalFB[0]=g_totalFB[1]=0;
     g_totalJIT[0]=g_totalJIT[1]=0;
     g_statusTick=0;
+    s_loopPC[0]=s_loopPC[1]=0xFFFFFFFFu;
+    s_loopCount[0]=s_loopCount[1]=0;
+    s_loopDumped[0]=s_loopDumped[1]=false;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
     memset(g_exitPC,    0,sizeof g_exitPC);
     memset(g_exitCPSR,  0,sizeof g_exitCPSR);
@@ -1652,7 +1721,7 @@ bool initJit(Core* core){
 }
 
 void shutdownJit(Core* core){
-    DebugLog("[JIT] shutdown total_fb0=%u total_fb1=%u total_jit0=%u total_jit1=%u\n",
+    DebugLog("[JIT] shutdown fb0=%u fb1=%u jit0=%u jit1=%u\n",
              g_totalFB[0],g_totalFB[1],g_totalJIT[0],g_totalJIT[1]);
     g_jitLive=false;
     if(core)core->setRunFunc(core->gbaMode
