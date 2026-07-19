@@ -493,3 +493,4 @@ FAT mounted, logging started
 [JIT] GBA SPIN escaped 08000192->08000194
 [JIT] GBA SPIN escaped 08000192->08000194
 
+###tokenlimit reached. will make a dynarec12 just to see if we can go any further. 
