@@ -1,5 +1,6 @@
 First fix of jitrec9 seems good improved speed to 8fps in rockwrestler. nothing else seems to work yet though as usual. here is the debug logs for rockwrestler.
 
+Here is my debug log after these changes playing an nds test rom: 
 === NooDS-Wii status log ===
 [STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f478
 [STATUS] fps=8 cycles=17014499 pc0=020001B4 pc1=038002AC halt0=0 halt1=0 gba=0 dsi=0
