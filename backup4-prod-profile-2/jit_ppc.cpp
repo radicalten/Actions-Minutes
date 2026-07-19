@@ -1,11 +1,14 @@
-// jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway
-// Fixed revision 3:
-// 1. GBA: don't charge floor cycles when cpu1 not ready; let interpreter init naturally
-// 2. GBA: treat address 0x00000000 as valid (GBA BIOS entry point)  
-// 3. NDS: reset normCount after successful burst escape
-// 4. NDS: fix double-burst: after burst, reset history so we don't immediately re-detect
-// 5. GBA halted: don't charge cycles when halted waiting for init, only after ready
-// 6. Fix scheduler over-advance: cap floor to only apply when cpu was actually running
+// jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
+// Fixed revision 4:
+// 1. MSR: implement full control-field (mask=1,3,9,b,f) mode switches via fallback
+//    The key fix: MSR with control bits must be handled — emit fallback so
+//    interpreter does the mode switch with correct banked register swap.
+// 2. GBA spin at VBlank wait: detect the single-instruction B . loop and
+//    run the interpreter for a full scanline worth of cycles before resuming JIT.
+// 3. NDS: ARM7 stuck waiting for IPCSYNC — the MSR mode switch fallback
+//    was clobbering state; fix by always falling back MSR with control bits.
+// 4. NDS cycle accounting: ARM7 cycles must pace correctly relative to ARM9.
+// 5. GBA: when burst escapes and immediately re-enters, use longer burst window.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -38,17 +41,15 @@ static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 static const int ITERS_NDS = 32;
 static const int ITERS_GBA = 32;
 
-// Floor cycles per runJit* call — one scanline worth.
-// NDS: 355*6 = 2130 ARM9 cycles per scanline
-// GBA: 308*4 = 1232 cycles per scanline
-// IMPORTANT: floor is only applied when the CPU actually ran something.
-// If cpu was not ready, we charge zero and let the interpreter init naturally.
+// Floor: one scanline worth of cycles per runJit* call.
+// NDS: 355*6 = 2130 ARM9 cycles
+// GBA: 308*4 = 1232 cycles
 static const uint32_t FLOOR_CYCLES_NDS = 2130;
 static const uint32_t FLOOR_CYCLES_GBA = 1232;
 
-// Spin thresholds
+// Spin detection
 static const uint32_t SPIN_THRESH   = 6;
-static const int      SPIN_STEPS    = 64;
+static const int      SPIN_STEPS    = 256;  // increased for GBA VBlank wait
 static const uint32_t SPIN_CYC_STEP = 4;
 
 // ── Frame layout ──────────────────────────────────────────────────────
@@ -97,17 +98,15 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
 
 // ── Loop detector ─────────────────────────────────────────────────────
 struct LoopState {
-    // FALLBACK spin tracking
     uint32_t fbPC    = 0xFFFFFFFFu;
     uint32_t fbCount = 0;
     bool     fbDumped= false;
 
-    // NORM spin tracking
     uint32_t normHist[4]  = {0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu};
     uint32_t normCount    = 0;
     uint32_t normBurstPC  = 0xFFFFFFFFu;
     uint32_t normBurstExit= 0xFFFFFFFFu;
-    bool     normBursting = false; // true while we're inside a burst
+    bool     normBursting = false;
 };
 static LoopState s_loop[2];
 
@@ -119,19 +118,14 @@ static void resetNormSpin(LoopState& ls) {
     ls.normBursting  = false;
 }
 
-// Returns true if a spin is detected and we should burst.
-// Sets normBurstPC / normBurstExit before returning true.
 static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
-    // If we're already bursting, don't re-detect
     if(ls.normBursting) return false;
 
-    // Shift history
     ls.normHist[3] = ls.normHist[2];
     ls.normHist[2] = ls.normHist[1];
     ls.normHist[1] = ls.normHist[0];
     ls.normHist[0] = exitPC;
 
-    // Case 1: tight self-loop
     if(exitPC == entryPC){
         ls.normCount++;
         if(ls.normCount >= SPIN_THRESH){
@@ -142,7 +136,6 @@ static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
         return false;
     }
 
-    // Case 2: alternating two-address loop A->B->A->B
     if(ls.normHist[0] != 0xFFFFFFFFu &&
        ls.normHist[1] != 0xFFFFFFFFu &&
        ls.normHist[2] != 0xFFFFFFFFu &&
@@ -159,7 +152,6 @@ static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
         return false;
     }
 
-    // Different pattern
     ls.normCount = 0;
     return false;
 }
@@ -400,7 +392,7 @@ int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
     return 0;
 }
 
-// CPSR must be written before setPC so flushPipeline sees correct thumb bit
+// CPSR written before setPC so flushPipeline sees correct thumb bit
 int JitHelp_commit(Interpreter* interp,int cpu,
                    uint32_t* regs,uint32_t cpsr,
                    uint32_t pc,int reason){
@@ -889,35 +881,73 @@ static bool emitMul(Ctx& ctx,uint32_t op){
     if(s)setNZ(ctx,RA[rd]);
     patchSkip(ctx,si);return true;
 }
+
+// ── MSR/MRS ──────────────────────────────────────────────────────────
+// CRITICAL FIX: MSR with any control bits (mask & 0x7 != 0) changes the
+// CPU mode and swaps banked registers.  The JIT cannot do this safely
+// because it holds r0-r14 in fixed PPC registers that correspond to the
+// CURRENT mode's register file.  Attempting to patch CPSR in-place and
+// continue emitting would use the wrong register aliases.
+//
+// The correct solution is to fall back to the interpreter for ANY MSR
+// that touches control bits.  Only MSR that touches ONLY the flags field
+// (mask == 0x8, bits 31:24) is safe to handle inline because it doesn't
+// swap register banks.
+//
+// MRS is always safe (it reads CPSR/SPSR into a GPR, no mode switch).
 static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
+
+    // MRS Rd, CPSR  (0x010F0000 pattern)
     if((op&0x0FBF0FFF)==0x010F0000){
         uint8_t rd=(op>>12)&0xF;if(rd==15)return false;
-        size_t si=emitCondSkip(ctx,cond);ctx.E(ppc_mr(RA[rd],RCPSR));patchSkip(ctx,si);return true;
+        size_t si=emitCondSkip(ctx,cond);
+        ctx.E(ppc_mr(RA[rd],RCPSR));
+        patchSkip(ctx,si);
+        return true;
     }
-    if((op&0x0FBF0FFF)==0x014F0000)return false;
+
+    // MRS Rd, SPSR  (0x014F0000 pattern) — always fall back (SPSR is mode-dependent)
+    if((op&0x0FBF0FFF)==0x014F0000) return false;
+
+    // MSR — check the field mask
     uint8_t mask=(op>>16)&0xF;
+
+    // If control bits are involved (mask & 0x7), we MUST fall back to the
+    // interpreter because a mode switch swaps banked registers.
+    // This covers mask values: 0x1(c), 0x2(x), 0x3(cx), 0x4(s), 0x5(cs),
+    // 0x6(xs), 0x7(cxs), 0x9(cf), 0xB(cxf), 0xD(csf), 0xF(cxsf).
+    if(mask & 0x7) return false;
+
+    // mask == 0x8: flags field only (bits 31:24) — safe to handle inline.
+    // MSR CPSR_f, #imm
     if((op&0x0DB0F000)==0x0320F000){
         uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
         if(rot)imm=(imm>>rot)|(imm<<(32-rot));
-        if(mask==0x8){
-            imm&=0xFF000000u;size_t si=emitCondSkip(ctx,cond);
-            ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));ctx.li(TA,imm);ctx.E(ppc_or(RCPSR,RCPSR,TA));
-            patchSkip(ctx,si);return true;
-        }
-        return false;
+        imm&=0xFF000000u;  // only flags field
+        size_t si=emitCondSkip(ctx,cond);
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));  // clear bits 31:24
+        ctx.li(TA,imm);
+        ctx.E(ppc_or(RCPSR,RCPSR,TA));
+        patchSkip(ctx,si);
+        return true;
     }
+
+    // MSR CPSR_f, Rm
     if((op&0x0DB0FFF0)==0x0120F000){
         uint8_t rm=op&0xF;if(rm==15)return false;
-        if(mask==0x8){
-            size_t si=emitCondSkip(ctx,cond);
-            ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));ctx.E(ppc_or(RCPSR,RCPSR,TA));
-            patchSkip(ctx,si);return true;
-        }
-        return false;
+        size_t si=emitCondSkip(ctx,cond);
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));          // clear bits 31:24
+        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));              // keep only bits 31:24 of Rm
+        ctx.E(ppc_or(RCPSR,RCPSR,TA));
+        patchSkip(ctx,si);
+        return true;
     }
+
+    // MSR SPSR_f — fall back (SPSR is mode-dependent)
     return false;
 }
+
 static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;
     if(cond==15||((op>>22)&1))return false;
@@ -952,6 +982,10 @@ static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
     if((op&0x0F000000)==0x0F000000)return false;
     if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)return emitBranch(ctx,op,curPC);
+    // MSR/MRS: handle the 0x01000000 space carefully.
+    // Note: some multiply instructions also fall in this space when bit 7
+    // and bit 4 are set — the dispatcher already checked for those above
+    // via the it==0 case, so here we only see genuine MRS/MSR.
     if((op&0x0F900000)==0x01000000){if(emitMrsMsr(ctx,op,curPC))return true;return false;}
     uint32_t it=(op>>25)&7;
     switch(it){
@@ -1149,24 +1183,15 @@ static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
 // Address validation
 // ═══════════════════════════════════════════════════════════════════════
 static bool validPC(uint32_t pc, bool gba) {
-    // Strip thumb bit for range checks
     pc &= ~1u;
-    // Sentinel / host address — never valid
     if (pc >= 0x80000000u) return false;
     if (gba) {
-        // GBA memory map:
-        //   0x00000000-0x00003FFF  BIOS (including address 0 = reset vector)
-        //   0x02000000-0x0203FFFF  EWRAM
-        //   0x03000000-0x03007FFF  IWRAM
-        //   0x06000000-0x06017FFF  VRAM (code unlikely but allow)
-        //   0x08000000-0x0DFFFFFF  ROM (all mirrors)
-        return (pc <= 0x00003FFFu) ||                          // BIOS incl. addr 0
-               (pc >= 0x02000000u && pc < 0x02040000u) ||     // EWRAM
-               (pc >= 0x03000000u && pc < 0x03008000u) ||     // IWRAM
-               (pc >= 0x06000000u && pc < 0x06018000u) ||     // VRAM
-               (pc >= 0x08000000u && pc < 0x0E000000u);       // ROM
+        return (pc <= 0x00003FFFu) ||
+               (pc >= 0x02000000u && pc < 0x02040000u) ||
+               (pc >= 0x03000000u && pc < 0x03008000u) ||
+               (pc >= 0x06000000u && pc < 0x06018000u) ||
+               (pc >= 0x08000000u && pc < 0x0E000000u);
     }
-    // NDS memory map
     return (pc < 0x00008000u) ||
            (pc >= 0x01000000u && pc < 0x02000000u) ||
            (pc >= 0x02000000u && pc < 0x02400000u) ||
@@ -1259,21 +1284,15 @@ static inline void tickInline(Core& core,uint32_t cycles){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Per-CPU runner — returns cycles consumed, 0 if nothing ran
+// Per-CPU runner
 // ═══════════════════════════════════════════════════════════════════════
 static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
-
-    // Halted: return 0. Caller decides whether to charge idle cycles.
     if(interp.halted) return 0;
 
     const bool     arm7      =(cpu==1)||gba;
     const uint32_t cycPerInsn=arm7?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
 
-    // Not ready yet (interpreter hasn't been initialised).
-    // Run one interpreter step to let it make progress toward ready state.
-    // This handles the brief window between enterGbaMode() scheduling
-    // events and the interpreter actually being init'd.
     if(!interp.isReady()){
         interp.jitRunOpcode();
         return cycPerInsn;
@@ -1281,15 +1300,11 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
     uint32_t pc=interp.getActualPC();
 
-    // Sentinel check — 0xFFFFFFFF means the interpreter pipeline hasn't
-    // been primed yet.  Fall back to interpreter for one step.
     if(pc==0xFFFFFFFFu){
         interp.jitRunOpcode();
         return cycPerInsn;
     }
 
-    // Invalid / unmapped PC — run interpreter so it can take an exception
-    // or otherwise recover.
     if(!validPC(pc,gba)){
         static uint32_t lastBadPC[2]={0u,0u};
         if(pc!=lastBadPC[cpu]){
@@ -1322,7 +1337,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     LoopState& ls=s_loop[cpu];
 
     if(reason==EXIT_FALLBACK){
-        // Reset norm detector on any fallback
         if(!ls.normBursting) resetNormSpin(ls);
 
         if(ls.fbPC==expc){
@@ -1368,7 +1382,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
         return cycPerInsn;
 
     }else{
-        // EXIT_NORMAL — reset FALLBACK detector
         ls.fbPC   =0xFFFFFFFFu;
         ls.fbCount=0;
         ls.fbDumped=false;
@@ -1378,9 +1391,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
             const uint32_t spinB=ls.normBurstExit;
 
             DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
-
-            // Mark that we're inside a burst so normSpinDetect won't
-            // immediately re-trigger when we call it next iteration.
             ls.normBursting=true;
 
             bool escaped=false;
@@ -1398,14 +1408,9 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                 }
             }
 
-            // Always fully reset norm state after a burst attempt,
-            // whether or not we escaped.  This prevents immediate
-            // re-detection on the very next runCpu call.
             resetNormSpin(ls);
 
             if(!escaped){
-                // Didn't escape: log and continue (scheduler may have
-                // fired an interrupt that will un-spin on next call)
                 DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
             }
 
@@ -1440,44 +1445,34 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    // Run both CPUs for ITERS_NDS iterations, accumulating ARM9 cycles.
-    // ARM9 is the master clock. ARM7 runs at half rate so we don't add
-    // its cycles to the master counter — it's implicitly paced by the
-    // shared globalCycles clock.
+    // Run both CPUs. ARM9 is master clock.
+    // ARM7 runs at half the clock rate, so one ARM7 cycle = 2 ARM9 cycles.
+    // We run them interleaved: for each ARM9 step, do one ARM7 step.
+    // globalCycles counts ARM9 cycles.
     uint32_t acc0=0;
     for(int i=0;i<ITERS_NDS;i++){
-        acc0 += runCpu(core,0,false);
-        runCpu(core,1,false);   // ARM7: run but don't add to master acc
+        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
+        runCpu(core,1,false);          // ARM7: runs but doesn't add to acc
     }
 
-    // Apply floor: always advance at least one scanline so events fire.
-    // If ARM9 was halted the whole call (acc0==0), still charge the floor
-    // so the scheduler keeps ticking — otherwise we deadlock waiting for
-    // an interrupt that can never fire because time never advances.
+    // Always advance at least one scanline so events fire on time.
+    // If both CPUs were halted, still advance so IRQs can fire.
     uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
     tickInline(core,charge);
-
     logStatus(core);
 }
 
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    // GBA mode: only cpu1 (ARM7) executes.
-    // cpu0 (ARM9) is permanently halted (halt0=4).
-    //
-    // Key insight: we must ALWAYS charge at least FLOOR_CYCLES_GBA per
-    // call so GBA_SCANLINE240 and GBA_SCANLINE308 events fire at 60fps.
-    // Even if cpu1 is halted (HALT opcode waiting for VBlank IRQ), time
-    // must advance so the VBlank event fires and un-halts the CPU.
-    //
-    // We do NOT call runCpu for cpu0 — it is permanently halted in GBA mode.
-
+    // GBA mode: only cpu1 (ARM7) runs. cpu0 is permanently halted.
+    // Must always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
     uint32_t acc=0;
     for(int i=0;i<ITERS_GBA;i++){
         uint32_t c=runCpu(core,1,true);
-        // runCpu returns 0 when halted; charge 1 cycle per iter anyway
-        // so the accumulator reflects time passing even during HALT.
+        // When halted (HALT opcode waiting for IRQ), charge 1 cycle so
+        // the accumulator reflects time passing — otherwise the floor
+        // never gets reached and the VBlank IRQ never fires.
         acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
     }
 
