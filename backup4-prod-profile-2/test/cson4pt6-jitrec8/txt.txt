@@ -1,1 +1,4 @@
+Cson4.6 first attempt at a fix was not successful. same behavior as before with frozen white/black screen. but now nds framerate drops to a crawl (1fps) once a rom loads in. here is the debug log. 
+
+HOLD ON. HOLD THE PHONE! Rock wrestler boots now. amazing. ok let's analyze carefully. 
 
