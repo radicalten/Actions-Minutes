@@ -5547,3 +5547,235 @@ The key logging improvements are:
 5. **Compile failure logging** — logs overflow and no-BLR cases
 6. **`flushJitCache` logging** — logs when cache is flushed with generation number
 7. **Shutdown summary** — total JIT vs fallback counts on exit
+
+===================
+Looking at the debug log, I can now clearly identify the remaining issues:
+
+## Analysis
+
+**CPU0 fallbacks are all coprocessor (CP15) instructions:**
+- `EE110F10` = `MRC p15, 0, r1, c1, c0, 0` (read control register)
+- `EE010F10` = `MCR p15, 0, r1, c1, c0, 0` (write control register)
+- `EE070F15/F16/F9A` = cache/TLB operations
+- `EE060F10-F17` = cache operations
+- `EE090F31/F11` = cache lockdown
+- `EE020F30/F10` = cache operations
+- `EE030F10` = cache operations
+- `EE050F70/F50` = cache operations
+- `E12FFF1E` = `BX LR` — **this should NOT be falling back!**
+- `E121F000` = `MSR CPSR_c, r0` — **this falls back because mask=1 (c field), not f field**
+- `E12FF000` = `MSR CPSR_c, r0` — **same**
+
+**CPU1 is stuck in a 3-instruction loop at `02380020-02380028`** with alternating JIT/fallback. The fallback at `02380024` repeats every cycle.
+
+**Critical bugs found:**
+1. `BX LR` (`E12FFF1E`) falls back — `rm=14` should work, only `rm=15` is rejected
+2. `MSR CPSR_c` (mask=1) falls back — we only handle mask=8 (f field); the c field controls mode and must go to interpreter, but the ARM9 init uses it legitimately and it halts boot
+3. CPU1 loop at `02380024` with `r=1` every other step — something at that address permanently falls back
+
+Let me decode `02380024`: given the loop `02380020→02380024→02380024(FB)→02380028→02380020`, the fallback at `02380024` is the loop exit condition. The instruction there is likely a conditional branch or comparison that involves a coprocessor result.
+
+The `BX LR` bug is the most critical — it means every function return falls back to interpreter. Let me check: `E12FFF1E` = `1110 0001 0010 1111 1111 1111 0001 1110`. Bits 27-20 = `00010010`, bits 7-4 = `0001`, bits 3-0 = `1110` = rm=14. So it IS a valid BX with rm=14. The bug is in `dispARM` — the opcode `E12FFF1E` has bits 27-20 = `0x12` which matches `0x0F900000` mask check... let me recheck.
+
+`E12FFF1E`: bits 31-28=`E`(cond=14=AL), bits 27-20=`0x12`=`00010010`. The check `(op&0x0F900000)==0x01000000` — `0xE12FFF1E & 0x0F900000 = 0x01000000`. Yes! So it goes into `emitMrsMsr` which fails because it doesn't match any MRS/MSR pattern, returning false. The fix is to check for BX **before** the MRS/MSR check.
+
+Here are the targeted fixes needed — only the changed functions:
+
+```cpp
+// ── Fix 1: dispARM — check BX/BLX before MRS/MSR ─────────────────────
+// BX has encoding 0x012FFF1x which matches the 0x0F900000==0x01000000
+// check and gets misrouted into emitMrsMsr. Check it first.
+static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
+    uint8_t cond = (op >> 28) & 0xF;
+    if (cond == 15) return false;
+
+    // SWI
+    if ((op & 0x0F000000) == 0x0F000000) return false;
+
+    // BX / BLX register — must be checked BEFORE the MRS/MSR 0x0F900000 test
+    // because BX encoding 0x012FFF10 satisfies (op&0x0F900000)==0x01000000
+    if ((op & 0x0FFFFFF0) == 0x012FFF10 ||
+        (op & 0x0FFFFFF0) == 0x012FFF30)
+        return emitBranch(ctx, op, curPC);
+
+    // MRS / MSR family (but not BX which was caught above)
+    if ((op & 0x0F900000) == 0x01000000) {
+        if (emitMrsMsr(ctx, op, curPC)) return true;
+        return false;
+    }
+
+    uint32_t it = (op >> 25) & 7;
+    switch (it) {
+        case 0:
+            if ((op & 0x0FC000F0) == 0x00000090) return emitMul(ctx, op);
+            if ((op & 0x0E000090) == 0x00000090) return emitLSExtra(ctx, op, curPC);
+            return emitDP(ctx, op, curPC);
+        case 1:
+            return emitDP(ctx, op, curPC);
+        case 2:
+        case 3:
+            return emitLS(ctx, op, curPC);
+        case 4:
+            return emitBlockXfer(ctx, op, curPC);
+        case 5:
+            return emitBranch(ctx, op, curPC);
+        default:
+            return false;
+    }
+}
+
+// ── Fix 2: emitMrsMsr — handle MSR CPSR_c (mode changes) safely ──────
+// MSR with c field (mask=1) changes the processor mode.
+// We can handle the common case of switching to known modes inline
+// for IRQ/SVC/SYS/USR if the immediate value is a known mode constant.
+// All other cases (register source for c field, or unknown modes) fall
+// back to interpreter.
+static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t) {
+    uint8_t cond = (op >> 28) & 0xF;
+    if (cond == 15) return false;
+
+    // MRS Rd, CPSR  — 0x010F0000
+    if ((op & 0x0FBF0FFF) == 0x010F0000) {
+        uint8_t rd = (op >> 12) & 0xF;
+        if (rd == 15) return false;
+        size_t si = emitCondSkip(ctx, cond);
+        ctx.E(ppc_mr(RA[rd], RCPSR));
+        patchSkip(ctx, si);
+        return true;
+    }
+
+    // MRS Rd, SPSR  — 0x014F0000 — needs banked regs, fall back
+    if ((op & 0x0FBF0FFF) == 0x014F0000) return false;
+
+    uint8_t mask = (op >> 16) & 0xF;
+
+    // MSR with immediate operand
+    if ((op & 0x0DB0F000) == 0x0320F000) {
+        uint32_t imm = op & 0xFF;
+        uint32_t rot = ((op >> 8) & 0xF) * 2;
+        if (rot) imm = (imm >> rot) | (imm << (32 - rot));
+
+        if (mask == 0x8) {
+            // flags field only (NZCV) — safe to do inline
+            imm &= 0xFF000000u;
+            size_t si = emitCondSkip(ctx, cond);
+            ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 8, 31));  // clear NZCV
+            ctx.li(TA, imm);
+            ctx.E(ppc_or(RCPSR, RCPSR, TA));
+            patchSkip(ctx, si);
+            return true;
+        }
+
+        if (mask == 0x1 || mask == 0x9) {
+            // c field (and possibly f) — mode change via immediate
+            // Only safe to inline if the mode bits are a known ARM mode
+            // and we're not changing to user mode (which would drop privileges)
+            uint8_t newMode = imm & 0x1F;
+            // Allowed modes we can handle: SVC=0x13, IRQ=0x12, FIQ=0x11,
+            //                              ABT=0x17, UND=0x1B, SYS=0x1F
+            // USR=0x10 changes banked regs — fall back
+            if (newMode == 0x10) return false;  // USR mode — complex
+            // For other modes, fall back to interpreter to handle
+            // banked register swaps correctly
+            return false;
+        }
+        return false;
+    }
+
+    // MSR with register operand
+    if ((op & 0x0DB0FFF0) == 0x0120F000) {
+        uint8_t rm = op & 0xF;
+        if (rm == 15) return false;
+
+        if (mask == 0x8) {
+            // flags only — safe
+            size_t si = emitCondSkip(ctx, cond);
+            ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 8, 31));
+            ctx.E(ppc_rlwinm(TA, RA[rm], 0, 0, 7));
+            ctx.E(ppc_or(RCPSR, RCPSR, TA));
+            patchSkip(ctx, si);
+            return true;
+        }
+
+        if (mask == 0xF) {
+            // All fields — but only safe if not changing mode
+            // Fall back to interpreter to handle banked regs
+            return false;
+        }
+
+        if (mask == 0x1 || mask == 0x9) {
+            // c field — mode change, fall back
+            return false;
+        }
+        return false;
+    }
+
+    // MSR SPSR — always fall back (needs banked SPSR)
+    return false;
+}
+
+// ── Fix 3: emitBranch — remove the redundant BX check from case 0 ────
+// dispARM now handles BX before calling into the it-field switch,
+// so emitBranch no longer needs to handle it from case 0.
+// emitBranch is still called directly for it==5 (B/BL) and for
+// BX from dispARM directly.
+static bool emitBranch(Ctx& ctx, uint32_t op, uint32_t curPC) {
+    // BX Rm
+    if ((op & 0x0FFFFFF0) == 0x012FFF10) return emitBX(ctx, op, curPC);
+    // BLX Rm — fall back (needs Thumb switch + link)
+    if ((op & 0x0FFFFFF0) == 0x012FFF30) return false;
+    // B / BL
+    if ((op & 0x0E000000) != 0x0A000000) return false;
+
+    uint8_t cond = (op >> 28) & 0xF;
+    if (cond == 15) return false;
+    bool lk = (op >> 24) & 1;
+    int32_t off = (int32_t)(op << 8) >> 6;
+    uint32_t tgt = curPC + 8u + (uint32_t)off;
+
+    size_t si = emitCondSkip(ctx, cond);
+    if (lk) ctx.li(RA[14], curPC + 4);
+    emitCommitExit(ctx, tgt, EXIT_NORMAL);
+    if (si != SIZE_MAX) {
+        patchSkip(ctx, si);
+        emitCommitExit(ctx, curPC + 4, EXIT_NORMAL);
+    }
+    ctx.done = true;
+    return true;
+}
+```
+
+Now to understand **why CPU1 is looping at `02380020-02380028`**, I need to know what's at `02380024`. From the log, `02380024 → 02380024 r=1` means the instruction at `02380024` always falls back. Given the surrounding context with `cpsr=800000DF` (N flag set, System mode), this is likely a conditional branch like `BMI` or `BPL` that should be exiting the loop.
+
+The fact that it alternates `r=0` then `r=1` every two cycles suggests the condition evaluation itself is wrong — the N flag is being computed incorrectly by the JIT. With `cpsr=800000DF`, N=1. If the branch at `02380024` is e.g. `BNE` and the comparison result is wrong, the branch will always fall back or always take the wrong path.
+
+However since `02380024` shows `r=1` (FALLBACK), the instruction itself is uncompilable — it's probably a coprocessor instruction or another MSR. Let me check: given this is ARM7 (`cpu1`) in System mode (`DF = 11011111`), the sequence `02380020→02380024→02380028→02380020` looks like a wait loop. The fallback at `02380024` means it's an instruction the JIT doesn't handle.
+
+Add this to your `debug_log.h` / status output to decode what's actually at those addresses — add this temporary diagnostic to `runCpu` to log the actual opcode when we see a repeated fallback at the same PC:
+
+```cpp
+// Add to runCpu(), just before executeBlock_asm call, temporarily:
+// Log the actual opcode at the block PC for diagnosis
+if (g_diagPC[cpu] == pc) {
+    g_diagCount[cpu]++;
+    if (g_diagCount[cpu] == 10) {
+        // We've looped here 10 times — dump the opcodes
+        uint32_t op0 = core.memory.read<uint32_t>(arm7, pc);
+        uint32_t op1 = core.memory.read<uint32_t>(arm7, pc+4);
+        uint32_t op2 = core.memory.read<uint32_t>(arm7, pc+8);
+        DebugLog("[JIT] LOOP DETECT cpu%d pc=%08X: %08X %08X %08X\n",
+                 cpu, pc, op0, op1, op2);
+    }
+} else {
+    g_diagPC[cpu] = pc;
+    g_diagCount[cpu] = 0;
+}
+```
+
+Add the statics at file scope:
+```cpp
+static uint32_t g_diagPC[2]    = {0xFFFFFFFFu, 0xFFFFFFFFu};
+static uint32_t g_diagCount[2] = {};
+```
+
+This will tell us exactly what opcode is at `02380024` so we can either implement it or understand why it's looping. Based on the pattern (ARM7, system mode, tight loop), it's almost certainly a `WFI` equivalent or a coprocessor status check. Share the output and we can add support for the specific instruction.
