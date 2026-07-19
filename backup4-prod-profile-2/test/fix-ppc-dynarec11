@@ -1,8 +1,10 @@
 Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code:
 
-Most nds games launch and go to the white screen but get stuck there (although a debug rom rockwrestler.nds plays at 28fps).
+Most nds games launch and go to the white screen but get stuck there (However one debug rom rockwrestler.nds plays at 28fps).
 When launching a gba game I get the gba boot logo then a black screen but it gets stuck there at the black screen.
-Here is a snippet of my debug log:
+In rockwrestler.nds (the one game that launches) in the top right corner the ARM7 light turns red then green then red, which could be a clue, from the rockwrestler description:
+"On the top right, there's a green or red light next to ARM7. This indicates if the ARM7 is currently in its main loop where it awaits tests. If this light is red due to a failed test, the ARM7 may be stuck somewhere and so future tests involving it will certainly fail. If this light is red when booting the ROM, either IPCSYNC is not working which is used for this, or the ARM7 is stuck somewhere else."
+When selecting IPCSYNC, IPCFIFO, and IPCFIFO IRQ rockwrestler states Timeout when the ARM7 light is red (which occurs at least half the time).
 rockwrestler nds debug info:
 === NooDS-Wii status log ===
 [STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f76c
