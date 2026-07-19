@@ -5,3 +5,15 @@ HOLD ON. HOLD THE PHONE! Rock wrestler boots now. amazing. ok let's analyze care
 Turns out rockwrestler worked with the 439 fix7 version too. hmm guess I hadn't checked rockwrestler in quite a few versions. 
 
 rockwrestler works: 440, 439, 438, but not 437. so whatever change was made on 438 did the trick. 
+
+I believe the exact change was: which changed interpreter function from
+    uint32_t getActualPC() {
+        return *registers[15] - (isThumb() ? 8u : 4u);
+    }
+to
+    uint32_t getActualPC() {
+        return *registers[15] - (isThumb() ? 2u : 4u);
+    }
+Update interpreter.h
+NooDS-Wii #330: Commit c671475 pushed by radicalten 
+
