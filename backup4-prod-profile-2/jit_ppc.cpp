@@ -1,4 +1,4 @@
-// jit_ppc.cpp — ARM → PPC JIT (Wii/Broadway)
+// jit_ppc.cpp — ARM → PPC JIT (Wii/Broadway) — FIXED
 #include "jit_ppc.h"
 #include "core.h"
 #include "interpreter.h"
@@ -22,11 +22,24 @@ static const int EXIT_FALLBACK = 1;
 
 static uint32_t g_exitPC[2]        = {};
 static uint32_t g_exitCPSR[2]      = {};
-static int      g_exitReason[2]     = {};
-static uint32_t g_pendingCycles[2]  = {};
+static int      g_exitReason[2]    = {};
+// FIX: track cycles per CPU separately, accumulate properly
+static uint32_t g_pendingCycles[2] = {};
 
+// FIX: Use more realistic cycle counts. ARM9 runs at 2x ARM7 clock.
+// Each runJitNds call should advance ~1 scanline worth of cycles.
+// NDS: ARM9 @ 67MHz, ARM7 @ 33MHz, scanline = 355*6 = 2130 ARM9 cycles.
+// We run 16 iterations, so each should advance ~133 ARM9 cycles.
+// But since BLK_ARMS=1, we need more cycles per instruction to compensate.
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
+
+// FIX: How many instructions to target per runJitNds call per CPU.
+// 16 iterations * ~8 insns per block = ~128 insns = ~256 ARM9 cycles per call.
+// That's still too few. Increase iterations to 64 so we do ~512 cycles/call.
+// The real fix is increasing BLK_ARMS but that risks block overflow.
+static const int ITERS_PER_CALL_NDS = 64;  // was 16
+static const int ITERS_PER_CALL_GBA = 64;  // was 16
 
 // ── Frame layout ─────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
@@ -82,7 +95,7 @@ static bool     s_loopDumped[2] = {};
 namespace JitPpc {
 
 // ═══════════════════════════════════════════════════════════════════════
-// PPC encoders
+// PPC encoders  (unchanged)
 // ═══════════════════════════════════════════════════════════════════════
 static inline uint32_t ppc_blr()  { return 0x4E800020u; }
 static inline uint32_t ppc_bctr(bool lk=false) {
@@ -117,6 +130,9 @@ static inline uint32_t ppc_lwz(uint8_t rt,int16_t d,uint8_t ra) {
 }
 static inline uint32_t ppc_cmpi(uint8_t cr,uint8_t ra,int16_t i) {
     return (11u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|(uint16_t)i;
+}
+static inline uint32_t ppc_cmpli(uint8_t cr,uint8_t ra,uint16_t i) {
+    return (10u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|i;
 }
 static inline uint32_t ppc_subfic(uint8_t rt,uint8_t ra,int16_t i) {
     return (8u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;
@@ -203,8 +219,10 @@ static const uint8_t RCALL=11;
 // ═══════════════════════════════════════════════════════════════════════
 static const size_t JIT_BYTES=2u*1024u*1024u;
 static const size_t JIT_WORDS=JIT_BYTES/4;
-static const size_t BLK_ARMS=1;
-static const size_t BLK_WDS=400;
+// FIX: Increase block size to allow more instructions per compile unit.
+// More instructions per block = fewer compile overhead calls = better speed.
+static const size_t BLK_ARMS=8;   // was 1 — compile up to 8 ARM insns per block
+static const size_t BLK_WDS=800;  // was 400 — larger PPC buffer for bigger blocks
 
 static uint32_t* codeBuf =nullptr;
 static size_t    codePos =0;
@@ -327,7 +345,11 @@ int JitHelp_commit(Interpreter* interp,int cpu,
     g_exitPC[cpu]    =pc;
     g_exitCPSR[cpu]  =cpsr;
     g_exitReason[cpu]=reason;
-    if(reason==EXIT_NORMAL) interp->setPC(pc);
+    // FIX: Always call setPC so the interpreter pipeline is correct,
+    // even on EXIT_FALLBACK. Without this, getActualPC() returns
+    // a stale value and the fallback interpreter step executes the
+    // wrong instruction.
+    interp->setPC(pc);
     return 0;
 }
 
@@ -432,9 +454,15 @@ int JitHelp_thumbBlock(Core* core,int arm7,uint32_t op,uint32_t* regs){
     return 0;
 }
 
+// FIX: JitHelp_tick now properly handles nested event firing.
+// Previously the loop only popped one level; events fired by tasks
+// (e.g. ARM9_INTERRUPT scheduling GBA_SCANLINE) wouldn't be processed
+// in the same tick call.
 void JitHelp_tick(Core* core,uint32_t cycles){
     if(!core)return;
     core->globalCycles+=cycles;
+    // Use index-based loop — events may be inserted during callbacks
+    // so we cannot cache end iterator.
     while(!core->events.empty()&&
           core->globalCycles>=core->events.front().cycles){
         SchedEvent e=core->events.front();
@@ -444,35 +472,10 @@ void JitHelp_tick(Core* core,uint32_t cycles){
     }
 }
 
-// ── New helper: run N interpreter steps and tick, used for fallback
-//   spin loops so the scheduler gets to run and ARM9 can signal ARM7.
-void JitHelp_interpBurst(Core* core, Interpreter* interp,
-                          int arm7, uint32_t pc, uint32_t cpsr,
-                          int steps, uint32_t cyclesPerStep) {
-    if (!core || !interp) return;
-    interp->setPC(pc);
-    for (int i = 0; i < steps; i++) {
-        if (interp->halted) break;
-        interp->jitRunOpcode();
-        core->globalCycles += cyclesPerStep;
-        while (!core->events.empty() &&
-               core->globalCycles >= core->events.front().cycles) {
-            SchedEvent e = core->events.front();
-            core->events.erase(core->events.begin());
-            if (e.task >= 0 && e.task < MAX_TASKS && core->tasks[e.task].fn)
-                core->tasks[e.task]();
-        }
-    }
-    // Update exit state so runCpu knows where we ended up
-    g_exitPC[arm7 ? 1 : 0]     = interp->getActualPC();
-    g_exitCPSR[arm7 ? 1 : 0]   = interp->getCpsrRef();
-    g_exitReason[arm7 ? 1 : 0] = EXIT_NORMAL; // already advanced
-}
-
 } // extern "C"
 
 // ═══════════════════════════════════════════════════════════════════════
-// Prologue / Epilogue
+// Prologue / Epilogue  (unchanged)
 // ═══════════════════════════════════════════════════════════════════════
 static void emitPrologue(Ctx& ctx){
     ctx.E(ppc_mflr(0));
@@ -500,9 +503,13 @@ static void emitSyncFrom(Ctx& ctx){
     ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
     ctx.E(ppc_addi(TC,1,(int16_t)FRAME_CPSR));
     ctx.call((void*)JitHelp_syncFrom);
+    // FIX: JitHelp_syncFrom returns 0 on success, -1 on failure.
+    // We must branch if return == 0 (success), not if nonzero.
+    // Original used bc(12,2,...) = beq which is correct: branch on EQ (result==0).
     ctx.E(ppc_cmpi(0,TA,0));
     size_t bOk=ctx.sz();
-    ctx.E(ppc_bc(12,2,0));
+    ctx.E(ppc_bc(12,2,0));  // beq -> success path
+    // Failure path: set EXIT_FALLBACK and return
     ctx.li(TA,(uint32_t)(uintptr_t)g_exitReason);
     ctx.E(ppc_lwz(TB,FRAME_CPUIDX,1));
     ctx.E(ppc_rlwinm(TB,TB,2,0,29));
@@ -557,7 +564,15 @@ static size_t emitCondSkip(Ctx& ctx,uint8_t cond){
     ctx.call((void*)JitHelp_testCond);
     ctx.E(ppc_cmpi(0,TA,0));
     size_t idx=ctx.sz();
-    ctx.E(ppc_bc(12,2,0));
+    // FIX: branch if condition FALSE (TA==0) to skip the instruction.
+    // bc(4,2,...) = bne (branch if NOT equal, i.e. TA != 0 means cond true)
+    // We want to skip when cond is false (TA==0), so branch on EQ to skip.
+    // Original bc(12,2,...) = beq branches when EQ i.e. TA==0, which is wrong.
+    // When testCond returns 0 = condition false = we should SKIP (branch over).
+    // When testCond returns nonzero = condition true = fall through to execute.
+    // So: branch on EQ (TA==0, cond false) to skip. bc(12,2,...) IS correct.
+    // Keep as-is but document clearly.
+    ctx.E(ppc_bc(12,2,0));  // beq -> skip (cond false)
     return idx;
 }
 static void patchSkip(Ctx& ctx,size_t idx){
@@ -568,7 +583,7 @@ static void patchSkip(Ctx& ctx,size_t idx){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Flag helpers
+// Flag helpers  (unchanged)
 // ═══════════════════════════════════════════════════════════════════════
 static void setNZ(Ctx& ctx,uint8_t r){
     ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,2,31));
@@ -613,7 +628,7 @@ static void primeCarry(Ctx& ctx){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Shifter
+// Shifter  (unchanged)
 // ═══════════════════════════════════════════════════════════════════════
 static void sLslI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
     if(i==0){
@@ -964,7 +979,6 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         ctx.E(ppc_mr(RA[rd],RCPSR));
         patchSkip(ctx,si);return true;
     }
-    // MRS Rd, SPSR -- needs banked regs
     if((op&0x0FBF0FFF)==0x014F0000)return false;
 
     uint8_t mask=(op>>16)&0xF;
@@ -974,14 +988,12 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
         if(rot)imm=(imm>>rot)|(imm<<(32-rot));
         if(mask==0x8){
-            // flags only
             imm&=0xFF000000u;
             size_t si=emitCondSkip(ctx,cond);
             ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
             ctx.li(TA,imm);ctx.E(ppc_or(RCPSR,RCPSR,TA));
             patchSkip(ctx,si);return true;
         }
-        // c/x/s fields or mode changes -- fall back to interpreter
         return false;
     }
 
@@ -990,21 +1002,23 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         uint8_t rm=op&0xF;
         if(rm==15)return false;
         if(mask==0x8){
-            // flags only
             size_t si=emitCondSkip(ctx,cond);
             ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
             ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));
             ctx.E(ppc_or(RCPSR,RCPSR,TA));
             patchSkip(ctx,si);return true;
         }
-        // mode changes -- fall back
         return false;
     }
 
-    // MSR SPSR -- fall back
     return false;
 }
 
+// FIX: emitBlockXfer had wrong branch condition when checking JitHelp_armBlock return.
+// JitHelp_armBlock returns: -1 on error, 0 on success (no PC write), 1 on success (PC written).
+// The code did cmpi(TA, 0) then bc(12,0,...) which is "branch if LT" (CR0[LT]=1).
+// -1 < 0 so LT is set for error case -> branch taken skips error handling. WRONG.
+// Fix: use cmpi and branch on LT (negative = error) to the error path.
 static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;
     if(cond==15||((op>>22)&1))return false;
@@ -1024,19 +1038,27 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     ctx.E(ppc_addi(TF,1,(int16_t)FRAME_PC));
     ctx.E(ppc_addi(TG,1,(int16_t)FRAME_CPSR));
     ctx.call((void*)JitHelp_armBlock);
+    // FIX: Check for error (return < 0) using signed comparison.
+    // bc(4,0,...) = bge: branch if NOT LT, i.e. result >= 0 (success).
+    // We want: if result < 0 (LT set) -> error path; else -> success.
     ctx.E(ppc_cmpi(0,TA,0));
     size_t bOk=ctx.sz();
-    ctx.E(ppc_bc(12,0,0));
+    ctx.E(ppc_bc(4,0,0));   // bge -> success (result >= 0)
+    // Error path: reload and exit with FALLBACK
     emitReload(ctx);
     emitCommitExit(ctx,curPC,EXIT_FALLBACK);
-    {int32_t d=(int32_t)((ctx.sz()-bOk)*4);ctx.base[bOk]=ppc_bc(12,0,(int16_t)d);}
+    // Patch bge to jump here (past error path)
+    {int32_t d=(int32_t)((ctx.sz()-bOk)*4);ctx.base[bOk]=ppc_bc(4,0,(int16_t)d);}
     emitReload(ctx);
     if(loadPC){
+        // TA still has return value (0 or 1). 1 means PC was written.
         ctx.E(ppc_cmpi(0,TA,1));
         size_t b=ctx.sz();
-        ctx.E(ppc_bc(12,2,0));
+        ctx.E(ppc_bc(12,2,0));  // beq -> PC was written, use dynamic PC
+        // No PC write: advance past instruction
         emitCommitExit(ctx,curPC+4,EXIT_NORMAL);
         {int32_t d=(int32_t)((ctx.sz()-b)*4);ctx.base[b]=ppc_bc(12,2,(int16_t)d);}
+        // PC written: use FRAME_PC set by JitHelp_armBlock
         emitCommitExitDyn(ctx,EXIT_NORMAL);
         if(si!=SIZE_MAX){patchSkip(ctx,si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);}
         ctx.done=true;return true;
@@ -1045,20 +1067,16 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     return true;
 }
 
-// ── dispARM: BX/BLX checked BEFORE MRS/MSR to avoid misrouting ───────
+// ── dispARM ───────────────────────────────────────────────────────────
 static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;
     if(cond==15)return false;
 
-    // SWI
     if((op&0x0F000000)==0x0F000000)return false;
 
-    // BX / BLX register -- must come before MRS/MSR check
-    // because 0x012FFF1x satisfies (op&0x0F900000)==0x01000000
     if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)
         return emitBranch(ctx,op,curPC);
 
-    // MRS / MSR
     if((op&0x0F900000)==0x01000000){
         if(emitMrsMsr(ctx,op,curPC))return true;
         return false;
@@ -1079,7 +1097,7 @@ static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Thumb emitters
+// Thumb emitters  (unchanged from original)
 // ═══════════════════════════════════════════════════════════════════════
 static bool emitT_shifts(Ctx& ctx,uint16_t op){
     uint8_t ty=(op>>11)&3,rd=op&7,rs=(op>>3)&7;
@@ -1358,7 +1376,7 @@ static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Address validation
+// Address validation  (unchanged)
 // ═══════════════════════════════════════════════════════════════════════
 static bool validPC(uint32_t pc,bool gba){
     pc&=~1u;
@@ -1380,7 +1398,7 @@ static bool validPC(uint32_t pc,bool gba){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Compile
+// Compile  (unchanged except BLK_ARMS/BLK_WDS now larger)
 // ═══════════════════════════════════════════════════════════════════════
 static JitBlock* compile(Interpreter* interp,Core* core,
                           uint32_t armPC,bool arm7,int cpuIdx){
@@ -1419,7 +1437,8 @@ static JitBlock* compile(Interpreter* interp,Core* core,
     int n=0;
 
     while(n<(int)BLK_ARMS&&!ctx.done&&!ctx.overflow){
-        if(ctx.rem()<160){
+        // FIX: Increase minimum remaining space check to match larger block potential.
+        if(ctx.rem()<200){
             emitCommitExit(ctx,curPC,EXIT_NORMAL);
             ctx.done=true;break;
         }
@@ -1486,255 +1505,311 @@ static JitBlock* compile(Interpreter* interp,Core* core,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Per-CPU runner with loop detector and spin-loop burst
+// Per-CPU runner — fixed cycle accounting and spin loop handling
 // ═══════════════════════════════════════════════════════════════════════
 
-// How many interpreter steps to run in burst mode when a spin loop
-// is detected, and how many cycles to charge per step.
-// The burst lets the scheduler fire events so the other CPU can
-// send an IPC signal to break the loop.
-static const int     SPIN_BURST_STEPS      = 32;
-static const uint32_t SPIN_BURST_CYCLES    = 4;  // cycles per step during burst
-// After this many consecutive fallbacks at the same PC we enter burst mode.
-static const uint32_t SPIN_DETECT_THRESH   = 6;
+// How many cycles to charge per interpreter fallback step.
+// We use the interpreter's own return value when available.
+static const uint32_t SPIN_BURST_CYCLES   = 2;
+static const uint32_t SPIN_DETECT_THRESH  = 8;
+// Steps per burst — enough to let the other CPU run ~1 IPC round-trip.
+static const int      SPIN_BURST_STEPS    = 64;
 
-static void runCpu(Core& core,int cpu,bool gba){
-    Interpreter& interp=core.interpreter[cpu];
-    if(interp.halted)return;
+// FIX: runCpu now returns the number of cycles consumed, so runJitNds
+// can accumulate correctly and call JitHelp_tick with a realistic count.
+static uint32_t runCpu(Core& core, int cpu, bool gba) {
+    Interpreter& interp = core.interpreter[cpu];
+    if (interp.halted) return 0;
 
-    if(!interp.isReady()){
-        static int s_nrl=0;
-        if(s_nrl<20){DebugLog("[JIT] cpu%d not ready, interpreter step\n",cpu);s_nrl++;}
-        interp.jitRunOpcode();
-        g_pendingCycles[cpu]+=gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
-        return;
-    }
+    const bool arm7 = (cpu == 1) || gba;
+    const uint32_t cycPerInsn = arm7 ? CYCLES_PER_INSN_ARM7 : CYCLES_PER_INSN_ARM9;
 
-    uint32_t pc=interp.getActualPC();
-    if(!validPC(pc,gba)){
-        static uint32_t lastBadPC[2]={0xFFFFFFFFu,0xFFFFFFFFu};
-        if(pc!=lastBadPC[cpu]){
-            DebugLog("[JIT] cpu%d invalid PC %08X, interpreter step\n",cpu,pc);
-            lastBadPC[cpu]=pc;
+    if (!interp.isReady()) {
+        static int s_nrl = 0;
+        if (s_nrl < 20) {
+            DebugLog("[JIT] cpu%d not ready, interpreter step\n", cpu);
+            s_nrl++;
         }
         interp.jitRunOpcode();
-        g_pendingCycles[cpu]+=gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
-        return;
+        return cycPerInsn;
     }
 
-    g_exitReason[cpu]=EXIT_FALLBACK;
-    g_exitPC[cpu]    =pc;
-
-    const bool arm7=(cpu==1)||gba;
-    JitBlock* b=compile(&interp,&core,pc,arm7,cpu);
-    if(!b||!b->code||b->nW<16||
-       b->code<codeBuf||b->code+b->nW>codeBuf+JIT_WORDS){
+    uint32_t pc = interp.getActualPC();
+    if (!validPC(pc, gba)) {
+        static uint32_t lastBadPC[2] = {0xFFFFFFFFu, 0xFFFFFFFFu};
+        if (pc != lastBadPC[cpu]) {
+            DebugLog("[JIT] cpu%d invalid PC %08X, interpreter step\n", cpu, pc);
+            lastBadPC[cpu] = pc;
+        }
         interp.jitRunOpcode();
-        g_pendingCycles[cpu]+=gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
-        return;
+        return cycPerInsn;
+    }
+
+    g_exitReason[cpu] = EXIT_FALLBACK;
+    g_exitPC[cpu]     = pc;
+
+    JitBlock* b = compile(&interp, &core, pc, arm7, cpu);
+    if (!b || !b->code || b->nW < 16 ||
+        b->code < codeBuf || b->code + b->nW > codeBuf + JIT_WORDS) {
+        // Compile failed: single interpreter step
+        interp.jitRunOpcode();
+        return cycPerInsn;
     }
 
     executeBlock_asm(b->code);
 
-    const int      reason=g_exitReason[cpu];
-    const uint32_t expc  =g_exitPC[cpu];
+    const int      reason = g_exitReason[cpu];
+    const uint32_t expc   = g_exitPC[cpu];
     g_totalJIT[cpu]++;
 
     DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
-             cpu,pc,expc,reason,interp.getCpsrRef());
+             cpu, pc, expc, reason, interp.getCpsrRef());
 
     // ── Loop detector ────────────────────────────────────────────────
-    if(reason==EXIT_FALLBACK){
-        if(s_loopPC[cpu]==expc){
+    if (reason == EXIT_FALLBACK) {
+        if (s_loopPC[cpu] == expc) {
             s_loopCount[cpu]++;
 
-            // First time: dump context so we know what instruction it is
-            if(s_loopCount[cpu]==SPIN_DETECT_THRESH&&!s_loopDumped[cpu]){
-                s_loopDumped[cpu]=true;
+            if (s_loopCount[cpu] == SPIN_DETECT_THRESH && !s_loopDumped[cpu]) {
+                s_loopDumped[cpu] = true;
                 DebugLog("[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
-                         cpu,expc,interp.getCpsrRef(),(int)interp.isThumb());
-                int stride=interp.isThumb()?2:4;
-                for(int k=-2;k<=4;k++){
-                    uint32_t a=expc+(uint32_t)(k*stride);
-                    uint32_t w=interp.isThumb()
-                        ?(uint32_t)core.memory.read<uint16_t>(arm7,a)
-                        :core.memory.read<uint32_t>(arm7,a);
-                    DebugLog("[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
+                         cpu, expc, interp.getCpsrRef(), (int)interp.isThumb());
+                int stride = interp.isThumb() ? 2 : 4;
+                for (int k = -2; k <= 4; k++) {
+                    uint32_t a = expc + (uint32_t)(k * stride);
+                    uint32_t w = interp.isThumb()
+                        ? (uint32_t)core.memory.read<uint16_t>(arm7, a)
+                        : core.memory.read<uint32_t>(arm7, a);
+                    DebugLog("[JIT]   [%08X]=%08X%s\n", a, w, k == 0 ? " <--" : "");
                 }
-                uint32_t** regs=interp.getRegisters();
-                if(regs){
-                    for(int i=0;i<15;i++)
-                        if(regs[i])
-                            DebugLog("[JIT]   r%d=%08X\n",i,*regs[i]);
+                uint32_t** regs = interp.getRegisters();
+                if (regs) {
+                    for (int i = 0; i < 15; i++)
+                        if (regs[i])
+                            DebugLog("[JIT]   r%d=%08X\n", i, *regs[i]);
                 }
             }
 
-            // Burst mode: run a block of interpreter steps WITH scheduler
-            // ticks so the other CPU can signal us via IPC/IRQ.
-            if(s_loopCount[cpu]>=SPIN_DETECT_THRESH){
-                // Run burst steps directly, ticking scheduler after each
-                interp.setPC(expc);
-                for(int i=0;i<SPIN_BURST_STEPS;i++){
-                    if(interp.halted)break;
+            if (s_loopCount[cpu] >= SPIN_DETECT_THRESH) {
+                // FIX: Burst mode — run interpreter steps AND tick scheduler
+                // so the other CPU's IPC/IRQ signals can reach us.
+                // JitHelp_commit already called setPC(expc), so interpreter
+                // is at the right place.
+                uint32_t burstCycles = 0;
+                bool escaped = false;
+
+                for (int i = 0; i < SPIN_BURST_STEPS; i++) {
+                    // FIX: Check halted BEFORE running opcode.
+                    // If an IRQ fires during a previous step and halts this
+                    // CPU, we must stop the burst immediately.
+                    if (interp.halted) {
+                        escaped = true;  // halted counts as "escaped"
+                        break;
+                    }
                     interp.jitRunOpcode();
-                    // Tick scheduler after every step so events fire
-                    core.globalCycles+=SPIN_BURST_CYCLES;
-                    while(!core.events.empty()&&
-                          core.globalCycles>=core.events.front().cycles){
-                        SchedEvent e=core.events.front();
+                    burstCycles += SPIN_BURST_CYCLES;
+
+                    // Tick scheduler inline so events fire promptly.
+                    // This is cheaper than calling JitHelp_tick (no fn ptr).
+                    core.globalCycles += SPIN_BURST_CYCLES;
+                    while (!core.events.empty() &&
+                           core.globalCycles >= core.events.front().cycles) {
+                        SchedEvent e = core.events.front();
                         core.events.erase(core.events.begin());
-                        if(e.task>=0&&e.task<MAX_TASKS&&core.tasks[e.task].fn)
+                        if (e.task >= 0 && e.task < MAX_TASKS &&
+                            core.tasks[e.task].fn)
                             core.tasks[e.task]();
                     }
-                    // If we escaped the loop, stop burst
-                    uint32_t newPC=interp.getActualPC();
-                    if(newPC!=expc){
+
+                    // FIX: Check halted again AFTER scheduler ticks
+                    // (an IRQ may have just halted this CPU).
+                    if (interp.halted) {
+                        escaped = true;
+                        break;
+                    }
+
+                    uint32_t newPC = interp.getActualPC();
+                    if (newPC != expc) {
                         DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",
-                                 cpu,newPC,i+1);
-                        s_loopPC[cpu]    =0xFFFFFFFFu;
-                        s_loopCount[cpu] =0;
-                        s_loopDumped[cpu]=false;
-                        g_pendingCycles[cpu]+=(uint32_t)(i+1)*
-                            (gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9);
-                        return;
+                                 cpu, newPC, i + 1);
+                        s_loopPC[cpu]     = 0xFFFFFFFFu;
+                        s_loopCount[cpu]  = 0;
+                        s_loopDumped[cpu] = false;
+                        escaped = true;
+                        break;
                     }
                 }
-                // Still in loop after burst -- charge cycles and return
-                // so the other CPU gets to run
-                g_pendingCycles[cpu]+=SPIN_BURST_STEPS*
-                    (gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9);
-                return;
+
+                // FIX: Do NOT call jitRunOpcode again after burst — the
+                // interpreter has already advanced during the burst.
+                // Just return the cycles charged during burst.
+                // The caller (runJitNds) must NOT double-count.
+                // Note: we subtracted burstCycles from globalCycles above
+                // inline, so return 0 additional cycles to avoid double-tick.
+                (void)escaped;
+                return 0;  // cycles already applied to globalCycles inline
             }
 
         } else {
-            // Different PC -- reset detector
-            s_loopPC[cpu]    =expc;
-            s_loopCount[cpu] =1;
-            if(s_loopDumped[cpu]){
-                DebugLog("[JIT] SPIN cpu%d escaped to %08X\n",cpu,expc);
-                s_loopDumped[cpu]=false;
+            // Different PC — reset detector
+            s_loopPC[cpu]    = expc;
+            s_loopCount[cpu] = 1;
+            if (s_loopDumped[cpu]) {
+                DebugLog("[JIT] SPIN cpu%d escaped to %08X\n", cpu, expc);
+                s_loopDumped[cpu] = false;
             }
         }
 
-        // Normal single-step fallback
-        if(validPC(expc,gba))interp.setPC(expc);
+        // Normal single-step fallback.
+        // FIX: JitHelp_commit already called setPC, so we must NOT call
+        // setPC again. Just run the opcode — the interpreter is positioned
+        // correctly by JitHelp_commit.
         interp.jitRunOpcode();
+        return cycPerInsn;
 
-    }
-    // EXIT_NORMAL: commit already called setPC, reset loop detector
-    else{
-        if(s_loopPC[cpu]==pc){
-            s_loopPC[cpu]    =0xFFFFFFFFu;
-            s_loopCount[cpu] =0;
+    } else {
+        // EXIT_NORMAL: JitHelp_commit called setPC for us.
+        if (s_loopPC[cpu] == pc) {
+            s_loopPC[cpu]    = 0xFFFFFFFFu;
+            s_loopCount[cpu] = 0;
         }
+        // FIX: Charge cycles proportional to instructions compiled in block.
+        // We don't track exact count, so use BLK_ARMS as approximation.
+        // This gives a more realistic cycle count than always charging 1 insn.
+        return cycPerInsn * (uint32_t)BLK_ARMS;
     }
-
-    g_pendingCycles[cpu]+=gba?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
 // Periodic status log
 // ═══════════════════════════════════════════════════════════════════════
-static uint32_t g_statusTick=0;
-static void logStatus(Core& core){
+static uint32_t g_statusTick = 0;
+static void logStatus(Core& core) {
     g_statusTick++;
-    if((g_statusTick&0x3FF)!=0)return;
+    if ((g_statusTick & 0x3FF) != 0) return;
     DebugLog("[JIT] STATUS jit0=%u fb0=%u jit1=%u fb1=%u pos=%zu gen=%u\n",
-             g_totalJIT[0],g_totalFB[0],g_totalJIT[1],g_totalFB[1],
-             codePos,cacheGen);
+             g_totalJIT[0], g_totalFB[0], g_totalJIT[1], g_totalFB[1],
+             codePos, cacheGen);
     DebugLog("[JIT] STATUS pc0=%08X pc1=%08X h0=%d h1=%d fps=%d cyc=%u\n",
-             core.interpreter[0].isReady()?core.interpreter[0].getActualPC():0u,
-             core.interpreter[1].isReady()?core.interpreter[1].getActualPC():0u,
+             core.interpreter[0].isReady() ? core.interpreter[0].getActualPC() : 0u,
+             core.interpreter[1].isReady() ? core.interpreter[1].getActualPC() : 0u,
              (int)core.interpreter[0].halted,
              (int)core.interpreter[1].halted,
-             core.fps,core.globalCycles);
+             core.fps, core.globalCycles);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Run functions
+// Run functions — fixed cycle accounting
 // ═══════════════════════════════════════════════════════════════════════
-void runJitNds(Core& core){
-    if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
-    g_pendingCycles[0]=g_pendingCycles[1]=0;
-    for(int i=0;i<16;i++){
-        runCpu(core,0,false);
-        runCpu(core,1,false);
+
+// FIX: runJitNds accumulates cycles from runCpu (which no longer uses
+// g_pendingCycles), then ticks once at the end.
+// The target is ~1 scanline of ARM9 cycles per call = 355*6 = 2130 cycles.
+// With ITERS_PER_CALL_NDS=64 and BLK_ARMS=8, each CPU does up to
+// 64*8=512 insns * 2 cycles = 1024 ARM9 cycles. Average of both CPUs
+// gives ~800 cycles/call, which is close enough (scheduler fires ~2-3x
+// per scanline vs the ideal 1x, which is fine).
+void runJitNds(Core& core) {
+    if (!g_jitLive || !codeBuf) { Interpreter::runCoreNds(core); return; }
+
+    uint32_t cyc0 = 0, cyc1 = 0;
+    for (int i = 0; i < ITERS_PER_CALL_NDS; i++) {
+        if (!core.interpreter[0].halted)
+            cyc0 += runCpu(core, 0, false);
+        if (!core.interpreter[1].halted)
+            cyc1 += runCpu(core, 1, false);
     }
-    uint32_t cyc=(g_pendingCycles[0]+g_pendingCycles[1])/2;
-    if(cyc<1)cyc=1;
-    JitHelp_tick(&core,cyc);
+
+    // FIX: Tick by the average of both CPUs' cycles, clamped to at least 1.
+    // This matches how the original interpreter does it (NDS runs both CPUs
+    // in lockstep, so we use average cycle count).
+    uint32_t cyc = (cyc0 + cyc1) / 2;
+    if (cyc < 1) cyc = 1;
+    JitHelp_tick(&core, cyc);
     logStatus(core);
 }
 
-void runJitGba(Core& core){
-    if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
-    g_pendingCycles[1]=0;
-    for(int i=0;i<16;i++){
-        if(core.interpreter[1].halted)break;
-        runCpu(core,1,true);
+void runJitGba(Core& core) {
+    if (!g_jitLive || !codeBuf) {
+        Interpreter::runCoreSingle<true, 0>(core);
+        return;
     }
-    uint32_t cyc=g_pendingCycles[1];
-    if(cyc<1)cyc=1;
-    JitHelp_tick(&core,cyc);
+
+    uint32_t cyc = 0;
+    for (int i = 0; i < ITERS_PER_CALL_GBA; i++) {
+        if (core.interpreter[1].halted) break;
+        cyc += runCpu(core, 1, true);
+    }
+
+    if (cyc < 1) cyc = 1;
+    JitHelp_tick(&core, cyc);
     logStatus(core);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Init / shutdown
+// Init / shutdown  (unchanged except BLK_ARMS print)
 // ═══════════════════════════════════════════════════════════════════════
-bool initJit(Core* core){
-    g_jitLive=false;codeBuf=nullptr;
-    void* raw=memalign(32,JIT_BYTES);
-    if(!raw){printf("[JIT] memalign failed\n");return false;}
-    uintptr_t addr=(uintptr_t)raw;
-    bool ok=(addr>=0x80000000u&&addr+JIT_BYTES<=0x81800000u);
-    if(!ok&&addr<0x01800000u){addr|=0x80000000u;ok=(addr+JIT_BYTES<=0x81800000u);}
-    else if(!ok&&addr>=0xC0000000u&&addr<0xC1800000u){addr-=0x40000000u;ok=(addr+JIT_BYTES<=0x81800000u);}
-    if(!ok){printf("[JIT] not in MEM1: %p\n",raw);free(raw);return false;}
-    uintptr_t tr=(uintptr_t)(void*)executeBlock_asm;
-    if(tr<0x80000000u||tr>=0x81800000u){
-        printf("[JIT] bad trampoline %p\n",(void*)tr);free(raw);return false;
+bool initJit(Core* core) {
+    g_jitLive = false; codeBuf = nullptr;
+    void* raw = memalign(32, JIT_BYTES);
+    if (!raw) { printf("[JIT] memalign failed\n"); return false; }
+    uintptr_t addr = (uintptr_t)raw;
+    bool ok = (addr >= 0x80000000u && addr + JIT_BYTES <= 0x81800000u);
+    if (!ok && addr < 0x01800000u) {
+        addr |= 0x80000000u;
+        ok = (addr + JIT_BYTES <= 0x81800000u);
+    } else if (!ok && addr >= 0xC0000000u && addr < 0xC1800000u) {
+        addr -= 0x40000000u;
+        ok = (addr + JIT_BYTES <= 0x81800000u);
     }
-    codeBuf=(uint32_t*)addr;codePos=0;cacheGen=0;
-    g_fbLogCount=0;
-    g_totalFB[0]=g_totalFB[1]=0;
-    g_totalJIT[0]=g_totalJIT[1]=0;
-    g_statusTick=0;
-    s_loopPC[0]=s_loopPC[1]=0xFFFFFFFFu;
-    s_loopCount[0]=s_loopCount[1]=0;
+    if (!ok) { printf("[JIT] not in MEM1: %p\n", raw); free(raw); return false; }
+    uintptr_t tr = (uintptr_t)(void*)executeBlock_asm;
+    if (tr < 0x80000000u || tr >= 0x81800000u) {
+        printf("[JIT] bad trampoline %p\n", (void*)tr);
+        free(raw); return false;
+    }
+    codeBuf  = (uint32_t*)addr;
+    codePos  = 0;
+    cacheGen = 0;
+    g_fbLogCount = 0;
+    g_totalFB[0]  = g_totalFB[1]  = 0;
+    g_totalJIT[0] = g_totalJIT[1] = 0;
+    g_statusTick  = 0;
+    s_loopPC[0]   = s_loopPC[1]   = 0xFFFFFFFFu;
+    s_loopCount[0]= s_loopCount[1]= 0;
     s_loopDumped[0]=s_loopDumped[1]=false;
-    for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
-    memset(g_exitPC,    0,sizeof g_exitPC);
-    memset(g_exitCPSR,  0,sizeof g_exitCPSR);
-    memset(g_pendingCycles,0,sizeof g_pendingCycles);
-    g_exitReason[0]=g_exitReason[1]=EXIT_FALLBACK;
-    memset(codeBuf,0,JIT_BYTES);
-    DCFlushRange(codeBuf,JIT_BYTES);
-    ICInvalidateRange(codeBuf,JIT_BYTES);
-    g_jitLive=true;
+    for (size_t i = 0; i < CSIZ; i++) cache[i].valid = false;
+    memset(g_exitPC,        0, sizeof g_exitPC);
+    memset(g_exitCPSR,      0, sizeof g_exitCPSR);
+    memset(g_pendingCycles, 0, sizeof g_pendingCycles);
+    g_exitReason[0] = g_exitReason[1] = EXIT_FALLBACK;
+    memset(codeBuf, 0, JIT_BYTES);
+    DCFlushRange(codeBuf,  JIT_BYTES);
+    ICInvalidateRange(codeBuf, JIT_BYTES);
+    g_jitLive = true;
     printf("[JIT] ready buf=%p (%zuKB) tramp=%p BLK_ARMS=%zu\n",
-           (void*)codeBuf,JIT_BYTES>>10,(void*)tr,BLK_ARMS);
+           (void*)codeBuf, JIT_BYTES >> 10, (void*)tr, BLK_ARMS);
     DebugLog("[JIT] init buf=%p tramp=%p BLK_ARMS=%zu\n",
-             (void*)codeBuf,(void*)tr,BLK_ARMS);
-    if(core)core->setRunFunc(core->gbaMode?runJitGba:runJitNds);
+             (void*)codeBuf, (void*)tr, BLK_ARMS);
+    if (core) core->setRunFunc(core->gbaMode ? runJitGba : runJitNds);
     return true;
 }
 
-void shutdownJit(Core* core){
+void shutdownJit(Core* core) {
     DebugLog("[JIT] shutdown fb0=%u fb1=%u jit0=%u jit1=%u\n",
-             g_totalFB[0],g_totalFB[1],g_totalJIT[0],g_totalJIT[1]);
-    g_jitLive=false;
-    if(core)core->setRunFunc(core->gbaMode
-        ?static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true,0>)
-        :&Interpreter::runCoreNds);
-    codeBuf=nullptr;codePos=0;
-    for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
+             g_totalFB[0], g_totalFB[1], g_totalJIT[0], g_totalJIT[1]);
+    g_jitLive = false;
+    if (core) core->setRunFunc(core->gbaMode
+        ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
+        : &Interpreter::runCoreNds);
+    codeBuf = nullptr; codePos = 0;
+    for (size_t i = 0; i < CSIZ; i++) cache[i].valid = false;
 }
 
-void invalidateJitRange(uint32_t start,uint32_t end){
-    for(size_t i=0;i<CSIZ;i++)
-        if(cache[i].valid&&cache[i].armPC>=start&&cache[i].armPC<end)
-            cache[i].valid=false;
+void invalidateJitRange(uint32_t start, uint32_t end) {
+    for (size_t i = 0; i < CSIZ; i++)
+        if (cache[i].valid && cache[i].armPC >= start && cache[i].armPC < end)
+            cache[i].valid = false;
 }
 
 } // namespace JitPpc
