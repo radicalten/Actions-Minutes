@@ -91,5 +91,10 @@ FAT mounted, logging started
 [JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=12615680
 [JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
 
+====
+ppc-fix brings GBA Logo back. however rockwrestler is still 28fps and the ARM7 cpu seems to be red more often now. still nothing truly boots except for rockwrestler. 
+
+The gba boot logo is back, but the rest of the behavior stays the same (stuck on black/white screen for gba/nds). However one test rom rockwrestler nds boots. But in the top right corner the ARM7 light is red, perhaps that is a clue:
+"On the top right, there's a green or red light next to ARM7. This indicates if the ARM7 is currently in its main loop where it awaits tests. If this light is red due to a failed test, the ARM7 may be stuck somewhere and so future tests involving it will certainly fail. If this light is red when booting the ROM, either IPCSYNC is not working which is used for this, or the ARM7 is stuck somewhere else."
 
 
