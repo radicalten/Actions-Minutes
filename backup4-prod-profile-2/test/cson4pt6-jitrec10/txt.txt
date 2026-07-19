@@ -579,3 +579,7 @@ FAT mounted, logging started
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 
 
+====
+fix3 seemed to merely reduce fps to 20fps in rockwrestler from 28fps. no other changes I could see.
+Oh and the debug text is gone. bad update tbh.
+
