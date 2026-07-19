@@ -3,6 +3,29 @@ Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? 
 Most nds games launch and go to the white screen but get stuck there (internal fps display 5-15fps)
 When launching a gba game I get the gba boot logo then a black screen but it gets stuck there at the black screen (internal fps display 5-20fps)
 Here is a snippet of my debug log:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f274
+[STATUS] fps=2 cycles=16763772 pc0=0200096C pc1=02380148 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=2 cycles=33603044 pc0=02000924 pc1=02380140 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=2 cycles=50435044 pc0=02000924 pc1=02380140 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80545160 tramp=0x8009fc20 BLK_ARMS=1
+[JIT] cpu0 02000800 -> 02000804 r=0 cpsr=000000DF
+[JIT] cpu1 02380000 -> 02380004 r=0 cpsr=000000DF
+[JIT] cpu0 02000804 -> 02000808 r=0 cpsr=000000DF
+[JIT] cpu1 02380004 -> 02380008 r=0 cpsr=000000DF
+[JIT] cpu0 02000808 -> 02000A5C r=0 cpsr=000000DF
+[JIT] cpu1 02380008 -> 0238000C r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02000A5C op=EE110F10
+[JIT] cpu0 02000A5C -> 02000A5C r=1 cpsr=000000DF
+[JIT] cpu1 0238000C -> 02380010 r=0 cpsr=000000DF
+[JIT] cpu0 02000A60 -> 02000A64 r=0 cpsr=000000DF
+[JIT] cpu1 02380010 -> 02380014 r=0 cpsr=000000DF
+[JIT] cpu0 02000A64 -> 02000A68 r=0 cpsr=000000DF
+[JIT] cpu1 02380014 -> 02380018 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02000A68 op=EE010F10
+...
 [JIT] arm   FB cpu0 pc=02000AA8 op=EE060F14
 [JIT] cpu0 02000AA8 -> 02000AA8 r=1 cpsr=000000DF
 [JIT] cpu1 02380028 -> 02380020 r=0 cpsr=800000DF
