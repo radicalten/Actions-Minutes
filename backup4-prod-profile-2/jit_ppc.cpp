@@ -1,13 +1,13 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway
-// Fixed revision 6:
-// 1. NDS: True interleaved execution - ARM9 and ARM7 alternate each step
-//    so neither CPU starves the other. This fixes IPCSYNC deadlocks.
-// 2. NDS: Spin burst yields to the OTHER CPU after each interpreter step,
-//    so ARM7 can respond to what ARM9 is waiting for.
-// 3. GBA: Removed double floor-tick. Floor is applied once after all iters.
-// 4. GBA: During HALT, charge exact scanline cycles and break early so
-//    tickInline fires the VBlank IRQ promptly.
-// 5. Spin detection threshold raised so short loops don't false-positive.
+// Fixed revision 7:
+// 1. NDS mutual spin: when both CPUs spin simultaneously, interleave
+//    interpreter steps for BOTH rather than just one.
+// 2. GBA VBlank re-entry: after escaping spin, force a scheduler tick
+//    before re-running so VBlank period is respected.
+// 3. GBA boot: during early boot (pc=0, jit not ready), charge cycles
+//    correctly so BIOS completes in reasonable time.
+// 4. Spin detection reset on fallback so stale burst state doesn't persist.
+// 5. NDS: track per-CPU spin state independently, detect mutual deadlock.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -34,28 +34,23 @@ static uint32_t g_exitPC[2]    = {};
 static uint32_t g_exitCPSR[2]  = {};
 static int      g_exitReason[2]= {};
 
-// NDS: ARM9 runs at 67MHz, ARM7 at 33MHz. Ratio = 2:1.
-// We model: each ARM9 insn = 2 master cycles, each ARM7 insn = 1 master cycle.
-// The master clock is the ARM9 clock (67MHz).
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 
-// Per-call iteration budget.
-// We interleave ARM9 and ARM7 one step at a time (see runJitNds).
-// Each "step" = 1 ARM9 instruction + 2 ARM7 instructions (to maintain ratio).
-static const int ITERS_NDS = 32;   // ARM9 steps per runJitNds call
-static const int ITERS_GBA = 64;   // ARM7 steps per runJitGba call
+// Per-call iteration budget
+static const int ITERS_NDS = 32;
+static const int ITERS_GBA = 64;
 
-// Floor: minimum master-clock cycles charged per runJit* call.
-// This ensures scanline events fire even when both CPUs are halted.
-// NDS: 1 scanline = 355*6 = 2130 ARM9 master cycles
-// GBA: 1 scanline = 308*4 = 1232 ARM7 cycles
-static const uint32_t FLOOR_CYCLES_NDS = 2130;
-static const uint32_t FLOOR_CYCLES_GBA = 1232;
+// Floor cycles per runJit* call
+static const uint32_t FLOOR_CYCLES_NDS = 2130;  // 355*6 ARM9 cycles (1 scanline)
+static const uint32_t FLOOR_CYCLES_GBA = 1232;  // 308*4 ARM7 cycles (1 scanline)
 
-// Spin detection
-static const uint32_t SPIN_THRESH = 8;    // consecutive same-PC exits before burst
-static const int      SPIN_STEPS  = 8;    // interpreter steps per burst iteration
+// Spin detection: how many consecutive same-PC exits before declaring a spin
+static const uint32_t SPIN_THRESH = 6;
+// How many interpreter steps to run during a spin burst
+static const int      SPIN_STEPS  = 32;
+// How many mutual-deadlock interpreter steps to run per CPU per iteration
+static const int      DEADLOCK_STEPS = 64;
 
 // ── Frame layout ──────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
@@ -101,64 +96,44 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
     else       DebugLog("[JIT] arm   FB cpu%d pc=%08X op=%08X\n", cpu, pc, op);
 }
 
-// ── Loop detector ─────────────────────────────────────────────────────
-struct LoopState {
-    uint32_t fbPC     = 0xFFFFFFFFu;
-    uint32_t fbCount  = 0;
-    bool     fbDumped = false;
-
-    // Normalised-spin (A->B->A->B pattern or A->A)
-    uint32_t normHist[4]   = {0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu};
-    uint32_t normCount     = 0;
-    uint32_t normBurstPC   = 0xFFFFFFFFu;
-    uint32_t normBurstExit = 0xFFFFFFFFu;
-    bool     normBursting  = false;
+// ── Per-CPU spin state ────────────────────────────────────────────────
+struct SpinState {
+    uint32_t spinPC    = 0xFFFFFFFFu; // PC where spin was detected
+    uint32_t spinCount = 0;           // consecutive same-or-alternating exits
+    bool     spinning  = false;       // currently in a detected spin
+    bool     logged    = false;
 };
-static LoopState s_loop[2];
+static SpinState g_spin[2];
 
-static void resetNormSpin(LoopState& ls) {
-    for(int j=0;j<4;j++) ls.normHist[j]=0xFFFFFFFFu;
-    ls.normCount     = 0;
-    ls.normBurstPC   = 0xFFFFFFFFu;
-    ls.normBurstExit = 0xFFFFFFFFu;
-    ls.normBursting  = false;
+static void spinReset(int cpu) {
+    g_spin[cpu] = SpinState{};
 }
 
-static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
-    if(ls.normBursting) return false;
+// Returns true if this exit looks like a spin (self-loop or ping-pong).
+// Updates internal counter. When count reaches SPIN_THRESH, sets spinning=true.
+static bool spinUpdate(int cpu, uint32_t entryPC, uint32_t exitPC) {
+    SpinState& s = g_spin[cpu];
 
-    ls.normHist[3] = ls.normHist[2];
-    ls.normHist[2] = ls.normHist[1];
-    ls.normHist[1] = ls.normHist[0];
-    ls.normHist[0] = exitPC;
-
-    if(exitPC == entryPC){
-        ls.normCount++;
-        if(ls.normCount >= SPIN_THRESH){
-            ls.normBurstPC   = entryPC;
-            ls.normBurstExit = exitPC;
-            return true;
+    bool loop = (exitPC == entryPC);
+    if (loop) {
+        s.spinCount++;
+    } else {
+        // Allow one-step ping-pong (A->B->A->B) as a spin too
+        if (s.spinPC != 0xFFFFFFFFu && exitPC == s.spinPC && entryPC != s.spinPC) {
+            s.spinCount++;
+        } else {
+            s.spinCount = 0;
         }
-        return false;
     }
+    s.spinPC = exitPC;
 
-    if(ls.normHist[0] != 0xFFFFFFFFu &&
-       ls.normHist[1] != 0xFFFFFFFFu &&
-       ls.normHist[2] != 0xFFFFFFFFu &&
-       ls.normHist[3] != 0xFFFFFFFFu &&
-       ls.normHist[0] == ls.normHist[2] &&
-       ls.normHist[1] == ls.normHist[3] &&
-       ls.normHist[0] != ls.normHist[1]){
-        ls.normCount++;
-        if(ls.normCount >= SPIN_THRESH){
-            ls.normBurstPC   = ls.normHist[1];
-            ls.normBurstExit = ls.normHist[0];
-            return true;
+    if (s.spinCount >= SPIN_THRESH) {
+        if (!s.spinning) {
+            s.spinning = true;
+            s.logged   = false;
         }
-        return false;
+        return true;
     }
-
-    ls.normCount = 0;
     return false;
 }
 
@@ -1144,11 +1119,11 @@ static bool validPC(uint32_t pc, bool gba) {
     pc &= ~1u;
     if (pc >= 0x80000000u) return false;
     if (gba) {
-        return (pc < 0x00004000u) ||                              // BIOS
-               (pc >= 0x02000000u && pc < 0x02040000u) ||        // EWRAM
-               (pc >= 0x03000000u && pc < 0x03008000u) ||        // IWRAM
-               (pc >= 0x06000000u && pc < 0x06018000u) ||        // VRAM
-               (pc >= 0x08000000u && pc < 0x0E000000u);          // ROM
+        return (pc < 0x00004000u) ||
+               (pc >= 0x02000000u && pc < 0x02040000u) ||
+               (pc >= 0x03000000u && pc < 0x03008000u) ||
+               (pc >= 0x06000000u && pc < 0x06018000u) ||
+               (pc >= 0x08000000u && pc < 0x0E000000u);
     }
     return (pc < 0x00008000u) ||
            (pc >= 0x01000000u && pc < 0x02000000u) ||
@@ -1228,7 +1203,7 @@ static JitBlock* compile(Interpreter* interp,Core* core,
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Inline scheduler tick
+// Scheduler tick
 // ═══════════════════════════════════════════════════════════════════════
 static inline void tickInline(Core& core,uint32_t cycles){
     core.globalCycles+=cycles;
@@ -1242,11 +1217,10 @@ static inline void tickInline(Core& core,uint32_t cycles){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Single-CPU step — returns master-clock cycles consumed.
-// Does NOT tick the scheduler. Does NOT run spin bursts.
-// Spin/fallback handling is done by the caller.
+// Single JIT step — no spin logic, no ticking.
+// Returns master-clock cycles consumed (0 = halted, no work done).
 // ═══════════════════════════════════════════════════════════════════════
-static uint32_t stepCpu(Core& core, int cpu, bool gba) {
+static uint32_t stepJit(Core& core, int cpu, bool gba) {
     Interpreter& interp = core.interpreter[cpu];
     if (interp.halted) return 0;
 
@@ -1273,19 +1247,13 @@ static uint32_t stepCpu(Core& core, int cpu, bool gba) {
     executeBlock_asm(b->code);
     g_totalJIT[cpu]++;
 
-    const int      reason = g_exitReason[cpu];
-    const uint32_t expc   = g_exitPC[cpu];
-
-    DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
-             cpu, pc, expc, reason, interp.getCpsrRef());
-
-    if (reason == EXIT_FALLBACK) {
+    if (g_exitReason[cpu] == EXIT_FALLBACK) {
         g_totalFB[cpu]++;
         interp.jitRunOpcode();
-        return cycPerInsn;
     }
 
-    uint32_t n = b->insnCount > 0 ? b->insnCount : 1u;
+    uint32_t n = (g_exitReason[cpu] == EXIT_NORMAL && b->insnCount > 0)
+                 ? b->insnCount : 1u;
     return n * cycPerInsn;
 }
 
@@ -1307,65 +1275,17 @@ static void logStatus(Core& core) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Spin detector — operates on recent PC history per CPU.
-// Returns true if the CPU appears stuck in a tight loop.
-// When it returns true, the caller should run interpreter steps for the
-// OTHER CPU before retrying this CPU, giving it a chance to unblock.
-// ═══════════════════════════════════════════════════════════════════════
-static bool detectSpin(int cpu, uint32_t entryPC, uint32_t exitPC) {
-    LoopState& ls = s_loop[cpu];
-
-    ls.normHist[3] = ls.normHist[2];
-    ls.normHist[2] = ls.normHist[1];
-    ls.normHist[1] = ls.normHist[0];
-    ls.normHist[0] = exitPC;
-
-    bool selfLoop = (exitPC == entryPC);
-    bool pingPong = (!selfLoop &&
-                     ls.normHist[0] != 0xFFFFFFFFu &&
-                     ls.normHist[1] != 0xFFFFFFFFu &&
-                     ls.normHist[2] != 0xFFFFFFFFu &&
-                     ls.normHist[3] != 0xFFFFFFFFu &&
-                     ls.normHist[0] == ls.normHist[2] &&
-                     ls.normHist[1] == ls.normHist[3]);
-
-    if (selfLoop || pingPong) {
-        ls.normCount++;
-    } else {
-        ls.normCount = 0;
-    }
-
-    if (ls.normCount >= SPIN_THRESH) {
-        if (!ls.normBursting) {
-            ls.normBursting  = true;
-            ls.normBurstPC   = selfLoop ? entryPC : ls.normHist[1];
-            ls.normBurstExit = selfLoop ? exitPC  : ls.normHist[0];
-            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",
-                     cpu, ls.normBurstPC, ls.normBurstExit);
-        }
-        return true;
-    }
-    return false;
-}
-
-static void clearSpin(int cpu) {
-    resetNormSpin(s_loop[cpu]);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// NDS run function — true interleaved ARM9+ARM7
+// NDS run — true interleaved with mutual-spin deadlock breaking
 //
-// Strategy:
-//   For each master step (ITERS_NDS total):
-//     1. Run one ARM9 JIT step  → earns N*2 master cycles
-//     2. Run two ARM7 JIT steps → earns M*1 master cycles each
-//        (ARM7 runs 2 steps per ARM9 step to maintain 2:1 clock ratio)
-//   Tick scheduler once at end with accumulated master cycles.
+// Each outer iteration:
+//   1. Run one ARM9 JIT step
+//   2. Run two ARM7 JIT/interp steps (maintains 2:1 clock ratio)
 //
-// Spin handling:
-//   If a CPU is detected spinning, run SPIN_STEPS interpreter steps for
-//   the OTHER CPU so it can send the signal the spinning CPU is waiting for.
-//   This breaks IPCSYNC / shared-memory deadlocks.
+// Spin detection:
+//   - Tracked per-CPU via spinUpdate()
+//   - When CPU A spins: run SPIN_STEPS interpreter steps of CPU B
+//   - When BOTH spin simultaneously (deadlock): run DEADLOCK_STEPS of
+//     each CPU interleaved one-at-a-time until one escapes
 // ═══════════════════════════════════════════════════════════════════════
 void runJitNds(Core& core) {
     if (!g_jitLive || !codeBuf) { Interpreter::runCoreNds(core); return; }
@@ -1374,88 +1294,141 @@ void runJitNds(Core& core) {
 
     for (int i = 0; i < ITERS_NDS; i++) {
 
-        // ── ARM9 step ──────────────────────────────────────────────
-        if (!core.interpreter[0].halted) {
-            uint32_t pc0 = core.interpreter[0].isReady()
-                           ? core.interpreter[0].getActualPC() : 0u;
-            uint32_t c0  = stepCpu(core, 0, false);
-            masterCycles += (c0 > 0) ? c0 : CYCLES_PER_INSN_ARM9;
-
-            // Check if ARM9 is spinning
-            if (c0 > 0 && g_exitReason[0] == EXIT_NORMAL) {
-                uint32_t ex0 = g_exitPC[0];
-                if (detectSpin(0, pc0, ex0)) {
-                    // ARM9 is spinning — run ARM7 interpreter steps to unblock it
-                    DebugLog("[JIT] NORM SPIN cpu0 bursting, running cpu1 interpreter\n");
-                    for (int k = 0; k < SPIN_STEPS; k++) {
-                        if (core.interpreter[1].halted) break;
-                        core.interpreter[1].jitRunOpcode();
-                        masterCycles += CYCLES_PER_INSN_ARM7;
-                    }
-                    // Check if ARM9 escaped
-                    uint32_t newPC0 = core.interpreter[0].isReady()
-                                      ? core.interpreter[0].getActualPC() : 0u;
-                    if (newPC0 != pc0) {
-                        DebugLog("[JIT] NORM SPIN cpu0 escaped %08X->%08X\n", pc0, newPC0);
-                        clearSpin(0);
-                    }
-                }
-            } else if (g_exitReason[0] == EXIT_FALLBACK) {
-                clearSpin(0);
-            }
-        } else {
-            // ARM9 halted: charge minimum so scheduler advances
-            masterCycles += CYCLES_PER_INSN_ARM9;
+        // ── ARM9 ──────────────────────────────────────────────────
+        bool arm9Halted = core.interpreter[0].halted != 0;
+        uint32_t pc0 = 0;
+        if (!arm9Halted) {
+            pc0 = core.interpreter[0].isReady()
+                  ? core.interpreter[0].getActualPC() : 0u;
         }
 
-        // ── ARM7 steps (2 per ARM9 step to maintain 2:1 ratio) ───
+        uint32_t c0 = arm9Halted ? 0 : stepJit(core, 0, false);
+        masterCycles += arm9Halted ? CYCLES_PER_INSN_ARM9
+                                   : (c0 > 0 ? c0 : CYCLES_PER_INSN_ARM9);
+
+        bool cpu0Spin = false;
+        if (!arm9Halted && c0 > 0) {
+            uint32_t ex0 = g_exitPC[0];
+            cpu0Spin = spinUpdate(0, pc0, ex0);
+            if (g_exitReason[0] == EXIT_FALLBACK) spinReset(0);
+        }
+
+        // ── ARM7 (2 steps per ARM9 step) ──────────────────────────
         for (int j = 0; j < 2; j++) {
-            if (core.interpreter[1].halted) {
-                // ARM7 halted: don't charge — ARM9 is master clock
-                break;
-            }
+            bool arm7Halted = core.interpreter[1].halted != 0;
+            if (arm7Halted) break;
+
             uint32_t pc1 = core.interpreter[1].isReady()
                            ? core.interpreter[1].getActualPC() : 0u;
-            uint32_t c1  = stepCpu(core, 1, false);
-            // ARM7 cycles are half the master clock; don't add to masterCycles
-            // (master clock is driven by ARM9 steps above).
-            // We still run ARM7 to keep it progressing.
-            (void)c1;
 
-            if (c1 > 0 && g_exitReason[1] == EXIT_NORMAL) {
+            uint32_t c1 = stepJit(core, 1, false);
+            // ARM7 cycles are half the master clock; master is driven by ARM9.
+
+            bool cpu1Spin = false;
+            if (c1 > 0) {
                 uint32_t ex1 = g_exitPC[1];
-                if (detectSpin(1, pc1, ex1)) {
-                    // ARM7 is spinning — run ARM9 interpreter steps to unblock it
-                    DebugLog("[JIT] NORM SPIN cpu1 bursting, running cpu0 interpreter\n");
-                    for (int k = 0; k < SPIN_STEPS; k++) {
-                        if (core.interpreter[0].halted) break;
+                cpu1Spin = spinUpdate(1, pc1, ex1);
+                if (g_exitReason[1] == EXIT_FALLBACK) spinReset(1);
+            }
+
+            // ── Deadlock: both spinning simultaneously ─────────────
+            if (cpu0Spin && cpu1Spin) {
+                if (!g_spin[0].logged || !g_spin[1].logged) {
+                    g_spin[0].logged = g_spin[1].logged = true;
+                    DebugLog("[JIT] DEADLOCK cpu0=%08X cpu1=%08X — interleaving\n",
+                             g_spin[0].spinPC, g_spin[1].spinPC);
+                }
+                // Run both CPUs through interpreter, interleaved,
+                // until at least one escapes its spin PC.
+                uint32_t spinPC0 = g_spin[0].spinPC;
+                uint32_t spinPC1 = g_spin[1].spinPC;
+                for (int k = 0; k < DEADLOCK_STEPS; k++) {
+                    // ARM9 interp step
+                    if (!core.interpreter[0].halted) {
                         core.interpreter[0].jitRunOpcode();
                         masterCycles += CYCLES_PER_INSN_ARM9;
+                        uint32_t npc0 = core.interpreter[0].isReady()
+                                        ? core.interpreter[0].getActualPC() : 0u;
+                        if (npc0 != spinPC0 && npc0 != 0u) {
+                            DebugLog("[JIT] DEADLOCK cpu0 escaped %08X->%08X at k=%d\n",
+                                     spinPC0, npc0, k);
+                            spinReset(0);
+                            cpu0Spin = false;
+                            break;
+                        }
                     }
-                    uint32_t newPC1 = core.interpreter[1].isReady()
-                                      ? core.interpreter[1].getActualPC() : 0u;
-                    if (newPC1 != pc1) {
-                        DebugLog("[JIT] NORM SPIN cpu1 escaped %08X->%08X\n", pc1, newPC1);
-                        clearSpin(1);
+                    // ARM7 interp step
+                    if (!core.interpreter[1].halted) {
+                        core.interpreter[1].jitRunOpcode();
+                        uint32_t npc1 = core.interpreter[1].isReady()
+                                        ? core.interpreter[1].getActualPC() : 0u;
+                        if (npc1 != spinPC1 && npc1 != 0u) {
+                            DebugLog("[JIT] DEADLOCK cpu1 escaped %08X->%08X at k=%d\n",
+                                     spinPC1, npc1, k);
+                            spinReset(1);
+                            cpu1Spin = false;
+                            break;
+                        }
                     }
                 }
-            } else if (g_exitReason[1] == EXIT_FALLBACK) {
-                clearSpin(1);
+                // If still deadlocked after DEADLOCK_STEPS, give up this
+                // outer iteration — the tick at the end will fire IRQs.
+                if (cpu0Spin && cpu1Spin) {
+                    DebugLog("[JIT] DEADLOCK unresolved, yielding to scheduler\n");
+                }
+                break; // exit the j=0..1 ARM7 loop
+            }
+
+            // ── Single-CPU spin: run other CPU's interpreter ───────
+            if (cpu1Spin && !cpu0Spin) {
+                DebugLog("[JIT] SPIN cpu1=%08X, running cpu0 interp\n", g_spin[1].spinPC);
+                uint32_t spc1 = g_spin[1].spinPC;
+                for (int k = 0; k < SPIN_STEPS; k++) {
+                    if (core.interpreter[0].halted) break;
+                    core.interpreter[0].jitRunOpcode();
+                    masterCycles += CYCLES_PER_INSN_ARM9;
+                    uint32_t npc1 = core.interpreter[1].isReady()
+                                    ? core.interpreter[1].getActualPC() : 0u;
+                    if (npc1 != spc1) {
+                        DebugLog("[JIT] SPIN cpu1 escaped %08X->%08X\n", spc1, npc1);
+                        spinReset(1);
+                        break;
+                    }
+                }
+            }
+        } // end ARM7 j loop
+
+        // ── Single-CPU ARM9 spin: run ARM7 interpreter ────────────
+        if (cpu0Spin && !g_spin[1].spinning) {
+            DebugLog("[JIT] SPIN cpu0=%08X, running cpu1 interp\n", g_spin[0].spinPC);
+            uint32_t spc0 = g_spin[0].spinPC;
+            for (int k = 0; k < SPIN_STEPS; k++) {
+                if (core.interpreter[1].halted) break;
+                core.interpreter[1].jitRunOpcode();
+                uint32_t npc0 = core.interpreter[0].isReady()
+                                ? core.interpreter[0].getActualPC() : 0u;
+                if (npc0 != spc0) {
+                    DebugLog("[JIT] SPIN cpu0 escaped %08X->%08X\n", spc0, npc0);
+                    spinReset(0);
+                    break;
+                }
             }
         }
     }
 
-    // Apply floor so scanline events always fire
     uint32_t charge = (masterCycles > FLOOR_CYCLES_NDS) ? masterCycles : FLOOR_CYCLES_NDS;
     tickInline(core, charge);
     logStatus(core);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// GBA run function — ARM7 only
+// GBA run — ARM7 only
 //
-// ARM9 (cpu0) is permanently halted in GBA mode.
-// Master clock = ARM7 clock (16.78 MHz).
+// The GBA VBlank wait loop at 0x08000192 escapes when VBlank IRQ fires,
+// runs the IRQ handler (~few hundred cycles), then re-enters the wait.
+// The key: after a spin escape, we must NOT immediately re-detect as a
+// spin. We give a grace period (spinReset after escape) and rely on the
+// floor tick to fire the next VBlank at the right time.
 // ═══════════════════════════════════════════════════════════════════════
 void runJitGba(Core& core) {
     if (!g_jitLive || !codeBuf) { Interpreter::runCoreSingle<true, 0>(core); return; }
@@ -1464,45 +1437,57 @@ void runJitGba(Core& core) {
 
     for (int i = 0; i < ITERS_GBA; i++) {
         if (core.interpreter[1].halted) {
-            // HALT: ARM7 is waiting for IRQ (VBlank etc.).
-            // Charge cycles so the scheduler can fire the IRQ.
-            // Charge one full scanline worth at a time so we don't
-            // overshoot and miss events.
+            // HALT: waiting for IRQ. Charge cycles so scheduler fires.
             acc += CYCLES_PER_INSN_ARM7;
-            // Don't break — keep looping so we accumulate enough to
-            // reach FLOOR_CYCLES_GBA and fire the tick below.
             continue;
         }
 
         uint32_t pc1 = core.interpreter[1].isReady()
                        ? core.interpreter[1].getActualPC() : 0u;
-        uint32_t c1  = stepCpu(core, 1, true);
+        uint32_t c1  = stepJit(core, 1, true);
         acc += (c1 > 0) ? c1 : CYCLES_PER_INSN_ARM7;
 
+        // Only track spin on EXIT_NORMAL (the loop B.->. case)
         if (c1 > 0 && g_exitReason[1] == EXIT_NORMAL) {
-            if (detectSpin(1, pc1, g_exitPC[1])) {
-                // GBA spin: nothing to unblock from the other CPU.
-                // Just run a few interpreter steps to let IRQ state change.
-                DebugLog("[JIT] GBA SPIN cpu1 at %08X, running interpreter\n", pc1);
+            uint32_t ex1 = g_exitPC[1];
+            if (spinUpdate(1, pc1, ex1)) {
+                // GBA spin (VBlank wait): run a few interpreter steps.
+                // Do NOT tick here — the outer floor tick handles timing.
+                uint32_t spc = g_spin[1].spinPC;
+                bool escaped = false;
                 for (int k = 0; k < SPIN_STEPS; k++) {
-                    if (core.interpreter[1].halted) break;
+                    if (core.interpreter[1].halted) { escaped = true; break; }
                     core.interpreter[1].jitRunOpcode();
                     acc += CYCLES_PER_INSN_ARM7;
+                    uint32_t npc = core.interpreter[1].isReady()
+                                   ? core.interpreter[1].getActualPC() : 0u;
+                    if (npc != spc) {
+                        DebugLog("[JIT] GBA SPIN escaped %08X->%08X\n", spc, npc);
+                        spinReset(1);
+                        escaped = true;
+                        break;
+                    }
                 }
-                uint32_t newPC = core.interpreter[1].isReady()
-                                 ? core.interpreter[1].getActualPC() : 0u;
-                if (newPC != pc1) {
-                    DebugLog("[JIT] GBA SPIN cpu1 escaped %08X->%08X\n", pc1, newPC);
-                    clearSpin(1);
+                if (!escaped) {
+                    // Exhausted spin steps without escape.
+                    // Force a tick NOW so the VBlank IRQ can fire,
+                    // then break out so we don't over-charge.
+                    uint32_t charge = (acc > FLOOR_CYCLES_GBA) ? acc : FLOOR_CYCLES_GBA;
+                    tickInline(core, charge);
+                    acc = 0;
+                    spinReset(1);
+                    break;
                 }
             }
         } else if (g_exitReason[1] == EXIT_FALLBACK) {
-            clearSpin(1);
+            spinReset(1);
         }
     }
 
-    uint32_t charge = (acc > FLOOR_CYCLES_GBA) ? acc : FLOOR_CYCLES_GBA;
-    tickInline(core, charge);
+    if (acc > 0) {
+        uint32_t charge = (acc > FLOOR_CYCLES_GBA) ? acc : FLOOR_CYCLES_GBA;
+        tickInline(core, charge);
+    }
     logStatus(core);
 }
 
@@ -1525,12 +1510,8 @@ bool initJit(Core* core) {
     g_totalFB[0] = g_totalFB[1] = 0;
     g_totalJIT[0] = g_totalJIT[1] = 0;
     g_statusTick = 0;
-    s_loop[0] = {}; s_loop[1] = {};
-    for (int j = 0; j < 4; j++) { s_loop[0].normHist[j] = 0xFFFFFFFFu; s_loop[1].normHist[j] = 0xFFFFFFFFu; }
-    s_loop[0].fbPC = s_loop[1].fbPC = 0xFFFFFFFFu;
-    s_loop[0].normBurstPC = s_loop[0].normBurstExit = 0xFFFFFFFFu;
-    s_loop[1].normBurstPC = s_loop[1].normBurstExit = 0xFFFFFFFFu;
-    s_loop[0].normBursting = s_loop[1].normBursting = false;
+    g_spin[0] = SpinState{};
+    g_spin[1] = SpinState{};
     for (size_t i = 0; i < CSIZ; i++) cache[i].valid = false;
     memset(g_exitPC,   0, sizeof g_exitPC);
     memset(g_exitCPSR, 0, sizeof g_exitCPSR);
