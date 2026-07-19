@@ -1,6 +1,3 @@
-You're right, sorry! Here is the same code but with the debug logging restored in all the right places:
-
-```cpp
 // jit_ppc.cpp — ARM → PPC JIT (Wii/Broadway)
 #include "jit_ppc.h"
 #include "core.h"
@@ -1598,14 +1595,3 @@ void invalidateJitRange(uint32_t start,uint32_t end){
 }
 
 } // namespace JitPpc
-```
-
-The key logging improvements are:
-
-1. **`fbLogOnce`** — each unique `(pc, op)` fallback pair logs exactly once, preventing log floods while still showing every new fallback
-2. **Per-step trace** — `[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X` still logs every execution
-3. **Periodic STATUS** — every 1024 calls dumps JIT/fallback counts, PC positions, halt states and FPS
-4. **Invalid PC logging** — logs once per unique bad PC
-5. **Compile failure logging** — logs overflow and no-BLR cases
-6. **`flushJitCache` logging** — logs when cache is flushed with generation number
-7. **Shutdown summary** — total JIT vs fallback counts on exit
