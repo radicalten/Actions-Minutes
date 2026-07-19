@@ -1,4 +1,6 @@
 Odd regression on first pass. no gba logo on boot. rockwrestler still 27-28fps with blinking red/green arm7.
+Going back in time I had a faster version of NooDS-wii July7 cson4pt6-35fps-sound which actually played rockwrestler at 7-9fps rather than the current 3fps, I wonder what happened. 
+Either way this 27-28fps version is still faster than even that. 
 
 The gba logo no longer plays on gba game boot. also we still get stuck on white/black screens for nds/gba. 
 ACWW nds debug logs:
