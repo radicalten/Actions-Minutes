@@ -1,1 +1,95 @@
+Odd regression on first pass. no gba logo on boot. rockwrestler still 27-28fps with blinking red/green arm7.
+
+The gba logo no longer plays on gba game boot. also we still get stuck on white/black screens for nds/gba. 
+ACWW nds debug logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f5a0
+[STATUS] fps=1 cycles=16676330 pc0=0200099C pc1=038F1428 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=41 cycles=33494242 pc0=0200099C pc1=039E7D28 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=42 cycles=50312398 pc0=020009A4 pc1=03ADE628 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=42 cycles=67136774 pc0=020009A4 pc1=03BD4F28 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549a20 tramp=0x800a0380 BLK_ARMS=8
+[JIT] cpu0 02000800 -> 02000A5C r=0 cpsr=000000DF
+[JIT] cpu1 02380000 -> 02380020 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02000A5C op=EE110F10
+[JIT] cpu0 02000A5C -> 02000A5C r=1 cpsr=000000DF
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] arm   FB cpu0 pc=02000A68 op=EE010F10
+[JIT] cpu0 02000A60 -> 02000A68 r=1 cpsr=000000DF
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] arm   FB cpu0 pc=02000A70 op=EE070F15
+[JIT] cpu0 02000A6C -> 02000A70 r=1 cpsr=000000DF
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] arm   FB cpu0 pc=02000A74 op=EE070F16
+[JIT] cpu0 02000A74 -> 02000A74 r=1 cpsr=000000DF
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] arm   FB cpu0 pc=02000A78 op=EE070F9A
+[JIT] cpu0 02000A78 -> 02000A78 r=1 cpsr=000000DF
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] arm   FB cpu0 pc=02000A80 op=EE060F10
+[JIT] cpu0 02000A7C -> 02000A80 r=1 cpsr=000000DF
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] NORM SPIN cpu1 detected at 02380020->02380020, bursting
+[JIT] NORM SPIN cpu1 escaped 02380020->02380024 after 1 steps
+[JIT] arm   FB cpu0 pc=02000A88 op=EE060F11
+[JIT] cpu0 02000A84 -> 02000A88 r=1 cpsr=000000DF
+[JIT] cpu1 02380024 -> 02380020 r=0 cpsr=800000DF
+[JIT] arm   FB cpu0 pc=02000A90 op=EE060F12
+...
+[JIT] NORM SPIN cpu0 detected at 02000924->02000924, bursting
+[JIT] NORM SPIN cpu0 escaped 02000924->02000928 after 1 steps
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] NORM SPIN cpu1 detected at 02380020->02380020, bursting
+[JIT] NORM SPIN cpu1 escaped 02380020->02380024 after 1 steps
+[JIT] cpu0 02000928 -> 02000924 r=0 cpsr=8000001F
+[JIT] cpu1 02380024 -> 02380020 r=0 cpsr=800000DF
+[JIT] cpu0 02000924 -> 02000924 r=0 cpsr=8000001F
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] cpu0 02000924 -> 02000924 r=0 cpsr=8000001F
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+[JIT] cpu0 02000924 -> 02000924 r=0 cpsr=8000001F
+[JIT] cpu1 02380020 -> 02380020 r=0 cpsr=800000DF
+gbaDoom debug logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f5a0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006fa00
+[STATUS] fps=0 cycles=8343104 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=0 cycles=16769984 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=0 cycles=25196864 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=0 cycles=33623744 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=0 cycles=42050624 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=0 cycles=50477504 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=194 cycles=58904384 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=194 cycles=67331264 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=194 cycles=75758144 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=194 cycles=84185024 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549960 tramp=0x800a0380 BLK_ARMS=8
+[JIT] cache flushed gen=1
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=1261568
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=2523136
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=3784704
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=5046272
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=6307840
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=7569408
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=8830976
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=10092544
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=11354112
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=12615680
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+
+
 
