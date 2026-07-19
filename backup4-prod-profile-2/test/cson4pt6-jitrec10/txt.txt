@@ -583,3 +583,4 @@ FAT mounted, logging started
 fix3 seemed to merely reduce fps to 20fps in rockwrestler from 28fps. no other changes I could see.
 Oh and the debug text is gone. bad update tbh.
 
+#token limit reached here. plan to revert back to fix2. put back interpreter.h/cpp backup and place fix2 as dynarec11. plus I am out of prompt usage today anyway.
