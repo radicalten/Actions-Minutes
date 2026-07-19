@@ -821,3 +821,294 @@ FAT mounted, logging started
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+
+===
+fix 2 is a ground breakingly good change from 3fps on rockwrestler in the official NooDS-wii v1.5 mute to 28fps in this JIT. Also shows why other games don't work as the ARM7 green light flickers between red and green, and it must always be green to boot any offical nds roms. here are the debug logs for rockwrestler:
+
+Good change! here are the debug logs for the nds game rockwrestler:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f4c8
+[STATUS] fps=1 cycles=16796100 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=33691520 pc0=020001B4 pc1=038002B0 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=50584324 pc0=020001B4 pc1=038002B0 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=67477126 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=84369978 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=101262886 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=118155690 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=135048470 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=151941278 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=168833734 pc0=020001E4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=27 cycles=185725896 pc0=02004E0C pc1=038002B0 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549460 tramp=0x8009fea0 BLK_ARMS=8
+[JIT] cpu0 02000100 -> 02002D2C r=0 cpsr=000000DF
+[JIT] cpu1 03800100 -> 038002C0 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] cpu0 02002D2C -> 02002D34 r=1 cpsr=000000DF
+[JIT] cpu1 038002C0 -> 038002EC r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10
+[JIT] cpu0 02002D38 -> 02002D3C r=1 cpsr=000000DF
+[JIT] arm   FB cpu1 pc=038002FC op=E121F003
+[JIT] cpu1 038002EC -> 038002FC r=1 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D44 op=EE120F30
+[JIT] cpu0 02002D40 -> 02002D44 r=1 cpsr=000000DF
+[JIT] arm   FB cpu1 pc=03800304 op=E121F004
+[JIT] cpu1 03800300 -> 03800304 r=1 cpsr=000000D2
+[JIT] arm   FB cpu0 pc=02002D4C op=EE130F10
+[JIT] cpu0 02002D48 -> 02002D4C r=1 cpsr=000000DF
+[JIT] cpu1 03800308 -> 038002CC r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D54 op=EE150F10
+[JIT] cpu0 02002D50 -> 02002D54 r=1 cpsr=000000DF
+[JIT] cpu1 038002CC -> 0380031C r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D5C op=EE150F30
+[JIT] cpu0 02002D58 -> 02002D5C r=1 cpsr=000000DF
+[JIT] cpu1 0380031C -> 03800744 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D64 op=EE150F50
+[JIT] cpu0 02002D60 -> 02002D64 r=1 cpsr=000000DF
+[JIT] arm   FB cpu1 pc=0380074C op=E121F003
+[JIT] cpu1 03800744 -> 0380074C r=1 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D6C op=EE150F70
+[JIT] cpu0 02002D68 -> 02002D6C r=1 cpsr=000000DF
+[JIT] cpu1 03800750 -> 03800328 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D74 op=EE160F10
+[JIT] cpu0 02002D70 -> 02002D74 r=1 cpsr=000000DF
+[JIT] cpu1 03800328 -> 03800348 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D7C op=EE160F11
+[JIT] cpu0 02002D78 -> 02002D7C r=1 cpsr=000000DF
+[JIT] cpu1 03800348 -> 03800368 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D84 op=EE160F12
+[JIT] cpu0 02002D80 -> 02002D84 r=1 cpsr=000000DF
+[JIT] cpu1 03800368 -> 03800374 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D8C op=EE160F13
+[JIT] cpu0 02002D88 -> 02002D8C r=1 cpsr=000000DF
+[JIT] cpu1 03800374 -> 03800394 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D94 op=EE160F14
+[JIT] cpu0 02002D90 -> 02002D94 r=1 cpsr=000000DF
+[JIT] cpu1 03800394 -> 038003B4 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D9C op=EE160F15
+[JIT] cpu0 02002D98 -> 02002D9C r=1 cpsr=000000DF
+[JIT] cpu1 038003B4 -> 038002D0 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002DA4 op=EE160F16
+[JIT] cpu0 02002DA0 -> 02002DA4 r=1 cpsr=000000DF
+[JIT] cpu1 038002D0 -> 038002EC r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002DAC op=EE160F17
+[JIT] cpu0 02002DA8 -> 02002DAC r=1 cpsr=000000DF
+[JIT] cpu1 038002EC -> 038002FC r=1 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002DB4 op=EE190F11
+[JIT] cpu0 02002DB0 -> 02002DB4 r=1 cpsr=000000DF
+[JIT] cpu1 03800300 -> 03800304 r=1 cpsr=000000D2
+[JIT] arm   FB cpu0 pc=02002DBC op=EE190F31
+[JIT] cpu0 02002DB8 -> 02002DBC r=1 cpsr=000000DF
+[JIT] cpu1 03800308 -> 038002D4 r=0 cpsr=000000DF
+[JIT] cpu0 02002DC0 -> 02002DE0 r=0 cpsr=000000DF
+[JIT] cpu1 038002D4 -> 03800204 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002DF0 op=E121F003
+[JIT] cpu0 02002DE0 -> 02002DF0 r=1 cpsr=000000DF
+[JIT] cpu1 03800204 -> 03800728 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002DF8 op=E121F004
+[JIT] cpu0 02002DF4 -> 02002DF8 r=1 cpsr=000000D2
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02002DFC -> 02002DC8 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02002DC8 -> 02005014 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02005014 -> 02007D18 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02007D20 op=E121F003
+[JIT] cpu0 02007D18 -> 02007D20 r=1 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02007D24 -> 02005020 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] cpu0 02005020 -> 02005040 r=0 cpsr=000000DF
+[JIT] cpu1 0380072C -> 03800728 r=0 cpsr=200000DF
+[JIT] cpu0 02005040 -> 02005074 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02005074 -> 02005080 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02005080 -> 020050A0 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=020050B4 op=E49DF004
+[JIT] cpu0 020050A0 -> 020050B4 r=1 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02002DCC -> 02000148 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02000148 -> 02000CA4 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] arm   FB cpu0 pc=02000CA4 op=EE010F10
+[JIT] cpu0 02000CA4 -> 02000CA4 r=1 cpsr=000000DF
+[JIT] cpu1 0380072C -> 03800728 r=0 cpsr=200000DF
+[JIT] cpu0 02000CA8 -> 02000154 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02000154 -> 02000174 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02000174 -> 02000CB4 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02000CB4 op=EE090F11
+[JIT] cpu0 02000CB4 -> 02000CB4 r=1 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 02000CB8 -> 0200017C r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 0200017C -> 02000CC4 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+[JIT] arm   FB cpu0 pc=02000CC4 op=EE090F31
+[JIT] cpu0 02000CC4 -> 02000CC4 r=1 cpsr=000000DF
+[JIT] cpu1 0380072C -> 03800728 r=0 cpsr=200000DF
+[JIT] cpu0 02000CC8 -> 02000184 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+And here are the debug logs for gba test suite rom:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f4c8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] fps=0 cycles=8492088 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=0 cycles=17069448 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] fps=0 cycles=25625519 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=1 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+...
+
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] fps=0 cycles=34164746 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+...
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f6a4
+[STATUS] fps=120 cycles=42727702 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+...
+[STATUS] fps=10 cycles=299610446 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=10 cycles=308052958 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=10 cycles=316495474 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=68 cycles=324937986 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=68 cycles=333380502 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=68 cycles=341823018 pc0=FFFF0000 pc1=08000194 halt0=4 halt1=0 gba=1 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x805493a0 tramp=0x8009fea0 BLK_ARMS=8
+[JIT] cache flushed gen=1
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=1245184
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=2490368
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=3735552
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=4980736
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=6225920
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=7471104
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=8716288
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=9961472
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=11206656
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=12451840
+...
+JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=74 cyc=57788273
+[EXC] vector=18 pc=000020B0 sp=03007E7C lr=000017AB cpsr=8000005F
+[EXC] vector=18 pc=0000206C sp=03007E7C lr=00001DD2 cpsr=2000005F
+[EXC] vector=18 pc=00002008 sp=03007E7C lr=00002376 cpsr=8000005F
+[EXC] vector=18 pc=00002050 sp=03007E7C lr=00003522 cpsr=2000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=74 cyc=59049870
+[EXC] vector=18 pc=000020B8 sp=03007E7C lr=00000FCC cpsr=8000005F
+[EXC] vector=18 pc=000020C4 sp=03007E7C lr=000017AB cpsr=2000005F
+[EXC] vector=18 pc=00002080 sp=03007E7C lr=00001DD2 cpsr=8000005F
+[EXC] vector=18 pc=0000204C sp=03007E7C lr=00002376 cpsr=2000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=74 cyc=60295054
+[EXC] vector=18 pc=00002070 sp=03007E7C lr=00003522 cpsr=2000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[EXC] vector=18 pc=000020A8 sp=03007E7C lr=00000FCC cpsr=8000005F
+[EXC] vector=18 pc=00002080 sp=03007E7C lr=000017AB cpsr=8000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=74 cyc=61554263
+[EXC] vector=18 pc=00002070 sp=03007E7C lr=00001DD2 cpsr=2000005F
+[EXC] vector=18 pc=0000207C sp=03007E7C lr=00002376 cpsr=8000005F
+[EXC] vector=18 pc=000020A0 sp=03007E7C lr=00003522 cpsr=8000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[EXC] vector=18 pc=000020B4 sp=03007E7C lr=00000FCC cpsr=8000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=74 cyc=62814666
+[EXC] vector=18 pc=00002074 sp=03007E7C lr=000017AB cpsr=2000005F
+[EXC] vector=18 pc=0000208C sp=03007E7C lr=00001DD2 cpsr=8000005F
+[EXC] vector=18 pc=00002070 sp=03007E7C lr=00002376 cpsr=2000005F
+[EXC] vector=18 pc=000020C8 sp=03007E7C lr=00003522 cpsr=2000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=74 cyc=64059850
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[EXC] vector=18 pc=00002078 sp=03007E7C lr=00000FCC cpsr=8000005F
+[EXC] vector=18 pc=0000209C sp=03007E7C lr=000017AB cpsr=8000005F
+[EXC] vector=18 pc=000020C0 sp=03007E7C lr=00001DD2 cpsr=2000005F
+[EXC] vector=18 pc=000020A4 sp=03007E7C lr=00002376 cpsr=8000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
+
