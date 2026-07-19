@@ -7566,5 +7566,5 @@ FAT mounted, logging started
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 
-
+##hit the token limit right here, but this will serve as jitrec10. it is great.
 
