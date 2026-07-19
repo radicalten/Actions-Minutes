@@ -795,20 +795,28 @@ static bool emitBX(Ctx& ctx,uint32_t op,uint32_t curPC){
     return true;
 }
 
-static bool emitBranch(Ctx& ctx,uint32_t op,uint32_t curPC){
-    if((op&0x0FFFFFF0)==0x012FFF10)return emitBX(ctx,op,curPC);
-    if((op&0x0FFFFFF0)==0x012FFF30)return false;
-    if((op&0x0E000000)!=0x0A000000)return false;
-    uint8_t cond=(op>>28)&0xF;
-    if(cond==15)return false;
-    bool lk=(op>>24)&1;
-    int32_t off=(int32_t)(op<<8)>>6;
-    uint32_t tgt=curPC+8u+(uint32_t)off;
-    size_t si=emitCondSkip(ctx,cond);
-    if(lk)ctx.li(RA[14],curPC+4);
-    emitCommitExit(ctx,tgt,EXIT_NORMAL);
-    if(si!=SIZE_MAX){patchSkip(ctx,si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);}
-    ctx.done=true;
+static bool emitBranch(Ctx& ctx, uint32_t op, uint32_t curPC) {
+    // BX Rm
+    if ((op & 0x0FFFFFF0) == 0x012FFF10) return emitBX(ctx, op, curPC);
+    // BLX Rm — fall back (needs Thumb switch + link)
+    if ((op & 0x0FFFFFF0) == 0x012FFF30) return false;
+    // B / BL
+    if ((op & 0x0E000000) != 0x0A000000) return false;
+
+    uint8_t cond = (op >> 28) & 0xF;
+    if (cond == 15) return false;
+    bool lk = (op >> 24) & 1;
+    int32_t off = (int32_t)(op << 8) >> 6;
+    uint32_t tgt = curPC + 8u + (uint32_t)off;
+
+    size_t si = emitCondSkip(ctx, cond);
+    if (lk) ctx.li(RA[14], curPC + 4);
+    emitCommitExit(ctx, tgt, EXIT_NORMAL);
+    if (si != SIZE_MAX) {
+        patchSkip(ctx, si);
+        emitCommitExit(ctx, curPC + 4, EXIT_NORMAL);
+    }
+    ctx.done = true;
     return true;
 }
 
@@ -931,36 +939,87 @@ static bool emitMul(Ctx& ctx,uint32_t op){
     return true;
 }
 
-static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
-    uint8_t cond=(op>>28)&0xF;
-    if(cond==15)return false;
-    if((op&0x0FBF0FFF)==0x010F0000){
-        uint8_t rd=(op>>12)&0xF;
-        if(rd==15)return false;
-        size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_mr(RA[rd],RCPSR));
-        patchSkip(ctx,si);return true;
+static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t) {
+    uint8_t cond = (op >> 28) & 0xF;
+    if (cond == 15) return false;
+
+    // MRS Rd, CPSR  — 0x010F0000
+    if ((op & 0x0FBF0FFF) == 0x010F0000) {
+        uint8_t rd = (op >> 12) & 0xF;
+        if (rd == 15) return false;
+        size_t si = emitCondSkip(ctx, cond);
+        ctx.E(ppc_mr(RA[rd], RCPSR));
+        patchSkip(ctx, si);
+        return true;
     }
-    if((op&0x0DB0F000)==0x0320F000){
-        uint8_t mask=(op>>16)&0xF;
-        if(mask!=0x8)return false;
-        uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
-        if(rot)imm=(imm>>rot)|(imm<<(32-rot));
-        imm&=0xFF000000u;
-        size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
-        ctx.li(TA,imm);ctx.E(ppc_or(RCPSR,RCPSR,TA));
-        patchSkip(ctx,si);return true;
+
+    // MRS Rd, SPSR  — 0x014F0000 — needs banked regs, fall back
+    if ((op & 0x0FBF0FFF) == 0x014F0000) return false;
+
+    uint8_t mask = (op >> 16) & 0xF;
+
+    // MSR with immediate operand
+    if ((op & 0x0DB0F000) == 0x0320F000) {
+        uint32_t imm = op & 0xFF;
+        uint32_t rot = ((op >> 8) & 0xF) * 2;
+        if (rot) imm = (imm >> rot) | (imm << (32 - rot));
+
+        if (mask == 0x8) {
+            // flags field only (NZCV) — safe to do inline
+            imm &= 0xFF000000u;
+            size_t si = emitCondSkip(ctx, cond);
+            ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 8, 31));  // clear NZCV
+            ctx.li(TA, imm);
+            ctx.E(ppc_or(RCPSR, RCPSR, TA));
+            patchSkip(ctx, si);
+            return true;
+        }
+
+        if (mask == 0x1 || mask == 0x9) {
+            // c field (and possibly f) — mode change via immediate
+            // Only safe to inline if the mode bits are a known ARM mode
+            // and we're not changing to user mode (which would drop privileges)
+            uint8_t newMode = imm & 0x1F;
+            // Allowed modes we can handle: SVC=0x13, IRQ=0x12, FIQ=0x11,
+            //                              ABT=0x17, UND=0x1B, SYS=0x1F
+            // USR=0x10 changes banked regs — fall back
+            if (newMode == 0x10) return false;  // USR mode — complex
+            // For other modes, fall back to interpreter to handle
+            // banked register swaps correctly
+            return false;
+        }
+        return false;
     }
-    if((op&0x0DB0FFF0)==0x0120F000){
-        uint8_t mask=(op>>16)&0xF,rm=op&0xF;
-        if(mask!=0x8||rm==15)return false;
-        size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
-        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));
-        ctx.E(ppc_or(RCPSR,RCPSR,TA));
-        patchSkip(ctx,si);return true;
+
+    // MSR with register operand
+    if ((op & 0x0DB0FFF0) == 0x0120F000) {
+        uint8_t rm = op & 0xF;
+        if (rm == 15) return false;
+
+        if (mask == 0x8) {
+            // flags only — safe
+            size_t si = emitCondSkip(ctx, cond);
+            ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 8, 31));
+            ctx.E(ppc_rlwinm(TA, RA[rm], 0, 0, 7));
+            ctx.E(ppc_or(RCPSR, RCPSR, TA));
+            patchSkip(ctx, si);
+            return true;
+        }
+
+        if (mask == 0xF) {
+            // All fields — but only safe if not changing mode
+            // Fall back to interpreter to handle banked regs
+            return false;
+        }
+
+        if (mask == 0x1 || mask == 0x9) {
+            // c field — mode change, fall back
+            return false;
+        }
+        return false;
     }
+
+    // MSR SPSR — always fall back (needs banked SPSR)
     return false;
 }
 
@@ -1004,27 +1063,42 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     return true;
 }
 
-static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
-    uint8_t cond=(op>>28)&0xF;
-    if(cond==15)return false;
-    if((op&0x0F000000)==0x0F000000)return false;
-    if((op&0x0F900000)==0x01000000){
-        if(emitMrsMsr(ctx,op,curPC))return true;
+static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
+    uint8_t cond = (op >> 28) & 0xF;
+    if (cond == 15) return false;
+
+    // SWI
+    if ((op & 0x0F000000) == 0x0F000000) return false;
+
+    // BX / BLX register — must be checked BEFORE the MRS/MSR 0x0F900000 test
+    // because BX encoding 0x012FFF10 satisfies (op&0x0F900000)==0x01000000
+    if ((op & 0x0FFFFFF0) == 0x012FFF10 ||
+        (op & 0x0FFFFFF0) == 0x012FFF30)
+        return emitBranch(ctx, op, curPC);
+
+    // MRS / MSR family (but not BX which was caught above)
+    if ((op & 0x0F900000) == 0x01000000) {
+        if (emitMrsMsr(ctx, op, curPC)) return true;
         return false;
     }
-    uint32_t it=(op>>25)&7;
-    switch(it){
+
+    uint32_t it = (op >> 25) & 7;
+    switch (it) {
         case 0:
-            if((op&0x0FC000F0)==0x00000090)return emitMul(ctx,op);
-            if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)
-                return emitBranch(ctx,op,curPC);
-            if((op&0x0E000090)==0x00000090)return emitLSExtra(ctx,op,curPC);
-            return emitDP(ctx,op,curPC);
-        case 1:return emitDP(ctx,op,curPC);
-        case 2:case 3:return emitLS(ctx,op,curPC);
-        case 4:return emitBlockXfer(ctx,op,curPC);
-        case 5:return emitBranch(ctx,op,curPC);
-        default:return false;
+            if ((op & 0x0FC000F0) == 0x00000090) return emitMul(ctx, op);
+            if ((op & 0x0E000090) == 0x00000090) return emitLSExtra(ctx, op, curPC);
+            return emitDP(ctx, op, curPC);
+        case 1:
+            return emitDP(ctx, op, curPC);
+        case 2:
+        case 3:
+            return emitLS(ctx, op, curPC);
+        case 4:
+            return emitBlockXfer(ctx, op, curPC);
+        case 5:
+            return emitBranch(ctx, op, curPC);
+        default:
+            return false;
     }
 }
 
