@@ -64,15 +64,7 @@ gba doom debug logs:
 [STATUS] fps=0 cycles=16769984 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
 [STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
 [STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006fa44
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006fa44
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006fa44
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006fa44
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006fa44
-[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+...
 [STATUS] fps=0 cycles=25196869 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=1 gba=1 dsi=0
 [STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006fa44
 [STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
@@ -83,8 +75,6 @@ gba doom debug logs:
 [STATUS] fps=32 cycles=320314422 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
 [STATUS] fps=68 cycles=328866378 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
 [STATUS] fps=68 cycles=337418330 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
-[STATUS] fps=68 cycles=345970286 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
-[STATUS] fps=68 cycles=354522242 pc0=FFFF0000 pc1=08000194 halt0=4 halt1=0 gba=1 dsi=0
 === NooDS-Wii JIT/CPU trace log ===
 FAT mounted, logging started
 [JIT] init buf=0x805499a0 tramp=0x800a0340 BLK_ARMS=8
@@ -100,30 +90,7 @@ FAT mounted, logging started
 [JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
 [JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=6307840
 [JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=7569408
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=8830976
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=10092544
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=11354112
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=12615680
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=13877248
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=15138816
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=16400384
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=17661952
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=18923520
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=20185088
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=21446656
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+...
 [JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=22708224
 [EXC] vector=18 pc=00002BBA sp=03007EA4 lr=00002BAF cpsr=6000007F
 [EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
@@ -156,73 +123,6 @@ FAT mounted, logging started
 [EXC] vector=18 pc=000020A8 sp=03007E7C lr=000017AB cpsr=8000005F
 [EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
 [EXC] vector=18 pc=000020C0 sp=03007E7C lr=00000FCC cpsr=2000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=30367587
-[EXC] vector=18 pc=00002094 sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[EXC] vector=18 pc=00001E38 sp=03007E7C lr=00001DF9 cpsr=2000005F
-[EXC] vector=18 pc=000020A8 sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=00002098 sp=03007E7C lr=00001DD2 cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=31944549
-[EXC] vector=18 pc=000020C0 sp=03007E7C lr=00000FCC cpsr=2000005F
-[EXC] vector=18 pc=00002084 sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=000020B8 sp=03007E7C lr=00001DD2 cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[EXC] vector=18 pc=00001E3C sp=03007E7C lr=00001DF9 cpsr=2000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=33393382
-[EXC] vector=18 pc=00002004 sp=03007E7C lr=000017AB cpsr=2000005F
-[EXC] vector=18 pc=000020A0 sp=03007E7C lr=00001DD2 cpsr=8000005F
-[EXC] vector=18 pc=00002028 sp=03007E7C lr=00002376 cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[EXC] vector=18 pc=00002008 sp=03007E7C lr=00000FCC cpsr=8000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=124 cyc=34869319
-[EXC] vector=18 pc=00002094 sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=00002074 sp=03007E7C lr=00001DD2 cpsr=2000005F
-[EXC] vector=18 pc=000020B8 sp=03007E7C lr=00002376 cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[EXC] vector=18 pc=00001E34 sp=03007E7C lr=00001DF9 cpsr=2000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=124 cyc=36355112
-[EXC] vector=18 pc=000020A8 sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=000020BC sp=03007E7C lr=00001DD2 cpsr=2000005F
-[EXC] vector=18 pc=00002028 sp=03007E7C lr=00002376 cpsr=8000005F
-[EXC] vector=18 pc=00002048 sp=03007E7C lr=00002CAE cpsr=2000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[EXC] vector=18 pc=0000207C sp=03007E7C lr=00000FCC cpsr=8000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=124 cyc=37845833
-[EXC] vector=18 pc=0000208C sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=0000206C sp=03007E7C lr=00001DD2 cpsr=2000005F
-[EXC] vector=18 pc=000020C0 sp=03007E7C lr=00002376 cpsr=2000005F
-[EXC] vector=18 pc=00002078 sp=03007E7C lr=00002CAE cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=124 cyc=39350106
-[EXC] vector=18 pc=00002094 sp=03007E7C lr=00000FCC cpsr=8000005F
-[EXC] vector=18 pc=0000208C sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=00002008 sp=03007E7C lr=00001DD2 cpsr=8000005F
-[EXC] vector=18 pc=000020A4 sp=03007E7C lr=00002376 cpsr=8000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=124 cyc=40611674
-[EXC] vector=18 pc=00002094 sp=03007E7C lr=00002CAE cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[EXC] vector=18 pc=00002008 sp=03007E7C lr=00000FCC cpsr=8000005F
-[EXC] vector=18 pc=0000207C sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=000020C0 sp=03007E7C lr=00001DD2 cpsr=2000005F
-[EXC] vector=18 pc=000020C8 sp=03007E7C lr=00002376 cpsr=2000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=124 cyc=42115947
-[EXC] vector=18 pc=00002044 sp=03007E7C lr=00002CAE cpsr=8000005F
-[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
-[EXC] vector=18 pc=00001E60 sp=03007E7C lr=00001DF9 cpsr=2000005F
-[EXC] vector=18 pc=00002094 sp=03007E7C lr=000017AB cpsr=8000005F
-[EXC] vector=18 pc=00002044 sp=03007E7C lr=00001DD2 cpsr=8000005F
-[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
-[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=124 cyc=43620220
 ...
 [JIT] NORM SPIN cpu1 detected at 08000192->08000192, bursting
 [JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
@@ -242,13 +142,7 @@ FAT mounted, logging started
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
 [JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
-[JIT] NORM SPIN cpu1 detected at 08000192->08000192, bursting
-[JIT] NORM SPIN cpu1 escaped 08000192->08000194 after 1 steps
-[JIT] cpu1 08000194 -> 08000192 r=0 cpsr=8000003F
-[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
-[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
-[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
-[JIT] cpu1 08000192 -> 08000192 r=0 cpsr=8000003F
+
 
 //debug_log.h
 #pragma once
