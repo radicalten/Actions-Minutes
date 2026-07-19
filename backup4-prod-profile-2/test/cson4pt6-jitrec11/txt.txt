@@ -327,3 +327,169 @@ FAT mounted, logging started
 [JIT] SPIN cpu1=02380020, running cpu0 interp
 [JIT] SPIN cpu1=02380020, running cpu0 interp
 [JIT] SPIN cpu1=02380020, running cpu0 interp
+
+====
+keeps getting worse and worse 3fps now for armwrestler
+rockwrestler.nds
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006ec40
+[STATUS] fps=5 cycles=24219720 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=5 cycles=41025420 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=5 cycles=57831120 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=5 cycles=74636820 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=5 cycles=91442520 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x805498e0 tramp=0x800a0240 BLK_ARMS=8
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] arm   FB cpu1 pc=038002FC op=E121F003
+[JIT] arm   FB cpu1 pc=03800304 op=E121F004
+[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10
+[JIT] arm   FB cpu0 pc=02002D44 op=EE120F30
+[JIT] arm   FB cpu1 pc=0380074C op=E121F003
+[JIT] arm   FB cpu0 pc=02002D4C op=EE130F10
+[JIT] arm   FB cpu0 pc=02002D54 op=EE150F10
+[JIT] arm   FB cpu0 pc=02002D5C op=EE150F30
+[JIT] arm   FB cpu0 pc=02002D64 op=EE150F50
+[JIT] arm   FB cpu0 pc=02002D6C op=EE150F70
+[JIT] arm   FB cpu0 pc=02002D74 op=EE160F10
+[JIT] arm   FB cpu0 pc=02002D7C op=EE160F11
+[JIT] arm   FB cpu0 pc=02002D84 op=EE160F12
+[JIT] arm   FB cpu0 pc=02002D8C op=EE160F13
+[JIT] arm   FB cpu0 pc=02002D94 op=EE160F14
+[JIT] arm   FB cpu0 pc=02002D9C op=EE160F15
+[JIT] arm   FB cpu0 pc=02002DA4 op=EE160F16
+[JIT] arm   FB cpu0 pc=02002DAC op=EE160F17
+[JIT] arm   FB cpu0 pc=02002DB4 op=EE190F11
+[JIT] arm   FB cpu0 pc=02002DBC op=EE190F31
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001E4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001E4->020001E8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=02000270 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 02000270->02000274 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=02000270 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 02000270->02000274 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001B4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001B4->020001B8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+[JIT] DEADLOCK cpu0=020001B4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001B4->020001B8 at k=0
+[JIT] DEADLOCK cpu0=020001B4 cpu1=03800728 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020001B4->020001B8 at k=0
+[JIT] SPIN cpu1=03800728 giveup=64, yielding
+...
+[JIT] SPIN cpu0=020001B4 giveup=64, yielding
+[JIT] SPIN cpu0=020001B4 giveup=64, yielding
+[JIT] STATUS jit0=65536 fb0=36 jit1=130498 fb1=42527 pos=32802 gen=0
+[JIT] STATUS pc0=02000220 pc1=0380022C h0=0 h1=0 fps=4 cyc=11927490
+[JIT] SPIN cpu0=020001A4 giveup=64, yielding
+[JIT] SPIN cpu0=020001A4 giveup=64, yielding
+[JIT] SPIN cpu0=020001A4 giveup=64, yielding
+[JIT] SPIN cpu0=020001A4 giveup=64, yielding
+gbadoom.gba
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006ec40
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f688
+[STATUS] fps=0 cycles=8343104 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f688
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f688
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549820 tramp=0x800a0240 BLK_ARMS=8
+[JIT] cache flushed gen=1
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=1261568
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=2523136
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=3784704
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=5046272
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=6307840
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=7569408
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=8830976
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=10092544
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=11354112
+[EXC] vector=18 pc=00002BBA sp=03007EA4 lr=00002BAF cpsr=6000007F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=14527753
+...
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[JIT] arm   FB cpu1 pc=080000EC op=E129F000
+[JIT] arm   FB cpu1 pc=080000F8 op=E129F000
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+[JIT] GBA SPIN escaped 08000192->08000194
+
