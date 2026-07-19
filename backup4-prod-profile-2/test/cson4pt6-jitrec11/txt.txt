@@ -282,3 +282,48 @@ FAT mounted, logging started
 [JIT] DEADLOCK cpu0=02000924 cpu1=02380020 — interleaving
 [JIT] DEADLOCK cpu0 escaped 02000924->02000928 at k=0
 [JIT] SPIN cpu1=02380020, running cpu0 interp
+gbadoom.gba
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006ec40
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f684
+[STATUS] fps=0 cycles=8343104 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f684
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549820 tramp=0x800a01e0 BLK_ARMS=8
+[JIT] arm   FB cpu0 pc=02000A5C op=EE110F10
+[JIT] arm   FB cpu0 pc=02000A68 op=EE010F10
+[JIT] arm   FB cpu0 pc=02000A70 op=EE070F15
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] DEADLOCK cpu0=02000924 cpu1=02380020 — interleaving
+[JIT] DEADLOCK cpu0 escaped 02000924->02000928 at k=0
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+...
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] DEADLOCK cpu0=020009AC cpu1=02380020 — interleaving
+[JIT] DEADLOCK cpu0 escaped 020009AC->020009B0 at k=0
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
+[JIT] SPIN cpu1=02380020, running cpu0 interp
