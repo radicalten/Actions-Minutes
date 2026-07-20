@@ -80,13 +80,6 @@ public:
         return *registers[15] - (isThumb() ? 2u : 4u);
     }
 
-    // Returns true when the interpreter has been fully initialised and
-    // getActualPC() will return a sensible value.  The JIT must not
-    // attempt to compile or execute until this returns true.
-    //
-    // We check pcData because it is set inside flushPipeline(), which is
-    // called from setPC(), which is called from init() / directBoot().
-    // Before init() runs, pcData is nullptr (default member initialiser).
     bool isReady() const { return pcData != nullptr; }
 
     void setPC(uint32_t newPC);
@@ -258,18 +251,6 @@ enum SchedTask {
     MAX_TASKS
 };
 
-// ---------------------------------------------------------------------------
-// SchedCallback — a zero-overhead two-word closure.
-//
-//   fn  : plain function pointer, signature void(void*, int)
-//   obj : opaque pointer forwarded as the first argument (the "this")
-//   arg : small integer second argument (channel/index, 0 when unused)
-//
-// For tasks that carry no integer argument (arg == 0 always) the compiler
-// will constant-fold the second parameter away after inlining the trampoline,
-// leaving a single indirect branch — identical cost to a raw method pointer
-// on PowerPC where member-function pointers are two words anyway.
-// ---------------------------------------------------------------------------
 struct SchedCallback {
     void (*fn)(void* obj, int arg);  // trampoline function
     void*  obj;                      // receiver object
@@ -374,23 +355,6 @@ private:
 
     void updateRun();
     void resetCycles();
-
-    // -----------------------------------------------------------------------
-    // Static trampoline shims.
-    //
-    // Each shim is a plain function that recovers the typed pointer from the
-    // opaque void* and calls the real member function.  Because they are
-    // static and their bodies are trivial the compiler inlines them at the
-    // SchedCallback::operator() call site, so the generated code is:
-    //
-    //   lwz   r3, obj(callback)      ; load receiver
-    //   lwz   r4, arg(callback)      ; load channel (often optimised away)
-    //   lwz   r12, fn(callback)      ; load trampoline address
-    //   mtctr r12
-    //   bctrl                        ; single indirect branch
-    //
-    // That is the minimum possible cost for a runtime-dispatched call on PPC.
-    // -----------------------------------------------------------------------
 
     // Core self-tasks (arg ignored)
     static void shim_updateRun   (void* o, int) { static_cast<Core*>(o)->updateRun();    }
