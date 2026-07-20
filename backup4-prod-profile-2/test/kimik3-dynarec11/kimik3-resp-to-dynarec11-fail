@@ -409,7 +409,47 @@
 
     One more potential show-stopper: validPC for GBA BIOS region allows 0x0000-0x3FFF ✓; but pc0=FFFF0000 for ARM9 in GBA mode — runJitGba never calls runCpu(0) ✓.
 
-    Bug H: hashPC collision between ARM9/ARM7/Thumb/ARM — slot stores thumb but NOT cpu/arm7/gba. A block compiled for ARM9 at pc X reused for ARM7 at same X would use wrong memory space (arm7 bool burned in) and wrong cpuIdx (exit reasons committed to wrong interpreter? cpuIdx stored in frame — FRAME_CPUIDX loaded → commit uses interp pointer — the interp pointer is burned at compile time! So cross-CPU reuse = catastrophic). Can it happen? ARM9 & ARM7 both executing at same PC value... DS: ARM9 executes from 0x02000000 main RAM & 0xFFFF0000 BIOS & ITCM. ARM7: 0x03800000/0x03000000 WRAM, 0x00000000 BIOS, ROM 0x08000000+ via... ARM7 can't execute from main RAM (0x02000000)? Actually ARM7 CANNOT access main RAM — correct, it's ARM9-only. Shared WRAM: ARM9 can map it to 0x03000000; ARM7 default at 0x03800000 (mirror 0x03000000?). If ARM9 runs code from 0x03000000 while ARM7 runs at same address — the cache slot compare s.armPC==armPC && s.thumb==thumb passes → WRONG CPU BLOCK. Also GBA mode flushes cache on enter ✓. But ARM7 BIOS at 0x00000018 etc. vs ARM9 at... ARM9 can't execute 0x00000000 (ITCM there). Possible overlap: both at 0x03800xxx? ARM9 can access ARM7 WRAM? ARM9 accesses shared WRAM
+    Bug H: hashPC collision between ARM9/ARM7/Thumb/ARM — slot stores thumb but NOT cpu/arm7/gba. A block compiled for ARM9 at pc X reused for ARM7 at same X would use wrong memory space (arm7 bool burned in) and wrong cpuIdx (exit reasons committed to wrong interpreter? cpuIdx stored in frame — FRAME_CPUIDX loaded → commit uses interp pointer — the interp pointer is burned at compile time! So cross-CPU reuse = catastrophic). Can it happen? ARM9 & ARM7 both executing at same PC value... DS: ARM9 executes from 0x02000000 main RAM & 0xFFFF0000 BIOS & ITCM. ARM7: 0x03800000/0x03000000 WRAM, 0x00000000 BIOS, ROM 0x08000000+ via... ARM7 can't execute from main RAM (0x02000000)? Actually ARM7 CANNOT access main RAM — correct, it's ARM9-only. Shared WRAM: ARM9 can map it to 0x03000000; ARM7 default at 0x03800000 (mirror 0x03000000?). If ARM9 runs code from 0x03000000 while ARM7 runs at same address — the cache slot compare s.armPC==armPC && s.thumb==thumb passes → WRONG CPU BLOCK. Also GBA mode flushes cache on enter ✓. But ARM7 BIOS at 0x00000018 etc. vs ARM9 at... ARM9 can't execute 0x00000000 (ITCM there). Possible overlap: both at 0x03800xxx? ARM9 can access ARM7 WRAM? ARM9 accesses shared WRAM at 0x03000000-0x03007FFF (32KB) — ARM7 at 0x03800000 mirrors the same 32KB (when WRAMCNT gives all to ARM7). ARM9 executing shared WRAM at 0x03000000 and ARM7 at 0x03800000 — different PCs, no clash. 0x03000000 for ARM7 is an alias of 0x03800000? ARM7 WRAM mirrors every 0x10000 from 0x03000000-0x037FFFFF? On DS, ARM7 sees WRAM at 0x03800000-0x0380FFFF (64KB range, 32KB mirrored) AND 0x03000000 region? GBATEK: ARM7 WRAM is at 0x03800000 (and mirrored at 0x03000000 for ARM7 too?). Hmm — actually yes: "ARM7: 03800000h (and 03000000h mirror)". If a game runs ARM7 code via 0x03000000 mirror and ARM9 also executes at 0x03000000 — rare. Rockwrestler ARM7 at 0x03800xxx ✓ no clash.
+
+    BUT WAIT — much more likely clash: the JIT cache hashPC(pc) = (pc>>1) & 4095 — 0x020001E4 (ARM9) vs 0x038001E4? (0x020001E4>>1)&0xFFF vs (0x038001E4>>1)&0xFFF: 0x020001E4>>1 = 0x010000F2 → &0xFFF = 0x0F2. 0x038001E4>>1 = 0x01C000F2 → 0x0F2. Same bucket, but full compare → evict/thrash only. OK.
+
+    So cross-CPU reuse needs identical PC — the DS Download Play/main RAM scenario is impossible; BIOS vectors: ARM9 high vectors 0xFFFF0000 vs ARM7 0x00000000 distinct. So skip... but cheap to add arm7 to the slot check. Actually! GBA: enterGbaMode flushes ✓. Save state load flushes ✓.
+
+    Hmm, wait — actually there IS a real clash: NDS ARM9 in GBA mode? no. And DSi? skip.
+
+    Bug I: emitLS for STR with rn==rd post-index etc. — they handle pre wb rn!=rd; post always writes. But LDR with rn in list... skip.
+
+    Bug J: JitHelp_armBlock for STM with rn in list stores... uses regs[] values — when storing rn (base) with writeback, ARM stores the ORIGINAL base for... complex, helper uses current regs (original since writeback at end) ✓ roughly.
+
+    Bug K: cycle floor while halted forever with IRQs disabled → infinite? No, time advances, fine.
+
+    **Bug L — POTENTIAL REAL HANG: executeBlock_asm calling convention: the JIT block is entered with bctrl from the trampoline. The block's prologue mflr r0; stwu r1,-256(r1); stw r0, 260(r1) — FRAME_LR_OFF=260 = FRAME_SIZE+4 ✓. Then saves r14-r31 at 16..88 ✓ within frame (offsets 16-84... 16+17*4=84, last at 84; FRAME_SAVE+(31-14)4 = 16+68 = 84 ✓; FRAME_CORE=88 ✓.
+
+    Bug M: emitCommitExitDyn reads FRAME_PC — set by emitBX_target ✓ / emitBlockXfer ✓ / pushPop ✓.
+
+    Bug N: Thumb conditional branch inside emitT_branch: two emitCommitExit with patchSkip between ✓.
+
+    Bug O: emitBranch ARM B with cond: if(lk)ctx.li(RA[14],curPC+4); INSIDE the skip region (after emitCondSkip) ✓ — conditional BL only sets LR when taken ✓.
+
+    Bug P — IMPORTANT: emitCondSkip calls a C function BEFORE... but at that point have we spilled? The ARM regs live in r14-r28 which are callee-saved ✓ no spill needed ✓.
+
+    Bug Q: Ctx::call sets overflow if target outside MEM1 — all helpers are in MEM1 (0x80xxxxxx) ✓.
+
+    Bug R: emitSyncFrom failure path: sets g_exitReason then epilogue — runCpu then does interp.jitRunOpcode() ✓.
+
+    Bug S — JitHelp_syncFrom reads only r0-r14 (15 regs) ✓ PC handled separately.
+
+    Bug T: In compile, when dispThumb/dispARM returns false they emitCommitExit(FALLBACK) at curPC — the instruction at curPC will run in interpreter ✓.
+
+    Bug U — fbLogOnce and logging spam — fine.
+
+    Bug V — runJitNds: when both CPUs halt → updateRun switches to runCoreNone → tickInline? runCoreNone presumably advances to next event. ✓.
+
+    Bug W — Core::updateRun picks JIT even when only one CPU active: runJitNds runs both; runCpu returns 0 when halted ✓.
+
+    **Bug X — Interpreter::offset_* statics using null-this — UB but works; unused by JIT anyway.*_
+
+    Now, is there anything that specifically explains IPCSYNC failing while rockwrestler otherwise runs? With C/V always 0: the ARM7 IPCSYNC test loop in rockwrestler... The main loop uses mostly simple logic; when a test starts, the ARM9 writes IPCSYNC and waits for ARM7 response with a timeout — the timeout path is taken (red light). The ARM7 waits for IPCSYNC bits — a BNE/BEQ loop. Those use Z — works. Hmm, so why would ARM7 not see the IPCSYNC write? IPCSYNC read via JIT LDR helper → memory.read
 
     Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. (Do not spend all your budget thinking, save some for writing a solution)
 
