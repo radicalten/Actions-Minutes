@@ -145,3 +145,5 @@ FAT mounted, logging started
 [JIT] STATUS pc0=020001E4 pc1=03800728 h0=0 h1=0 fps=0 cyc=3211446
 [JIT] STATUS jit0=7222 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
 
+===
+reached the token limit and it never stopped line scrolling at 5 fps. bad changes scrap entirely. keep trying dynarec11 with other models.
