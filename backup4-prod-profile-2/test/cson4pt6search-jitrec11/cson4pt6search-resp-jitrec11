@@ -1,0 +1,162 @@
+## Bug Analysis
+
+Looking at your logs and code, I can identify **four distinct bugs** causing both the NDS IPCSYNC failures and the GBA black screen.
+
+---
+
+### Bug 1 — Critical: `tickInline` called once after all iterations (both NDS and GBA)
+
+This is the root cause of nearly every symptom. Events like `NDS_SCANLINE256`, `GBA_SCANLINE240`, `ARM9_INTERRUPT`, and `ARM7_INTERRUPT` are only dispatched once per `runJit*` call, after all 32 iterations complete. Hardware expects them to fire mid-loop during execution.
+
+**NDS consequence:** ARM9 writes IPCSYNC at iteration 3, but the `ARM7_INTERRUPT` event only fires after iteration 32 — so ARM7 spins for ~29 extra iterations and the rockwrestler test times out.
+
+**GBA consequence:** The VBlank IRQ (`GBA_SCANLINE240`) fires after the full 32-iteration window, but the CPU is already spinning in the `NORM SPIN` burst handler (which runs the *interpreter*, not `tickInline`), so VBlank never actually unhalts the CPU.
+
+---
+
+### Bug 2 — Critical: GBA HALT state never advances the clock
+
+In `runJitGba`, when `interp.halted` is true, `runCpu` returns 0. In the old code, `acc += 0` and the single `tickInline(core, FLOOR_CYCLES_GBA)` at the end fires the event anyway — but with the accumulator pattern this only "works" by luck. With per-iteration ticking (Bug 1 fix), a halted CPU must explicitly jump to the next scheduled event, or VBlank will never be reached.
+
+This explains the repeated `[EXC] vector=18 pc=00000348` — the GBA is re-entering the IRQ handler over and over because `HALT` never properly re-enables execution.
+
+---
+
+### Bug 3 — NDS: ARM9/ARM7 cycle ratio is wrong (1:1 instead of 2:1)
+
+NDS hardware: ARM9 runs at 66 MHz, ARM7 at 33 MHz. One ARM7 instruction costs **2 ARM9 master cycles**. Your current code runs them iteration-for-iteration at the same rate. This makes the ARM7 run twice as fast as it should, which corrupts timing-sensitive IPC handshakes like IPCSYNC.
+
+---
+
+### Bug 4 — NDS: Halted ARM9 doesn't tick the master clock
+
+When ARM9 is halted, `runCpu` returns 0, and the master clock never advances. The ARM7 then runs 32 instructions in zero simulated time, which breaks all timing. The master clock must advance by at least one ARM9 cycle per iteration even when ARM9 is halted.
+
+---
+
+## Fixed `runJitNds` and `runJitGba`
+
+Replace both functions entirely:
+
+```cpp
+// ═══════════════════════════════════════════════════════════════════════
+// Run functions  (fixed)
+// ═══════════════════════════════════════════════════════════════════════
+
+void JitPpc::runJitNds(Core& core) {
+    if (!g_jitLive || !codeBuf) { Interpreter::runCoreNds(core); return; }
+
+    // NDS master clock: ARM9 @ 2 cycles/insn, ARM7 @ 1 cycle/insn (half speed).
+    // We interleave: for every ARM9 step we advance the master clock by c0
+    // cycles and also run one ARM7 step (ARM7 contributes no additional
+    // master-clock cycles because it is already accounted for by the 2:1 ratio).
+    // tickInline is called INSIDE the loop so that IPCSYNC / DMA / IRQ events
+    // fire at the correct moment relative to both CPUs.
+
+    Interpreter& arm9 = core.interpreter[0];
+    Interpreter& arm7 = core.interpreter[1];
+
+    for (int i = 0; i < ITERS_NDS; i++) {
+
+        // ── ARM9 step ────────────────────────────────────────────────
+        uint32_t c0;
+        if (!arm9.halted) {
+            c0 = runCpu(core, 0, false);
+            if (c0 == 0) c0 = CYCLES_PER_INSN_ARM9;   // safety: never stall clock
+        } else {
+            // ARM9 halted: still advance master clock so ARM7 and events
+            // are not starved.  One ARM9 cycle = minimum quantum.
+            c0 = CYCLES_PER_INSN_ARM9;
+        }
+
+        // ── ARM7 step ────────────────────────────────────────────────
+        // ARM7 runs at half the ARM9 rate. We run one ARM7 instruction per
+        // ARM9 instruction; each ARM7 instruction costs 2 master cycles, which
+        // is exactly c0 = CYCLES_PER_INSN_ARM9 = 2.  ARM7 does NOT add to c0.
+        if (!arm7.halted) {
+            runCpu(core, 1, false);
+        }
+        // (If ARM7 halted, no step needed — IRQ will unhalt it via tickInline.)
+
+        // ── Tick scheduler ───────────────────────────────────────────
+        // FIX: tick INSIDE the loop so events (IPCSYNC, DMA, scanline,
+        // interrupts) fire at the correct time relative to both CPUs.
+        tickInline(core, c0);
+    }
+
+    logStatus(core);
+}
+
+void JitPpc::runJitGba(Core& core) {
+    if (!g_jitLive || !codeBuf) { Interpreter::runCoreSingle<true, 0>(core); return; }
+
+    // GBA mode: only ARM7 (cpu1) runs; cpu0 is permanently halted (halt bit 2).
+    Interpreter& interp = core.interpreter[1];
+
+    // ── Handle HALT at entry (waiting for VBlank / IRQ) ─────────────
+    // FIX: when the CPU is already halted we must explicitly advance the
+    // master clock to the next scheduled event so the VBlank/HBlank/timer
+    // IRQ can fire and unhalt the CPU.  Without this the CPU spins forever
+    // because tickInline(FLOOR) at the end of the loop was the only thing
+    // advancing time, and with per-step ticking a halted CPU contributes
+    // zero cycles, so the floor was never reached.
+    if (interp.halted) {
+        uint32_t delta = FLOOR_CYCLES_GBA;   // sensible default
+        if (!core.events.empty()) {
+            uint32_t next = core.events.front().cycles;
+            if (next > core.globalCycles)
+                delta = next - core.globalCycles;
+            else
+                delta = 1;
+        }
+        // Cap so we don't jump multiple frames at once.
+        static const uint32_t MAX_HALT_DELTA = FLOOR_CYCLES_GBA * 2;
+        if (delta > MAX_HALT_DELTA) delta = MAX_HALT_DELTA;
+        tickInline(core, delta);
+        logStatus(core);
+        return;     // re-evaluate halt/run state on next call
+    }
+
+    // ── Normal execution ─────────────────────────────────────────────
+    for (int i = 0; i < ITERS_GBA; i++) {
+
+        if (interp.halted) {
+            // CPU halted mid-loop (e.g. executed HALT opcode).
+            // Jump to next event so the IRQ fires immediately.
+            uint32_t delta = 1;
+            if (!core.events.empty()) {
+                uint32_t next = core.events.front().cycles;
+                if (next > core.globalCycles)
+                    delta = next - core.globalCycles;
+            }
+            static const uint32_t MAX_HALT_DELTA = FLOOR_CYCLES_GBA * 2;
+            if (delta > MAX_HALT_DELTA) delta = MAX_HALT_DELTA;
+            tickInline(core, delta);
+            break;     // don't keep iterating; re-evaluate on next call
+        }
+
+        uint32_t c = runCpu(core, 1, true);
+        if (c == 0) c = CYCLES_PER_INSN_ARM7;   // safety
+
+        // FIX: tick INSIDE the loop — VBlank/HBlank events must fire at
+        // the correct cycle boundary, not after 32 instructions have run.
+        tickInline(core, c);
+    }
+
+    logStatus(core);
+}
+```
+
+---
+
+## Summary of All Changes
+
+| # | Location | Bug | Fix |
+|---|----------|-----|-----|
+| 1 | `runJitNds` | `tickInline` after loop → IPCSYNC never fires on time | Move `tickInline(core, c0)` **inside** the `for` loop |
+| 2 | `runJitGba` | `tickInline` after loop → VBlank IRQ never fires during spin | Move `tickInline(core, c)` **inside** the `for` loop |
+| 3 | `runJitGba` | HALT state contributes 0 cycles → clock stalls, CPU never unhalts | Add early-exit HALT path that jumps to next scheduled event |
+| 4 | `runJitNds` | ARM9 halted → master clock stalls, ARM7 starves | Always advance clock by at least `CYCLES_PER_INSN_ARM9` per iteration |
+| 5 | `runJitNds` | ARM9/ARM7 ratio 1:1 instead of 2:1 | ARM7 step does not add to `c0`; ARM9 alone drives the master clock |
+
+The `NORM SPIN` bursting for IPCSYNC and the GBA VBlank loop are both *symptoms* of the scheduler not being ticked frequently enough — the spin detection was working correctly, but the underlying cause (events not firing in-loop) was what needed fixing. The spin detector will still help for pathological cases, but with correct in-loop ticking it should trigger far less often.
