@@ -1,6 +1,4 @@
-Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. (Do not spend all your budget thinking, save some for writing a solution)
-
-Most nds games launch and go to the white screen but get stuck there.
+Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. 
 When launching a gba game I get the gba boot logo then a black screen but it gets stuck there at the black screen.
 nds rom debug info:
 === NooDS-Wii status log ===
