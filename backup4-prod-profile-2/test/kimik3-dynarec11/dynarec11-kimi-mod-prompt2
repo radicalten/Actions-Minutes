@@ -2177,5 +2177,4 @@ void invalidateJitRange(uint32_t start,uint32_t end){
         if(cache[i].valid&&cache[i].armPC>=start&&cache[i].armPC<end)
             cache[i].valid=false;
 }
-
 } 
