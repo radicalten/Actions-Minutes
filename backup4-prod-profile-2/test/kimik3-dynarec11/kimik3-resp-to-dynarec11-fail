@@ -449,7 +449,116 @@
 
     **Bug X — Interpreter::offset_* statics using null-this — UB but works; unused by JIT anyway.*_
 
-    Now, is there anything that specifically explains IPCSYNC failing while rockwrestler otherwise runs? With C/V always 0: the ARM7 IPCSYNC test loop in rockwrestler... The main loop uses mostly simple logic; when a test starts, the ARM9 writes IPCSYNC and waits for ARM7 response with a timeout — the timeout path is taken (red light). The ARM7 waits for IPCSYNC bits — a BNE/BEQ loop. Those use Z — works. Hmm, so why would ARM7 not see the IPCSYNC write? IPCSYNC read via JIT LDR helper → memory.read
+    Now, is there anything that specifically explains IPCSYNC failing while rockwrestler otherwise runs? With C/V always 0: the ARM7 IPCSYNC test loop in rockwrestler... The main loop uses mostly simple logic; when a test starts, the ARM9 writes IPCSYNC and waits for ARM7 response with a timeout — the timeout path is taken (red light). The ARM7 waits for IPCSYNC bits — a BNE/BEQ loop. Those use Z — works. Hmm, so why would ARM7 not see the IPCSYNC write? IPCSYNC read via JIT LDR helper → memory.read → ipc.readIpcSync — fine. UNLESS the block cache holds a stale block after IPC... no, reads aren't cached.
+
+    OH WAIT. I see something. runJitNds — ARM7 runs but its cycles are never charged; but that's fine. BUT the ARM7's JitHelp_commit/setPC and interrupts: ARM7_INTERRUPT task fires interpreter[1].interrupt() — if ARM7 is spinning inside a JIT block when IRQ fires... interrupt() does exception() which swaps registers to IRQ mode — the JIT block for the IRQ handler will syncFrom the IRQ-mode registers ✓ because registersUsr/banked pointers are swapped in the interpreter, and JIT syncs from interpreter state at block entry ✓. On return (subs pc,lr,#4 fallback → interpreter restores user mode ✓). OK.
+
+    So the IPC timeout is likely a knock-on of broken flags corrupting the protocol sequence on either side (e.g., ARM9's IPCSYNC write sequence computed with comparisons that branch wrong, so it never writes the right value, or ARM7's response check fails). Also: rockwrestler's ARM7 light toggling red/green "at least half the time" = timing-sensitive race — consistent with flags making some code paths randomly fail.
+
+    Actually — WAIT. Let me reconsider. Is C really always 0? setC_xer reads XER bit 29 — XER bits 25-31 = TBC (transfer byte count), which is 0 except during lswx/stswx — JIT never emits those, so bit29=0 always → C=0 ✓. setC_imm: TC masked to bit31 only; after rotl 29, bit at PPC 29 = original bit (29+29)%32 = 26 → 0 ✓ C=0. setV: bit at PPC28 after rotl 29 = original (28+29)%32=25 → 0 ✓ V=0. YES: C and V hardwired to 0 after every JIT flag op.
+
+    Given Thumb compares (CMP imm8 etc.) all use subfc+setC_xer → C=0 → every unsigned compare in JIT-compiled Thumb code reports "borrow" (C=0) → BCC/BLO always taken, BCS never, BHI never, BLS always. GBA games are ~99% Thumb → immediate boot failure after BIOS logo. NDS ARM7 runs Thumb too → IPC code breaks. ARM9 ARM-state code breaks similarly. Rockwrestler surviving at 28fps: its main loop must avoid unsigned branches on JIT-compiled paths... plausible enough (and it DOES fail its IPC tests — consistent!).
+
+    So the fix list, prioritized:
+        Fix setC_xer mask: 29,29 → 2,2.
+        Fix setC_imm mask: rotl 29, mask 2,2 (was 29,29).
+        Fix setV_add/setV_sub final mask: 3,3 (was 28,28).
+        Fix RSC: subfe(res, srcRn, TA). (and V call already swapped ✓)
+        Add C-flag updates for Thumb register shifts/ALU shift ops (cases 2,3,4,7) and MUL? ARMv4 MUL C is unpredictable — fine to leave. Register-shifted operand2 in emitShifter should set C (currently never) — recommend computing, or at minimum mention.
+        Recommend adding cpu/arm7 to JitBlock identity to prevent cross-CPU reuse (safety).
+        Also MSR immediate path unreachable — minor; leave as fallback.
+        The EXC storm in GBA: likely IRQ-related; after flag fix, retest. But let me think if there's an IRQ-specific JIT bug...
+
+    IRQ re-entry check: does Interpreter::interrupt() check CPSR I bit? We don't have interpreter.cpp, but the EXC storm shows exceptions taken while I=1 (cpsr=6000007F has I set — 0x7F bit7 = 1? 0x7F = 0111 1111: bit 7 = 0! Wait: 0x7F = 127 = 0b01111111 — bit7 is 0! So I=0?? 0x6000007F: low byte 0x7F: bit7(I)=0, bit6(F)=1, T=0, mode=0x1F. Hmm so I=0, F=1. And 0x6000005F = 0b01011111: I=0? bit7=0, bit6(F)=1, mode 0x1F system. Wait 0x5F = 0b0101_1111: bit7=0 (I=0, IRQ ENABLED), bit6=1 (F=1). Hmm both have I=0! So IRQs enabled in both — BIOS IRQ handler on GBA runs in IRQ mode (0x12) normally with I=1... 0xDF seen in NDS logs = 0b1101_1111: I=1,F=1,T=0,mode=0x1F. OK whatever — with I=0 in those GBA EXC entries, nested IRQ re-entry is plausible if IF stays set — GBA BIOS handler runs with I=0? No wait — on exception entry, the CPU sets I=1 automatically. If these entries show I=0, then the exception was taken... hmm, the log prints cpsr maybe BEFORE entry. vector=18 exception at pc=0x348 with I=0 → normal. But 50+ times at the same pc means the handler re-executes/never progresses: lr=0x344 — LR_irq = pc+4 = 0x34C expected if pc=0x348 is the interrupted instruction... they log lr=0x344 = pc-4. Weird, but if exception() computed lr wrong (pc-4 instead of pc+4?) the RETURN from IRQ (subs pc, lr, #4) would go to lr-4 = 0x340 → re-execute handler prologue in a loop?! Actually subs pc,lr,#4 with lr=0x344 → pc=0x340. Hmm. If exception entry LR is wrong, IRQ return loops forever → then how did pc1=08000192 appear later...
+
+    I can't verify exception() without interpreter.cpp. But it's interpreter code that presumably worked before the JIT (the interpreter handles GBA fine in upstream NooDS). The EXC log is printed from exception() — it prints the CURRENT pc (before vectoring) = 0x348 and lr register = current r14 (USR lr, not LR_irq yet) = 0x344? Before exception entry, lr is the user's r14 — at 0x348 in BIOS the current r14 could be anything. Repeated identical → IRQ firing every few cycles: IF bits re-set or never cleared. The user IRQ handler at 0x0300xxxx/0x08000xxx clears IF via strh — JIT-compiled? BIOS region and IWRAM 0x03000000-0x03007FFF are validPC ✓ JIT'd. STRH via emitLSExtra → JitHelp_w16 → memory.write<uint16_t> → ipc/IF write — should clear.
+
+    OR the handler is at 0x08000xxx (ROM, uncommon) ✓ also valid.
+
+    Honestly, the flag bug explains the GBA hang too: with C always 0, the game's IRQ handler code (Thumb) that checks IF bits / acknowledges may take wrong branches, never clearing IF → interrupt storm → game stuck right after boot logo. Consistent!
+
+    Also Doom GBA: crt0 waits for VBlank flag in a loop using unsigned compares → hangs at 0x08000192 → B . style loop. Consistent.
+
+    Let me also double check setNZ's rlwimi for N: rlwimi(RCPSR, r, 0, 0, 0) — inserts r's PPC bit 0 into RCPSR PPC bit 0 ✓ N=ARM bit31=PPC bit0 ✓. And Z via cmpi against 0 — but cmpi compares SIGNED r vs 0 — EQ unaffected by signedness ✓.
+
+    Also check clearing N,Z: rlwinm(RCPSR,RCPSR,0,2,31) keeps PPC 2..31 → clears PPC 0,1 = N,Z ✓ C (PPC2) preserved ✓.
+
+    One more check on setV_sub argument order for RSB/RSC: V_sub(res, opB, opA) computes (opB - opA) overflow: sub formula: xor(a,b) & xor(a,res) MSB. For RSB: res = op2 - rn → setV_sub(res, opB=shifter, opA=rn) ✓ they call setV_sub(ctx,res,opB,opA) ✓.
+
+    Also emitT_addSub3 with imm3==0 and sub: fine.
+
+    emitT_imm8 case 2 (ADD) flags ✓; case 1 CMP uses TC result ✓ but writes... ppc_subfc(TC,TA,TB) = TB - TA ✓.
+
+    emitMul MLA: mullw(TA, rm, rs); add(rd, TA, rn) ✓ (MUL: rmrs ✓ operand order per ARM: Rd = Rm * Rs ✓ they use rm=op&0xF ✓ rs=(op>>8)&0xF ✓).
+
+    Now the SECOND part of the question: performance/timing — NDS cycle pacing: runJitNds charge uses acc0 only; if ARM9 halted but ARM7 active (common: ARM9 halts waiting for ARM7), acc0=0 → charge=2130 floor ✓ good.
+
+    But ARM7 runs 32 iterations per call at ~1 cycle each = 32 ARM7 cycles, while time advances 2130 ARM9 cycles (= ~1065 ARM7 cycles of real time) — ARM7 runs at ~3% of required speed relative to ARM9!! Wait: ARM9: acc0 = sum of runCpu(0) returns: each runCpu(0) executes one BLOCK (up to 8 insns, ~2 cyc/insn → ~16) → 32 iters * ~16 = 512 max, but typically blocks exit early... Floor 2130 dominates → per call: ARM9 executes ~32 blocks (~256 insns) while clock advances ≥2130 cycles. Real hardware: 2130 ARM9 cycles ≈ 2130 instructions-ish (1-2 cyc/insn). So ARM9 executes 256 insns per 2130 cycles — 8x SLOWDOWN of CPU vs timers. ARM7 similar: 32 blocks per call. This explains 28fps max and IPC timeouts (rockwrestler's IPC test has a timeout measured in ARM9 cycles — ARM7 responds too late → Timeout!). This is a major cause of the IPCSYNC/IPCFIFO "Timeout" failures! Even with flags fixed, the ARM7 may respond but way too late relative to the ARM9's timeout counter.*
+
+    Wait, actually let me recompute: timeout in rockwrestler — they wait N iterations. With both CPUs equally slowed, the ratio matters: ARM9 executes 256 insns per call, ARM7 executes 32 blocks per call. If ARM7 blocks are ~2-3 insns each (IPC wait loop), ARM7 gets ~64-96 insns per call vs ARM9's 256 — ARM7 runs at ~1/3 of ARM9 instruction rate; on hardware ARM7 should be ~1/2 (33/67 MHz) of ARM9 — roughly OK actually. Hmm, but the absolute rate vs the scheduler: 2130 cycles/call with only ~256 ARM9 insns → timer IRQs fire every ~256 instructions instead of every ~1000+ → VBlank IRQs come 4-8x more often per instruction → games see way more IRQs → boot code that counts VBlanks progresses faster in wall-time; fine-ish. But IPC timeouts measured in cycle-counted loops: ARM9's timeout loop is JIT'd blocks; each call ARM9 does 256 insns; ARM7 does ~64-96; if ARM9 timeout is e.g. 100000 loop iterations and ARM7 needs 50000 insns to respond — ratio-wise ARM7 needs 50000/96 = 520 calls; ARM9 times out after 100000/256 = 390 calls → TIMEOUT even though functionally OK! So yes: the per-call instruction budget ITERS_NDS=32 with floor 2130 starves ARM7 → IPC timeouts. The interpreter path (runCoreNds) paces by cycles properly.
+
+    The robust fix: charge time based on actual executed cycles and run BOTH CPUs until the floor is reached, not a fixed 32 iterations:
+    cpp
+
+    void runJitNds(Core& core){
+        if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
+        uint32_t target = core.globalCycles + FLOOR_CYCLES_NDS;
+        while (core.globalCycles < target) {
+            uint32_t c0 = runCpu(core,0,false);   // returns ARM9 cycles
+            runCpu(core,1,false);                 // ARM7 interleave (or track c1/2)
+            tickInline(core, c0 ? c0 : CYCLES_PER_INSN_ARM9);
+        }
+    }
+
+    But careful: events firing during tickInline can unhalt etc. Also both halted → updateRun switches to runCoreNone anyway; but to be safe, if both halted break.
+
+    Also ARM7 pacing: DS ARM7 = half clock → per ARM9 cycle, ARM7 should execute ~0.5 cycle. Simple approach: accumulate ARM7 cycles and tick... The scheduler only has one clock (ARM9 33.5M? NooDS globalCycles counts... NDS_SCANLINE256 = 2566 cycles per scanline at 6 cycles/dot — ARM9 cycles). ARM7 cycles = globalCycles/2. The interpreter runCoreNds presumably runs each CPU for its share. For the JIT, a decent approximation: run ARM7 every other ARM9 step, or track acc1 and charge ARM7 at 2x: i.e., maintain static uint32_t arm7Debt — simpler: loop until globalCycles reaches target; each iteration: c0=runCpu(0); c1=runCpu(1); tickInline(core, max(c0, c12)/... hmm since runCpu(1) returns ARM7 cycles (1/insn), convert: arm7Cycles*2 = arm9-equivalent. Tick by c0 (arm9) primarily.
+
+    Let me write a cleaner runJitNds:
+    cpp
+
+    void runJitNds(Core& core){
+        if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
+        const uint32_t target = core.globalCycles + FLOOR_CYCLES_NDS;
+        while(core.globalCycles < target){
+            if(core.interpreter[0].halted && core.interpreter[1].halted) break;
+            uint32_t c0 = runCpu(core,0,false);
+            uint32_t c1 = runCpu(core,1,false);
+            // ARM7 runs at half the ARM9 clock: 1 ARM7 cycle == 2 ARM9 cycles.
+            uint32_t t0 = c0 ? c0 : CYCLES_PER_INSN_ARM9;
+            uint32_t t1 = c1 ? (c1 * 2) : 0;
+            tickInline(core, t0 > t1 ? t0 : t1);
+        }
+        logStatus(core);
+    }
+
+    Hmm but this changes event granularity... tickInline fires events whenever due; over-advancing slightly is fine. When both halted, break and let outer code... but if both halted, updateRun would have switched to runCoreNone — except during the run. The break leaves globalCycles short of target — the next event (e.g., scanline IRQ) will wake via scheduler — but globalCycles won't advance until next runCore call... runCoreNone handles the halted case by fast-forwarding to next event. When interrupt unhalts a CPU, sendInterrupt → updateRun → running=0 → outer loop re-enters with runJitNds ✓. To be safe, if both halted: tickInline to next event? Simplest: if both halted, tickInline(core, target - core.globalCycles) then break — events fire, IRQ wakes CPU, updateRun sets running=0, outer loop resumes. Good.
+
+    Also GBA version:
+    cpp
+
+    void runJitGba(Core& core){
+        if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
+        const uint32_t target = core.globalCycles + FLOOR_CYCLES_GBA;
+        while(core.globalCycles < target){
+            uint32_t c = runCpu(core,1,true);
+            tickInline(core, c ? c : CYCLES_PER_INSN_ARM7);
+            if(core.interpreter[1].halted){
+                // fast-forward to next event so VBlank etc. can fire
+                if(!core.events.empty()){
+                    uint32_t next = core.events.front().cycles;
+                    if(next > core.globalCycles)
+                        tickInline(core, next - core.globalCycles);
+                }
+                break;
+            }
+        }
+        logStatus(core);
+    }
+
+    Wait — careful: tickInline while halted fires scanline events → HBlank/VBlank IRQ → unhalt → updateRun → running=0. Fine.
+
+    Hmm, but the original GBA loop with ITERS_GBA=32 and floor 1232: 32 blocks/call vs 1232 cycles — the GBA CPU runs at ~1/20 real speed?! Doom's boot logo is the BIOS (runs before? no — with JIT active from the start... the logo
 
     Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. (Do not spend all your budget thinking, save some for writing a solution)
 
