@@ -347,7 +347,43 @@
         PPCIrqUnlockByMsr(st);
     }
 
-    It sets running=0 — meaning the outer main loop (which presumably loops while(core->running) core->runCore();) will STOP after updateRun is called from within a run! That's by design in NooDS (running=0 forces the frame loop to restart with new runFunc — the outer loop re-checks and resumes). In NooDS desktop, runCore is called from a loop that checks running. The status log shows updateRun being called repeatedly in GBA mode ([STATUS] updateRun: ... halt1=0 -> func=0x8006fa44 alternating with halt1=1 -> func=0x800454d4) — the function toggles between runJitGba and runCoreSingle?? Wait: func=0x8006fa44 vs func=0x800454d4 — two different functions. When halt1=1 (ARM7 halted), updateRun picks... interpreter[0].halted && interpreter[1].halted → runCoreNone
+    It sets running=0 — meaning the outer main loop (which presumably loops while(core->running) core->runCore();) will STOP after updateRun is called from within a run! That's by design in NooDS (running=0 forces the frame loop to restart with new runFunc — the outer loop re-checks and resumes). In NooDS desktop, runCore is called from a loop that checks running. The status log shows updateRun being called repeatedly in GBA mode ([STATUS] updateRun: ... halt1=0 -> func=0x8006fa44 alternating with halt1=1 -> func=0x800454d4) — the function toggles between runJitGba and runCoreSingle?? Wait: func=0x8006fa44 vs func=0x800454d4 — two different functions. When halt1=1 (ARM7 halted), updateRun picks... interpreter[0].halted && interpreter[1].halted → runCoreNone (0x800454d4?). When halt1=0 → runJitGba. That's the GBA SWI Halt ↔ IRQ wake cycle — normal-ish, though toggling every frame... Actually in GBA mode when the CPU halts waiting for VBlank, halt1=1, halt0=4 → both halted → runCoreNone. Then VBlank IRQ unhalts → runJitGba. That's correct behavior. Doom idles in Halt — fine.
+
+    But the STATUS log shows pc1=FFFFFFFF for a long time while halt1=0 and runJitGba chosen — PC FFFFFFFF means interpreter not ready?? interpreter[1].init() is called in enterGbaMode; init sets PC? pc1=00000000 in JIT STATUS log (which checks isReady). The 0xFFFFFFFF comes from the STATUS logger in core (pc1=FFFFFFFF) — maybe reading getPC() directly. Meanwhile the JIT STATUS shows pc1=00000000 — halted at 0? Then later EXC storm, then pc1=08000192.
+
+    Hmm, halt1=1 and pc1=FFFFFFFF during early GBA — the GBA BIOS boots (logo), then game... those EXC at 0x348 are during BIOS/game with cpsr 0x5F (system mode).
+
+    OK whatever — the concrete actionable bugs I've found that I should present:
+
+    PRIMARY BUG: setC_xer, setC_imm, setV_add, setV_sub use wrong rlwinm masks (ARM bit numbers instead of PPC bit numbers) → C and V flags are ALWAYS 0 in JIT-compiled code. This breaks every unsigned comparison (CS/CC/HI/LS) and signed comparisons (GE/LT/GT/LE via N==V) → boot code and IPC protocol loops deadlock; GBA crt0 hangs. Rockwrestler's ARM7 test loop partially runs (mostly EQ/NE logic) — matches symptoms.
+
+    Let me write the corrected helpers:
+    cpp
+
+    // XER: PPC bit 2 = CA.  ARM C flag = CPSR bit 29 = PPC bit 2.
+    static void setC_xer(Ctx& ctx){
+        ctx.E(ppc_mfxer(TA));
+        ctx.E(ppc_rlwinm(TA,TA,0,2,2));            // isolate XER.CA at PPC bit 2 (== ARM bit 29)
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));      // clear C
+        ctx.E(ppc_or(RCPSR,RCPSR,TA));
+    }
+    // carry-in sits at ARM bit 0 (PPC bit 31) of cr; move to ARM bit 29 (PPC bit 2)
+    static void setC_imm(Ctx& ctx,uint8_t cr){
+        ctx.E(ppc_rlwinm(TA,cr,29,2,2));           // rotl 29: PPC31->PPC2, keep PPC bit 2
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));
+        ctx.E(ppc_or(RCPSR,RCPSR,TA));
+    }
+    static void setV_add(Ctx& ctx,uint8_t res,uint8_t a,uint8_t b){
+        ctx.E(ppc_xor(TE,res,a));
+        ctx.E(ppc_xor(TF,res,b));
+        ctx.E(ppc_and(TE,TE,TF));                  // MSB = overflow
+        ctx.E(ppc_rlwinm(TE,TE,29,3,3));           // PPC0 -> PPC3 (ARM bit 28 = V)
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));      // clear V
+        ctx.E(ppc_or(RCPSR,RCPSR,TE));
+    }
+
+    Wait — rotate: overflow bit at PPC bit 0; want PPC bit 3; rotate left 29: 0 -> (0-29) mod32 = 3 ✓ mask 3,3. The original code did TWO rlwinm (isolate then rotate) — can keep both but fix final mask: rlwinm(TE,TE,0,0,0); rlwinm(TE,TE,29,3,3); — but wait, the second rotates the whole register; bits other than 0 don't matter due to mask 3,3 ✓. Also can drop the isolate. I'll present minimal fixes keeping their structure:
+        setC_xer: rlwinm(TA,TA,0,29,29)
 
     Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. (Do not spend all your budget thinking, save some for writing a solution)
 
