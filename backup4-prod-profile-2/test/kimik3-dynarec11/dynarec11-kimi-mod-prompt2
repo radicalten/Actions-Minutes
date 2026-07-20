@@ -2,7 +2,7 @@ Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? 
 
 Most nds games launch and go to the white screen but get stuck there.
 When launching a gba game I get the gba boot logo then a black screen but it gets stuck there at the black screen.
-rockwrestler.nds debug info:
+nds rom debug info:
 === NooDS-Wii status log ===
 [STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f76c
 [STATUS] fps=1 cycles=16936378 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
@@ -27,10 +27,6 @@ FAT mounted, logging started
 [JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
 [JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
 [JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
-[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
-[JIT] cpu1 0380072C -> 03800728 r=0 cpsr=200000DF
-[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
-
 
 //debug_log.h
 #pragma once
