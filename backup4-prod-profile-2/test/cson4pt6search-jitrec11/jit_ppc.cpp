@@ -1440,44 +1440,109 @@ static void logStatus(Core& core){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Run functions
+// Run functions  (fixed)
 // ═══════════════════════════════════════════════════════════════════════
-void runJitNds(Core& core){
-    if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    // Run both CPUs. ARM9 is master clock.
-    // ARM7 runs at half the clock rate, so one ARM7 cycle = 2 ARM9 cycles.
-    // We run them interleaved: for each ARM9 step, do one ARM7 step.
-    // globalCycles counts ARM9 cycles.
-    uint32_t acc0=0;
-    for(int i=0;i<ITERS_NDS;i++){
-        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
-        runCpu(core,1,false);          // ARM7: runs but doesn't add to acc
+void JitPpc::runJitNds(Core& core) {
+    if (!g_jitLive || !codeBuf) { Interpreter::runCoreNds(core); return; }
+
+    // NDS master clock: ARM9 @ 2 cycles/insn, ARM7 @ 1 cycle/insn (half speed).
+    // We interleave: for every ARM9 step we advance the master clock by c0
+    // cycles and also run one ARM7 step (ARM7 contributes no additional
+    // master-clock cycles because it is already accounted for by the 2:1 ratio).
+    // tickInline is called INSIDE the loop so that IPCSYNC / DMA / IRQ events
+    // fire at the correct moment relative to both CPUs.
+
+    Interpreter& arm9 = core.interpreter[0];
+    Interpreter& arm7 = core.interpreter[1];
+
+    for (int i = 0; i < ITERS_NDS; i++) {
+
+        // ── ARM9 step ────────────────────────────────────────────────
+        uint32_t c0;
+        if (!arm9.halted) {
+            c0 = runCpu(core, 0, false);
+            if (c0 == 0) c0 = CYCLES_PER_INSN_ARM9;   // safety: never stall clock
+        } else {
+            // ARM9 halted: still advance master clock so ARM7 and events
+            // are not starved.  One ARM9 cycle = minimum quantum.
+            c0 = CYCLES_PER_INSN_ARM9;
+        }
+
+        // ── ARM7 step ────────────────────────────────────────────────
+        // ARM7 runs at half the ARM9 rate. We run one ARM7 instruction per
+        // ARM9 instruction; each ARM7 instruction costs 2 master cycles, which
+        // is exactly c0 = CYCLES_PER_INSN_ARM9 = 2.  ARM7 does NOT add to c0.
+        if (!arm7.halted) {
+            runCpu(core, 1, false);
+        }
+        // (If ARM7 halted, no step needed — IRQ will unhalt it via tickInline.)
+
+        // ── Tick scheduler ───────────────────────────────────────────
+        // FIX: tick INSIDE the loop so events (IPCSYNC, DMA, scanline,
+        // interrupts) fire at the correct time relative to both CPUs.
+        tickInline(core, c0);
     }
 
-    // Always advance at least one scanline so events fire on time.
-    // If both CPUs were halted, still advance so IRQs can fire.
-    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
-    tickInline(core,charge);
     logStatus(core);
 }
 
-void runJitGba(Core& core){
-    if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
+void JitPpc::runJitGba(Core& core) {
+    if (!g_jitLive || !codeBuf) { Interpreter::runCoreSingle<true, 0>(core); return; }
 
-    // GBA mode: only cpu1 (ARM7) runs. cpu0 is permanently halted.
-    // Must always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
-    uint32_t acc=0;
-    for(int i=0;i<ITERS_GBA;i++){
-        uint32_t c=runCpu(core,1,true);
-        // When halted (HALT opcode waiting for IRQ), charge 1 cycle so
-        // the accumulator reflects time passing — otherwise the floor
-        // never gets reached and the VBlank IRQ never fires.
-        acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
+    // GBA mode: only ARM7 (cpu1) runs; cpu0 is permanently halted (halt bit 2).
+    Interpreter& interp = core.interpreter[1];
+
+    // ── Handle HALT at entry (waiting for VBlank / IRQ) ─────────────
+    // FIX: when the CPU is already halted we must explicitly advance the
+    // master clock to the next scheduled event so the VBlank/HBlank/timer
+    // IRQ can fire and unhalt the CPU.  Without this the CPU spins forever
+    // because tickInline(FLOOR) at the end of the loop was the only thing
+    // advancing time, and with per-step ticking a halted CPU contributes
+    // zero cycles, so the floor was never reached.
+    if (interp.halted) {
+        uint32_t delta = FLOOR_CYCLES_GBA;   // sensible default
+        if (!core.events.empty()) {
+            uint32_t next = core.events.front().cycles;
+            if (next > core.globalCycles)
+                delta = next - core.globalCycles;
+            else
+                delta = 1;
+        }
+        // Cap so we don't jump multiple frames at once.
+        static const uint32_t MAX_HALT_DELTA = FLOOR_CYCLES_GBA * 2;
+        if (delta > MAX_HALT_DELTA) delta = MAX_HALT_DELTA;
+        tickInline(core, delta);
+        logStatus(core);
+        return;     // re-evaluate halt/run state on next call
     }
 
-    uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
-    tickInline(core,charge);
+    // ── Normal execution ─────────────────────────────────────────────
+    for (int i = 0; i < ITERS_GBA; i++) {
+
+        if (interp.halted) {
+            // CPU halted mid-loop (e.g. executed HALT opcode).
+            // Jump to next event so the IRQ fires immediately.
+            uint32_t delta = 1;
+            if (!core.events.empty()) {
+                uint32_t next = core.events.front().cycles;
+                if (next > core.globalCycles)
+                    delta = next - core.globalCycles;
+            }
+            static const uint32_t MAX_HALT_DELTA = FLOOR_CYCLES_GBA * 2;
+            if (delta > MAX_HALT_DELTA) delta = MAX_HALT_DELTA;
+            tickInline(core, delta);
+            break;     // don't keep iterating; re-evaluate on next call
+        }
+
+        uint32_t c = runCpu(core, 1, true);
+        if (c == 0) c = CYCLES_PER_INSN_ARM7;   // safety
+
+        // FIX: tick INSIDE the loop — VBlank/HBlank events must fire at
+        // the correct cycle boundary, not after 32 instructions have run.
+        tickInline(core, c);
+    }
+
     logStatus(core);
 }
 
