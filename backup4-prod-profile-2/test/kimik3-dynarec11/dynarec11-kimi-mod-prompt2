@@ -73,7 +73,7 @@ executeBlock_asm:
 
     .size executeBlock_asm, .-executeBlock_asm
 
-// jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
+// jit_ppc.cpp   
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -932,7 +932,7 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
     if((op&0x0DB0F000)==0x0320F000){
         uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
         if(rot)imm=(imm>>rot)|(imm<<(32-rot));
-        imm&=0xFF000000u;  // only flags field
+        imm&=0xFF000000u;  
         size_t si=emitCondSkip(ctx,cond);
         ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));  
         ctx.li(TA,imm);
@@ -1366,19 +1366,15 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
         }
         interp.jitRunOpcode();
         return cycPerInsn;
-
     }else{
         ls.fbPC   =0xFFFFFFFFu;
         ls.fbCount=0;
         ls.fbDumped=false;
-
         if(normSpinDetect(ls,pc,expc)){
             const uint32_t spinA=ls.normBurstPC;
             const uint32_t spinB=ls.normBurstExit;
-
             DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
             ls.normBursting=true;
-
             bool escaped=false;
             for(int i=0;i<SPIN_STEPS;i++){
                 if(interp.halted){escaped=true;break;}
@@ -1393,21 +1389,16 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                     break;
                 }
             }
-
             resetNormSpin(ls);
-
             if(!escaped){
                 DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
             }
-
             return cycPerInsn;
         }
-
         uint32_t n=b->insnCount>0?b->insnCount:1u;
         return n*cycPerInsn;
     }
 }
-
 static uint32_t g_statusTick=0;
 static void logStatus(Core& core){
     g_statusTick++;
@@ -1421,7 +1412,6 @@ static void logStatus(Core& core){
              (int)core.interpreter[1].halted,
              core.fps,core.globalCycles);
 }
-
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
     uint32_t acc0=0;
@@ -1429,12 +1419,10 @@ void runJitNds(Core& core){
         acc0 += runCpu(core,0,false);  
         runCpu(core,1,false);          
     }
-
     uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
     tickInline(core,charge);
     logStatus(core);
 }
-
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
@@ -1443,12 +1431,10 @@ void runJitGba(Core& core){
         uint32_t c=runCpu(core,1,true);
         acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
     }
-
     uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
     tickInline(core,charge);
     logStatus(core);
 }
-
 bool initJit(Core* core){
     g_jitLive=false;codeBuf=nullptr;
     void* raw=memalign(32,JIT_BYTES);
@@ -1486,7 +1472,6 @@ bool initJit(Core* core){
     if(core)core->setRunFunc(core->gbaMode?runJitGba:runJitNds);
     return true;
 }
-
 void shutdownJit(Core* core){
     DebugLog("[JIT] shutdown fb0=%u fb1=%u jit0=%u jit1=%u\n",
              g_totalFB[0],g_totalFB[1],g_totalJIT[0],g_totalJIT[1]);
@@ -1497,7 +1482,6 @@ void shutdownJit(Core* core){
     codeBuf=nullptr;codePos=0;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
 }
-
 void invalidateJitRange(uint32_t start,uint32_t end){
     for(size_t i=0;i<CSIZ;i++)
         if(cache[i].valid&&cache[i].armPC>=start&&cache[i].armPC<end)
