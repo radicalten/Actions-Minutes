@@ -318,7 +318,36 @@
     BUT WAIT — BUG: for BLX, emitCommitExit(ctx,tgt&~1u,...) — they masked tgt&=~3u first ✓. But commit's JitHelp_commit writes CPSR then setPC — setPC flushes pipeline based on T bit ✓.
     44. Thumb emitT_hiReg MOV with rd==15? rejected? if(rd==15){ if(o==1)return false; ...BX_target } — MOV rd=15 falls into the rd==15 path: o==2: TA=rs... then if(o==0){add curPC+4} else (o==2) TA stays; then BX_target — MOV pc, rs: does NOT change thumb state from bit0! MOV to PC in Thumb: bit 0 of value... Actually Thumb MOV pc: bit0 must be 1 (interworking only via BX/BLX/POP). The value's bit 0 ignored; stays thumb. Their BX_target path takes bit0 → could switch to ARM — technically wrong for MOV, but compilers don't emit MOV pc with even addresses. Minor.
 
-    Also ADD rd=15 in Thumb (o==0): handled: adds curPC+4... wait for rd==15, o==0: if(rs==15)ctx.li(TA,curPC+4);else mr(TA,RA[rs]); if(o==0){ctx.li(TB,curPC+4);ctx.E(ppc_add(TA,TB,TA));} — hmm ADD pc, rs should be (PC+4) + rs. TA=rs, TB=curPC+4, TA=TB+TA ✓. But what about "ADD rd, pc" where rd!=15? rs==15 → TA=curPC+4 ✓ (PC+4 for thumb ✓ aligned? For thumb hi-reg ADD with rs=15: value = (PC+4) & ~2? ARMv4T: reading R15 in thumb gives PC+4 with bit... "the value read is the address of the instruction + 4, with bit 1 forced to 0"? Hmm: Thumb ADD (hi-reg) reading PC: the value is (addr+4) with bits [1:0] = 0? ARM ARM: "R15 reads as the address of the current instruction plus 4, with bits[1:0]... for ADD/CMP/MOV
+    Also ADD rd=15 in Thumb (o==0): handled: adds curPC+4... wait for rd==15, o==0: if(rs==15)ctx.li(TA,curPC+4);else mr(TA,RA[rs]); if(o==0){ctx.li(TB,curPC+4);ctx.E(ppc_add(TA,TB,TA));} — hmm ADD pc, rs should be (PC+4) + rs. TA=rs, TB=curPC+4, TA=TB+TA ✓. But what about "ADD rd, pc" where rd!=15? rs==15 → TA=curPC+4 ✓ (PC+4 for thumb ✓ aligned? For thumb hi-reg ADD with rs=15: value = (PC+4) & ~2? ARMv4T: reading R15 in thumb gives PC+4 with bit... "the value read is the address of the instruction + 4, with bit 1 forced to 0"? Hmm: Thumb ADD (hi-reg) reading PC: the value is (addr+4) with bits [1:0] = 0? ARM ARM: "R15 reads as the address of the current instruction plus 4, with bits[1:0]... for ADD/CMP/MOV high registers, reading R15: value has bit [1] = 0"? Actually: BX uses bit0 for state. For ALU ops reading PC in Thumb state, the value is the address of the instruction + 4, with bit [1] cleared? I recall: "When R15 is read... in Thumb state, the value is the address of the instruction plus 4, with bit 1 = 0". Hmm, actually bit 0 reads as 0 always; bit 1... For LDR literal they align &~3 ✓. For ADD rd,pc: should be (pc+4)&~2. They use curPC+4 unaligned — since curPC is halfword aligned, curPC+4 has bit1 possibly set. Rare usage; skip.
+    45. Thumb ALU flags: emitT_alu case 9 (NEG): addi(TA,0,0); subfc(d,s,TA) — wait NEG rd, rs = 0 - rs. subfc(d, s, TA)?? subfc(d,a,b) = b - a. They call ppc_subfc(d,s,TA) = TA - s = 0 - rs ✓. setV_sub(ctx,d,TA,s) ✓.
+
+    case 10 (CMP): subfc(TA, s, TB) = TB - s = rd - rs ✓ (TB=rd saved). ✓.
+
+    case 2-4 shifts: LSL rd,rs: slw with full rs value — ARM uses rs&0xFF ✓ PPC uses low 6 bits + if bit5... hmm slw: shift amount = rs[26:31] (low 6 bits); if rs[26] (value 32-63) → result 0. If rs has bit 6 set (64+)? PPC slw uses low 6 bits only → 64 → shift 0! ARM: 64 → 0. MISMATCH for shifts >= 64. Rare. Also carry flag NOT set for these shifts (setNZ only) — ARM requires C set from shift. Thumb LSL/LSR/ASR/ROR set C! Their emitT_alu cases 2,3,4,7 don't set C — but since C is broken anyway... The interpreter fallback... no wait these are JIT'd. Flags incomplete — after fixing setC_imm, should add carry for these. Minor compared to C/V always 0.
+
+    case 5 ADC: adde with primeCarry ✓ V via setV_add (approx for carry-in: a+b+C overflow differs when C=1 — close enough mostly).
+
+    case 6 SBC: subfe(d, s, TB) = ~s + TB + CA = TB - s - 1 + CA ✓.
+    46. emitT_imm8 MOV: sets NZ ✓ (MOV imm8 sets N,Z, preserves C ✓ they don't touch C ✓).
+    47. emitT_shifts sets C via setC_imm ✓ (once fixed).
+    48. NOW — the OTHER potentially fatal bug: executeBlock_asm uses bctrl — and JIT blocks internally use call() = mtctr r11; bctrl — CTR is caller-saved, fine.
+    49. tickInline erases from a std::vector from within event callbacks — reentrancy: tasks may schedule new events (insert) — iterators invalidated? tickInline copies front, erases (invalidates iterators but they re-access front each loop) ✓. But events.erase(begin()) while a task's schedule() inserts — after erase, next loop reads front fresh ✓.
+    50. runCpu cycle return for EXIT_NORMAL: n*cycPerInsn where n = insnCount — ARM9 2 cycles/insn is rough but OK.
+    51. runJitNds doesn't tick ARM7 time separately — timing skew (ARM7 runs at same wall rate). NooDS interpreter runs both with own cycle counts vs globalCycles. The JIT's tickInline only fires scheduler events; timers for ARM7 (TIMER7_OVERFLOW) are scheduled in globalCycles — globalCycles advances via charge (ARM9 cycles + floor). ARM7 executes ~same #instructions as ARM9 per call but its cycles aren't added — that's fine since only one global clock.
+
+    BUT — IPCSYNC/FIFO IRQs are triggered inside memory.write handlers, which run synchronously ✓.
+    52. Halted CPUs: runCpu returns 0 if halted ✓; floor keeps time moving; when interrupt unhalts, updateRun is called (interrupt → unhalt → updateRun?) — in NooDS, sendInterrupt/unhalt triggers core->updateRun() to switch run function. updateRun with jitAvailable picks runJitNds again ✓. BUT NOTE: updateRun sets running=0! Look:
+    cpp
+
+    void Core::updateRun() {
+        ...
+        runFunc = newFunc;
+        PPCIrqState st = PPCIrqLockByMsr();
+        running = 0;
+        PPCIrqUnlockByMsr(st);
+    }
+
+    It sets running=0 — meaning the outer main loop (which presumably loops while(core->running) core->runCore();) will STOP after updateRun is called from within a run! That's by design in NooDS (running=0 forces the frame loop to restart with new runFunc — the outer loop re-checks and resumes). In NooDS desktop, runCore is called from a loop that checks running. The status log shows updateRun being called repeatedly in GBA mode ([STATUS] updateRun: ... halt1=0 -> func=0x8006fa44 alternating with halt1=1 -> func=0x800454d4) — the function toggles between runJitGba and runCoreSingle?? Wait: func=0x8006fa44 vs func=0x800454d4 — two different functions. When halt1=1 (ARM7 halted), updateRun picks... interpreter[0].halted && interpreter[1].halted → runCoreNone
 
     Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. (Do not spend all your budget thinking, save some for writing a solution)
 
