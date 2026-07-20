@@ -1,14 +1,9 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 4:
-// 1. MSR: implement full control-field (mask=1,3,9,b,f) mode switches via fallback
-//    The key fix: MSR with control bits must be handled — emit fallback so
-//    interpreter does the mode switch with correct banked register swap.
-// 2. GBA spin at VBlank wait: detect the single-instruction B . loop and
-//    run the interpreter for a full scanline worth of cycles before resuming JIT.
-// 3. NDS: ARM7 stuck waiting for IPCSYNC — the MSR mode switch fallback
-//    was clobbering state; fix by always falling back MSR with control bits.
-// 4. NDS cycle accounting: ARM7 cycles must pace correctly relative to ARM9.
-// 5. GBA: when burst escapes and immediately re-enters, use longer burst window.
+// Fixed revision 5:
+// 1. Slice-Accurate Event Prediction: Run local CPU cycles up to the next 
+//    scheduled event cycle. Reduces scheduler overhead from O(N) per block to O(1) per event.
+// 2. Self-Loop Fast-Forwarding: Fast-forwards single-instruction self-loops (b .)
+//    directly to the next event to eliminate JIT/Interpreter thrashing entirely.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -38,19 +33,9 @@ static int      g_exitReason[2]= {};
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 
-static const int ITERS_NDS = 32;
-static const int ITERS_GBA = 32;
-
-// Floor: one scanline worth of cycles per runJit* call.
-// NDS: 355*6 = 2130 ARM9 cycles
-// GBA: 308*4 = 1232 cycles
+// Floor limits: one scanline worth of cycles per runJit* call.
 static const uint32_t FLOOR_CYCLES_NDS = 2130;
 static const uint32_t FLOOR_CYCLES_GBA = 1232;
-
-// Spin detection
-static const uint32_t SPIN_THRESH   = 6;
-static const int      SPIN_STEPS    = 256;  // increased for GBA VBlank wait
-static const uint32_t SPIN_CYC_STEP = 4;
 
 // ── Frame layout ──────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
@@ -94,66 +79,6 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
     }
     if (thumb) DebugLog("[JIT] thumb FB cpu%d pc=%08X op=%04X\n", cpu, pc, op);
     else       DebugLog("[JIT] arm   FB cpu%d pc=%08X op=%08X\n", cpu, pc, op);
-}
-
-// ── Loop detector ─────────────────────────────────────────────────────
-struct LoopState {
-    uint32_t fbPC    = 0xFFFFFFFFu;
-    uint32_t fbCount = 0;
-    bool     fbDumped= false;
-
-    uint32_t normHist[4]  = {0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu};
-    uint32_t normCount    = 0;
-    uint32_t normBurstPC  = 0xFFFFFFFFu;
-    uint32_t normBurstExit= 0xFFFFFFFFu;
-    bool     normBursting = false;
-};
-static LoopState s_loop[2];
-
-static void resetNormSpin(LoopState& ls) {
-    for(int j=0;j<4;j++) ls.normHist[j]=0xFFFFFFFFu;
-    ls.normCount     = 0;
-    ls.normBurstPC   = 0xFFFFFFFFu;
-    ls.normBurstExit = 0xFFFFFFFFu;
-    ls.normBursting  = false;
-}
-
-static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
-    if(ls.normBursting) return false;
-
-    ls.normHist[3] = ls.normHist[2];
-    ls.normHist[2] = ls.normHist[1];
-    ls.normHist[1] = ls.normHist[0];
-    ls.normHist[0] = exitPC;
-
-    if(exitPC == entryPC){
-        ls.normCount++;
-        if(ls.normCount >= SPIN_THRESH){
-            ls.normBurstPC   = entryPC;
-            ls.normBurstExit = exitPC;
-            return true;
-        }
-        return false;
-    }
-
-    if(ls.normHist[0] != 0xFFFFFFFFu &&
-       ls.normHist[1] != 0xFFFFFFFFu &&
-       ls.normHist[2] != 0xFFFFFFFFu &&
-       ls.normHist[3] != 0xFFFFFFFFu &&
-       ls.normHist[0] == ls.normHist[2] &&
-       ls.normHist[1] == ls.normHist[3] &&
-       ls.normHist[0] != ls.normHist[1]){
-        ls.normCount++;
-        if(ls.normCount >= SPIN_THRESH){
-            ls.normBurstPC   = ls.normHist[1];
-            ls.normBurstExit = ls.normHist[0];
-            return true;
-        }
-        return false;
-    }
-
-    ls.normCount = 0;
-    return false;
 }
 
 namespace JitPpc {
@@ -392,7 +317,6 @@ int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
     return 0;
 }
 
-// CPSR written before setPC so flushPipeline sees correct thumb bit
 int JitHelp_commit(Interpreter* interp,int cpu,
                    uint32_t* regs,uint32_t cpsr,
                    uint32_t pc,int reason){
@@ -1288,6 +1212,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
     if(!interp.isReady()){
         interp.jitRunOpcode();
+        addCpuCycles(interp, cycPerInsn);
         return cycPerInsn;
     }
 
@@ -1295,16 +1220,13 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
     if(pc==0xFFFFFFFFu){
         interp.jitRunOpcode();
+        addCpuCycles(interp, cycPerInsn);
         return cycPerInsn;
     }
 
     if(!validPC(pc,gba)){
-        static uint32_t lastBadPC[2]={0u,0u};
-        if(pc!=lastBadPC[cpu]){
-            DebugLog("[JIT] cpu%d bad PC %08X\n",cpu,pc);
-            lastBadPC[cpu]=pc;
-        }
         interp.jitRunOpcode();
+        addCpuCycles(interp, cycPerInsn);
         return cycPerInsn;
     }
 
@@ -1315,6 +1237,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     if(!b||!b->code||b->nW<16||
        b->code<codeBuf||b->code+b->nW>codeBuf+JIT_WORDS){
         interp.jitRunOpcode();
+        addCpuCycles(interp, cycPerInsn);
         return cycPerInsn;
     }
 
@@ -1324,106 +1247,28 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     const uint32_t expc  =g_exitPC[cpu];
     g_totalJIT[cpu]++;
 
-    DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
-             cpu,pc,expc,reason,interp.getCpsrRef());
-
-    LoopState& ls=s_loop[cpu];
+    // Single-instruction infinite loop detected (b .)
+    // Fast-forward this CPU directly to the next scheduled event cycle.
+    if(expc == pc){
+        uint32_t nextEventCycles = core.events.front().cycles;
+        if(nextEventCycles > core.globalCycles){
+            uint32_t diff = nextEventCycles - core.globalCycles;
+            addCpuCycles(interp, diff);
+            return diff;
+        }
+        addCpuCycles(interp, cycPerInsn);
+        return cycPerInsn;
+    }
 
     if(reason==EXIT_FALLBACK){
-        if(!ls.normBursting) resetNormSpin(ls);
-
-        // Account for JIT blocks executed prior to fallback exit
-        uint32_t jit_insns = (expc >= pc) ? (expc - pc) / (interp.isThumb() ? 2u : 4u) : 0u;
-        uint32_t jit_cycles = jit_insns * cycPerInsn;
-        addCpuCycles(interp, jit_cycles);
-
-        if(ls.fbPC==expc){
-            ls.fbCount++;
-            if(ls.fbCount==SPIN_THRESH&&!ls.fbDumped){
-                ls.fbDumped=true;
-                DebugLog("[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
-                         cpu,expc,interp.getCpsrRef(),(int)interp.isThumb());
-                int stride=interp.isThumb()?2:4;
-                for(int k=-2;k<=4;k++){
-                    uint32_t a=expc+(uint32_t)(k*stride);
-                    uint32_t w=interp.isThumb()
-                        ?(uint32_t)core.memory.read<uint16_t>(arm7,a)
-                        :core.memory.read<uint32_t>(arm7,a);
-                    DebugLog("[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
-                }
-                uint32_t** regs=interp.getRegisters();
-                if(regs)for(int i=0;i<15;i++)if(regs[i])DebugLog("[JIT]   r%d=%08X\n",i,*regs[i]);
-            }
-            if(ls.fbCount>=SPIN_THRESH){
-                uint32_t spin_cycles = 0;
-                for(int i=0;i<SPIN_STEPS;i++){
-                    if(interp.halted)break;
-                    interp.jitRunOpcode();
-                    spin_cycles += cycPerInsn;
-                    tickInline(core,SPIN_CYC_STEP);
-                    if(interp.halted)break;
-                    uint32_t newPC=interp.getActualPC();
-                    if(newPC!=expc){
-                        DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",cpu,newPC,i+1);
-                        ls.fbPC=0xFFFFFFFFu;ls.fbCount=0;ls.fbDumped=false;
-                        resetNormSpin(ls);
-                        break;
-                    }
-                }
-                return jit_cycles + spin_cycles;
-            }
-        }else{
-            if(ls.fbDumped)DebugLog("[JIT] SPIN cpu%d escaped to %08X\n",cpu,expc);
-            ls.fbPC   =expc;
-            ls.fbCount=1;
-            ls.fbDumped=false;
-        }
         interp.jitRunOpcode();
-        return jit_cycles + cycPerInsn;
-
+        addCpuCycles(interp, cycPerInsn);
+        return cycPerInsn;
     }else{
-        ls.fbPC   =0xFFFFFFFFu;
-        ls.fbCount=0;
-        ls.fbDumped=false;
-
         uint32_t n=b->insnCount>0?b->insnCount:1u;
-        uint32_t jit_cycles = n*cycPerInsn;
-        addCpuCycles(interp, jit_cycles);
-
-        if(normSpinDetect(ls,pc,expc)){
-            const uint32_t spinA=ls.normBurstPC;
-            const uint32_t spinB=ls.normBurstExit;
-
-            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
-            ls.normBursting=true;
-
-            bool escaped=false;
-            uint32_t spin_cycles = 0;
-            for(int i=0;i<SPIN_STEPS;i++){
-                if(interp.halted){escaped=true;break;}
-                interp.jitRunOpcode();
-                spin_cycles += cycPerInsn;
-                tickInline(core,SPIN_CYC_STEP);
-                if(interp.halted){escaped=true;break;}
-                uint32_t newPC=interp.getActualPC();
-                if(newPC!=spinA&&newPC!=spinB){
-                    DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
-                             cpu,spinA,newPC,i+1);
-                    escaped=true;
-                    break;
-                }
-            }
-
-            resetNormSpin(ls);
-
-            if(!escaped){
-                DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
-            }
-
-            return jit_cycles + spin_cycles;
-        }
-
-        return jit_cycles;
+        uint32_t cycles = n*cycPerInsn;
+        addCpuCycles(interp, cycles);
+        return cycles;
     }
 }
 
@@ -1445,7 +1290,7 @@ static void logStatus(Core& core){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Run functions (Optimized cycle-accurate schedulers)
+// Run functions (Streamlined slice-accurate schedulers)
 // ═══════════════════════════════════════════════════════════════════════
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
@@ -1453,37 +1298,44 @@ void runJitNds(Core& core){
     Interpreter& interp0 = core.interpreter[0];
     Interpreter& interp1 = core.interpreter[1];
 
-    uint32_t startCycles = core.globalCycles;
-    uint32_t targetCycles = startCycles + FLOOR_CYCLES_NDS;
+    // Predict standard time segment until the next scheduled event cycle
+    uint32_t nextEventCycles = core.events.front().cycles;
+    uint32_t sliceCycles = (nextEventCycles > core.globalCycles) ? (nextEventCycles - core.globalCycles) : 1u;
+    if (sliceCycles > FLOOR_CYCLES_NDS) {
+        sliceCycles = FLOOR_CYCLES_NDS;
+    }
 
-    while (core.globalCycles < targetCycles) {
-        if (interp0.halted && interp1.halted) {
-            uint32_t diff = targetCycles - core.globalCycles;
-            tickInline(core, diff);
+    uint32_t acc0=0; // Accumulated CPU0 (ARM9) cycles
+    uint32_t acc1=0; // Accumulated CPU1 (ARM7) cycles
+
+    while(acc0 < sliceCycles){
+        if(interp0.halted && interp1.halted){
+            acc0 = sliceCycles;
             break;
         }
 
-        // Compare execution cycles. ARM7 frequency is half of ARM9.
-        uint32_t cyc0 = getCpuCycles(interp0);
-        uint32_t cyc1 = getCpuCycles(interp1) * 2; 
+        uint32_t cyc9 = acc0;
+        uint32_t cyc7 = acc1 * 2; 
 
         if (interp0.halted) {
             uint32_t c1 = runCpu(core, 1, false);
-            tickInline(core, c1 * 2);
+            acc1 += c1;
+            acc0 += c1 * 2;
         } else if (interp1.halted) {
             uint32_t c0 = runCpu(core, 0, false);
-            tickInline(core, c0);
+            acc0 += c0;
         } else {
-            // Run whichever processor has fallen behind
-            if (cyc0 <= cyc1) {
+            if (cyc9 <= cyc7) {
                 uint32_t c0 = runCpu(core, 0, false);
-                tickInline(core, c0);
+                acc0 += c0;
             } else {
-                runCpu(core, 1, false);
+                uint32_t c1 = runCpu(core, 1, false);
+                acc1 += c1;
             }
         }
     }
 
+    tickInline(core, acc0);
     logStatus(core);
 }
 
@@ -1491,26 +1343,30 @@ void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
     Interpreter& interp1 = core.interpreter[1];
-    uint32_t startCycles = core.globalCycles;
-    uint32_t targetCycles = startCycles + FLOOR_CYCLES_GBA;
 
-    while (core.globalCycles < targetCycles) {
-        if (interp1.halted) {
-            // CPU is halted waiting for VBlank/Timers: advance system time
-            uint32_t diff = targetCycles - core.globalCycles;
-            tickInline(core, diff);
-            addCpuCycles(interp1, diff);
-            break;
-        }
-
-        uint32_t c1 = runCpu(core, 1, true);
-        if (c1 > 0) {
-            tickInline(core, c1);
-        } else {
-            tickInline(core, 1);
-        }
+    uint32_t nextEventCycles = core.events.front().cycles;
+    uint32_t sliceCycles = (nextEventCycles > core.globalCycles) ? (nextEventCycles - core.globalCycles) : 1u;
+    if (sliceCycles > FLOOR_CYCLES_GBA) {
+        sliceCycles = FLOOR_CYCLES_GBA;
     }
 
+    if (interp1.halted) {
+        tickInline(core, sliceCycles);
+        addCpuCycles(interp1, sliceCycles);
+        return;
+    }
+
+    uint32_t acc=0;
+    while(acc < sliceCycles){
+        if(interp1.halted){
+            acc = sliceCycles;
+            break;
+        }
+        uint32_t c1 = runCpu(core, 1, true);
+        acc += (c1 > 0)? c1 : 1;
+    }
+
+    tickInline(core, acc);
     logStatus(core);
 }
 
@@ -1533,12 +1389,6 @@ bool initJit(Core* core){
     g_totalFB[0]=g_totalFB[1]=0;
     g_totalJIT[0]=g_totalJIT[1]=0;
     g_statusTick=0;
-    s_loop[0]={};s_loop[1]={};
-    for(int j=0;j<4;j++){s_loop[0].normHist[j]=0xFFFFFFFFu;s_loop[1].normHist[j]=0xFFFFFFFFu;}
-    s_loop[0].fbPC=s_loop[1].fbPC=0xFFFFFFFFu;
-    s_loop[0].normBurstPC=s_loop[0].normBurstExit=0xFFFFFFFFu;
-    s_loop[1].normBurstPC=s_loop[1].normBurstExit=0xFFFFFFFFu;
-    s_loop[0].normBursting=s_loop[1].normBursting=false;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
     memset(g_exitPC,  0,sizeof g_exitPC);
     memset(g_exitCPSR,0,sizeof g_exitCPSR);
