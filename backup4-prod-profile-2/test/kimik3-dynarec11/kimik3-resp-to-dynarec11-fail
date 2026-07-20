@@ -383,7 +383,33 @@
     }
 
     Wait — rotate: overflow bit at PPC bit 0; want PPC bit 3; rotate left 29: 0 -> (0-29) mod32 = 3 ✓ mask 3,3. The original code did TWO rlwinm (isolate then rotate) — can keep both but fix final mask: rlwinm(TE,TE,0,0,0); rlwinm(TE,TE,29,3,3); — but wait, the second rotates the whole register; bits other than 0 don't matter due to mask 3,3 ✓. Also can drop the isolate. I'll present minimal fixes keeping their structure:
-        setC_xer: rlwinm(TA,TA,0,29,29)
+        setC_xer: rlwinm(TA,TA,0,29,29) → rlwinm(TA,TA,0,2,2)
+        setC_imm: rlwinm(TA,cr,29,29,29) → rlwinm(TA,cr,29,2,2)
+        setV_add/sub: rlwinm(TE,TE,29,28,28) → rlwinm(TE,TE,29,3,3)
+
+    Double check setC_imm rotation direction: TC bit PPC31 (carry). rotl 29: bit p -> (p-29) mod 32 = 31-29=2 ✓ mask 2,2 ✓.
+
+    setV: TE has sign at PPC0. rotl 29: (0-29)%32 = 3 ✓ mask 3,3 ✓.
+
+    SECONDARY BUGS to mention:
+
+    Bug B: RSC emits same as SBC — case SBC: case RSC: ppc_subfe(res,TA,srcRn) → RSC should be ppc_subfe(res,srcRn,TA). Also setV for RSC should be setV_sub(res, opB, opA) — they already pass swapped for RSB/RSC ✓ for the V call. Fix the compute.
+
+    Bug C: Thumb ALU shifts (LSL/LSR/ASR/ROR register) and MUL don't set C — and more importantly emitT_alu doesn't set C for shift cases. And register-shifter ARM data processing doesn't set C (emitShifter reg path returns false → C unchanged, but ARM sets C). Given C was always 0 before, games may now misbehave subtly — mention.
+
+    Bug D: JitHelp_commit / MSR: emitMrsMsr's inline MSR_f path writes RCPSR but doesn't preserve... it's fine. But NOTE the MSR dispatcher mask bug: MSR immediate (0x0320F000) never matches (op&0x0F900000)==0x01000000 so always falls back — that's fine (safe) though slower; and MSR with control bits falls back ✓ as intended.
+
+    Bug E (potential hang contributor): runJitNds charges max(acc0, FLOOR) where acc0 counts only ARM9 — ARM7 cycle starvation/skew. Also the spin-burst runs the INTERPRETER for up to 256 steps with tickInline(4) each — during bursts, interrupt() can fire and change PC; loop checks halted only; newPC compared to spin PCs ✓ escapes.
+
+    Bug F: normSpinDetect misfires on normal two-address loops and the burst runs the interpreter even though interpreter stepping uses jitRunOpcode — which is... wait, interp.jitRunOpcode() — that's presumably one interpreted instruction. Fine.
+
+    Bug G — THE GBA-SPECIFIC ONE: In runJitGba, acc += (c>0)?c:CYCLES_PER_INSN_ARM7; — when runCpu returns 0 (halted) adds 1. Fine. But look at the EXC storm: could be caused by tickInline running the scheduler while core.interpreter[1] is mid-JIT? No.
+
+    Hmm — but is there something that breaks IRQ DELIVERY specifically in JIT mode? The interpreter's interrupt() is invoked via scheduler task ARM7_INTERRUPT, scheduled by... writes to IE/IF or by checkInterrupt in NooDS: In NooDS, Interpreter::sendInterrupt(bit) sets IRF and schedules ARM7_INTERRUPT at current globalCycles + 4? And interrupt() checks IME && (IE&IRF) && !I → exception. Should work.
+
+    One more potential show-stopper: validPC for GBA BIOS region allows 0x0000-0x3FFF ✓; but pc0=FFFF0000 for ARM9 in GBA mode — runJitGba never calls runCpu(0) ✓.
+
+    Bug H: hashPC collision between ARM9/ARM7/Thumb/ARM — slot stores thumb but NOT cpu/arm7/gba. A block compiled for ARM9 at pc X reused for ARM7 at same X would use wrong memory space (arm7 bool burned in) and wrong cpuIdx (exit reasons committed to wrong interpreter? cpuIdx stored in frame — FRAME_CPUIDX loaded → commit uses interp pointer — the interp pointer is burned at compile time! So cross-CPU reuse = catastrophic). Can it happen? ARM9 & ARM7 both executing at same PC value... DS: ARM9 executes from 0x02000000 main RAM & 0xFFFF0000 BIOS & ITCM. ARM7: 0x03800000/0x03000000 WRAM, 0x00000000 BIOS, ROM 0x08000000+ via... ARM7 can't execute from main RAM (0x02000000)? Actually ARM7 CANNOT access main RAM — correct, it's ARM9-only. Shared WRAM: ARM9 can map it to 0x03000000; ARM7 default at 0x03800000 (mirror 0x03000000?). If ARM9 runs code from 0x03000000 while ARM7 runs at same address — the cache slot compare s.armPC==armPC && s.thumb==thumb passes → WRONG CPU BLOCK. Also GBA mode flushes cache on enter ✓. But ARM7 BIOS at 0x00000018 etc. vs ARM9 at... ARM9 can't execute 0x00000000 (ITCM there). Possible overlap: both at 0x03800xxx? ARM9 can access ARM7 WRAM? ARM9 accesses shared WRAM
 
     Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. (Do not spend all your budget thinking, save some for writing a solution)
 
