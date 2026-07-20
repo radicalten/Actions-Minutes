@@ -814,16 +814,6 @@ executeBlock_asm:
     .size executeBlock_asm, .-executeBlock_asm
 
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 4:
-// 1. MSR: implement full control-field (mask=1,3,9,b,f) mode switches via fallback
-//    The key fix: MSR with control bits must be handled — emit fallback so
-//    interpreter does the mode switch with correct banked register swap.
-// 2. GBA spin at VBlank wait: detect the single-instruction B . loop and
-//    run the interpreter for a full scanline worth of cycles before resuming JIT.
-// 3. NDS: ARM7 stuck waiting for IPCSYNC — the MSR mode switch fallback
-//    was clobbering state; fix by always falling back MSR with control bits.
-// 4. NDS cycle accounting: ARM7 cycles must pace correctly relative to ARM9.
-// 5. GBA: when burst escapes and immediately re-enters, use longer burst window.
 
 #include "jit_ppc.h"
 #include "core.h"
