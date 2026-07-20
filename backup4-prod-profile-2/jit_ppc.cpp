@@ -1,9 +1,9 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 6:
-// 1. Critical Bug Fix: Only fast-forward infinite loops when reason == EXIT_NORMAL.
-//    This prevents JIT fallback blocks from getting permanently stuck on their 
-//    first instruction (e.g. CP15/MCR instructions).
-// 2. Maintained O(1) slice event scheduling and cycle-accurate interleaving.
+// Fixed revision 7:
+// 1. Progressive Cycle Interleaving: Updates core.globalCycles and ticks scheduled 
+//    hardware events progressively after every JIT block execution.
+// 2. Eradicates latency delays on HBlank interrupts, raster splits, and line scrolls.
+// 3. Retains infinite loop self-checks (only running on EXIT_NORMAL).
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -33,7 +33,7 @@ static int      g_exitReason[2]= {};
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 
-// Floor limits: one scanline worth of cycles per runJit* call.
+// Limit constraints: one scanline worth of cycles per runJit* call.
 static const uint32_t FLOOR_CYCLES_NDS = 2130;
 static const uint32_t FLOOR_CYCLES_GBA = 1232;
 
@@ -1249,7 +1249,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
     // Single-instruction infinite loop detected (b .)
     // Fast-forward this CPU directly to the next scheduled event cycle.
-    // CRITICAL FIX: Only apply to EXIT_NORMAL blocks so fallback opcodes can execute!
     if(reason == EXIT_NORMAL && expc == pc){
         uint32_t nextEventCycles = core.events.front().cycles;
         if(nextEventCycles > core.globalCycles){
@@ -1296,7 +1295,7 @@ static void logStatus(Core& core){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Run functions (Streamlined slice-accurate schedulers)
+// Run functions (Progressive cycle-accurate interleaving)
 // ═══════════════════════════════════════════════════════════════════════
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
@@ -1304,44 +1303,36 @@ void runJitNds(Core& core){
     Interpreter& interp0 = core.interpreter[0];
     Interpreter& interp1 = core.interpreter[1];
 
-    // Predict standard time segment until the next scheduled event cycle
-    uint32_t nextEventCycles = core.events.front().cycles;
-    uint32_t sliceCycles = (nextEventCycles > core.globalCycles) ? (nextEventCycles - core.globalCycles) : 1u;
-    if (sliceCycles > FLOOR_CYCLES_NDS) {
-        sliceCycles = FLOOR_CYCLES_NDS;
-    }
+    uint32_t targetCycles = core.globalCycles + FLOOR_CYCLES_NDS;
 
-    uint32_t acc0=0; // Accumulated CPU0 (ARM9) cycles
-    uint32_t acc1=0; // Accumulated CPU1 (ARM7) cycles
-
-    while(acc0 < sliceCycles){
-        if(interp0.halted && interp1.halted){
-            acc0 = sliceCycles;
+    // Progressive Event Interleaving Loop
+    while (core.globalCycles < targetCycles) {
+        if (interp0.halted && interp1.halted) {
+            uint32_t diff = targetCycles - core.globalCycles;
+            tickInline(core, diff);
             break;
         }
 
-        uint32_t cyc9 = acc0;
-        uint32_t cyc7 = acc1 * 2; 
+        uint32_t cyc9 = getCpuCycles(interp0);
+        uint32_t cyc7 = getCpuCycles(interp1) * 2; 
 
         if (interp0.halted) {
             uint32_t c1 = runCpu(core, 1, false);
-            acc1 += c1;
-            acc0 += c1 * 2;
+            tickInline(core, c1 * 2);
         } else if (interp1.halted) {
             uint32_t c0 = runCpu(core, 0, false);
-            acc0 += c0;
+            tickInline(core, c0);
         } else {
+            // Determine which processor has fallen behind and execute progressively
             if (cyc9 <= cyc7) {
                 uint32_t c0 = runCpu(core, 0, false);
-                acc0 += c0;
+                tickInline(core, c0); // Instantly advance master clock and dispatch events
             } else {
-                uint32_t c1 = runCpu(core, 1, false);
-                acc1 += c1;
+                runCpu(core, 1, false);
             }
         }
     }
 
-    tickInline(core, acc0);
     logStatus(core);
 }
 
@@ -1349,30 +1340,21 @@ void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
     Interpreter& interp1 = core.interpreter[1];
+    uint32_t targetCycles = core.globalCycles + FLOOR_CYCLES_GBA;
 
-    uint32_t nextEventCycles = core.events.front().cycles;
-    uint32_t sliceCycles = (nextEventCycles > core.globalCycles) ? (nextEventCycles - core.globalCycles) : 1u;
-    if (sliceCycles > FLOOR_CYCLES_GBA) {
-        sliceCycles = FLOOR_CYCLES_GBA;
-    }
-
-    if (interp1.halted) {
-        tickInline(core, sliceCycles);
-        addCpuCycles(interp1, sliceCycles);
-        return;
-    }
-
-    uint32_t acc=0;
-    while(acc < sliceCycles){
-        if(interp1.halted){
-            acc = sliceCycles;
+    while (core.globalCycles < targetCycles) {
+        if (interp1.halted) {
+            uint32_t diff = targetCycles - core.globalCycles;
+            tickInline(core, diff);
+            addCpuCycles(interp1, diff);
             break;
         }
+
         uint32_t c1 = runCpu(core, 1, true);
-        acc += (c1 > 0)? c1 : 1;
+        uint32_t cycles = (c1 > 0) ? c1 : 1u;
+        tickInline(core, cycles); // Immediately dispatch scanline offsets and HBlank events
     }
 
-    tickInline(core, acc);
     logStatus(core);
 }
 
