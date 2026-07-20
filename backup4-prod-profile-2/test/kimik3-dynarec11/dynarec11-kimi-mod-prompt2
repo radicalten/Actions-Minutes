@@ -316,9 +316,6 @@ public:
     volatile uint8_t running;
 
     std::vector<SchedEvent> events;
-
-    // Flat array of two-word callbacks — fits in two cache lines (32 tasks).
-    // Each entry is 12 bytes on 32-bit PPC: fn(4) + obj(4) + arg(4).
     SchedCallback tasks[MAX_TASKS];
 
     uint32_t globalCycles = 0;
@@ -329,12 +326,11 @@ public:
          int ndsStateFd = -1, int gbaStateFd = -1,
          int ndsCheatFd = -1);
 
-    ~Core();   // <-- add this line
+    ~Core();   
     void saveState(FILE* file);
     void loadState(FILE* file);
     void invalidateJitPage(uint32_t addr);
 
-    // Hot path: single load + indirect branch, no virtual dispatch.
     inline void runCore() { (*runFunc)(*this); }
 
     void setRunFunc(void (*f)(Core&)) {
@@ -347,7 +343,7 @@ public:
 
 private:
     bool realGbaBios;
-    bool jitAvailable = false;   // true when JIT code buffer is live
+    bool jitAvailable = false;  
     void (*runFunc)(Core&) = &Interpreter::runCoreNds;
 
     uint64_t lastFpsTimeTicks = 0;
@@ -356,44 +352,36 @@ private:
     void updateRun();
     void resetCycles();
 
-    // Core self-tasks (arg ignored)
     static void shim_updateRun   (void* o, int) { static_cast<Core*>(o)->updateRun();    }
     static void shim_resetCycles (void* o, int) { static_cast<Core*>(o)->resetCycles();  }
 
-    // CartridgeNds::wordReady(int cpu)  — arg = cpu index
     static void shim_cartWordReady(void* o, int a) {
         static_cast<CartridgeNds*>(o)->wordReady(a);
     }
 
-    // Dma::transfer(int channel)  — arg = channel
     static void shim_dmaTransfer(void* o, int a) {
         static_cast<Dma*>(o)->transfer(a);
     }
 
-    // Gpu scanlines (arg ignored)
     static void shim_gpuScanline256  (void* o, int) { static_cast<Gpu*>(o)->scanline256();     }
     static void shim_gpuScanline355  (void* o, int) { static_cast<Gpu*>(o)->scanline355();     }
     static void shim_gpuGbaScanline240(void* o, int) { static_cast<Gpu*>(o)->gbaScanline240(); }
     static void shim_gpuGbaScanline308(void* o, int) { static_cast<Gpu*>(o)->gbaScanline308(); }
 
-    // Gpu3D (arg ignored)
+    
     static void shim_gpu3dCommands(void* o, int) { static_cast<Gpu3D*>(o)->runCommands(); }
 
-    // Interpreter::interrupt (arg ignored)
     static void shim_interpreterInterrupt(void* o, int) {
         static_cast<Interpreter*>(o)->interrupt();
     }
 
-    // Spu (arg ignored)
     static void shim_spuSample   (void* o, int) { static_cast<Spu*>(o)->runSample();    }
     static void shim_spuGbaSample(void* o, int) { static_cast<Spu*>(o)->runGbaSample(); }
 
-    // Timers::overflow(int timer)  — arg = timer index
     static void shim_timersOverflow(void* o, int a) {
         static_cast<Timers*>(o)->overflow(a);
     }
 
-    // Wifi (arg ignored / arg = cmd)
     static void shim_wifiCountMs    (void* o, int)  { static_cast<Wifi*>(o)->countMs();          }
     static void shim_wifiTransmit(void* o, int a) {
     static_cast<Wifi*>(o)->transmitPacket(static_cast<PacketType>(a));
@@ -726,8 +714,6 @@ void Core::invalidateJitPage(uint32_t addr) {
 
 class Core;
 
-// Defined in jit_trampoline.S
-// Calls blockCode via bctrl so JIT block's mflr gets a valid PPC return address
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -806,18 +792,13 @@ static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 static const int ITERS_NDS = 32;
 static const int ITERS_GBA = 32;
 
-// Floor: one scanline worth of cycles per runJit* call.
-// NDS: 355*6 = 2130 ARM9 cycles
-// GBA: 308*4 = 1232 cycles
 static const uint32_t FLOOR_CYCLES_NDS = 2130;
 static const uint32_t FLOOR_CYCLES_GBA = 1232;
 
-// Spin detection
 static const uint32_t SPIN_THRESH   = 6;
-static const int      SPIN_STEPS    = 256;  // increased for GBA VBlank wait
+static const int      SPIN_STEPS    = 256;  
 static const uint32_t SPIN_CYC_STEP = 4;
 
-// ── Frame layout ──────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
 static const int FRAME_LR_OFF  = FRAME_SIZE + 4;
 static const int FRAME_SAVE    = 16;
@@ -836,7 +817,6 @@ static_assert(FRAME_SAVE + 18*4 == FRAME_CORE, "save map");
 static_assert(FRAME_REGSYNC + 15*4 == FRAME_CPSR, "regsync map");
 static_assert(FRAME_PC + 4 <= FRAME_SIZE,       "pc fits");
 
-// ── Debug ─────────────────────────────────────────────────────────────
 static const size_t FB_LOG_MAX = 512;
 struct FbEntry { uint32_t pc; uint32_t op; };
 static FbEntry  g_fbLog[FB_LOG_MAX];
@@ -861,7 +841,6 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
     else       DebugLog("[JIT] arm   FB cpu%d pc=%08X op=%08X\n", cpu, pc, op);
 }
 
-// ── Loop detector ─────────────────────────────────────────────────────
 struct LoopState {
     uint32_t fbPC    = 0xFFFFFFFFu;
     uint32_t fbCount = 0;
@@ -923,9 +902,6 @@ static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
 
 namespace JitPpc {
 
-// ═══════════════════════════════════════════════════════════════════════
-// PPC encoders
-// ═══════════════════════════════════════════════════════════════════════
 static inline uint32_t ppc_blr()  { return 0x4E800020u; }
 static inline uint32_t ppc_bctr(bool lk=false) {
     return (19u<<26)|(20u<<21)|(528u<<1)|(lk?1u:0u);
@@ -1040,9 +1016,6 @@ static const uint8_t RCPSR=29;
 static const uint8_t TA=3,TB=4,TC=5,TD=6,TE=7,TF=8,TG=9;
 static const uint8_t RCALL=11;
 
-// ═══════════════════════════════════════════════════════════════════════
-// Code buffer
-// ═══════════════════════════════════════════════════════════════════════
 static const size_t JIT_BYTES=2u*1024u*1024u;
 static const size_t JIT_WORDS=JIT_BYTES/4;
 static const size_t BLK_ARMS=8;
@@ -1078,9 +1051,6 @@ static void flushICache(uint32_t* p,size_t nW){
     ICInvalidateRange(p,nW*4);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Emit context
-// ═══════════════════════════════════════════════════════════════════════
 struct Ctx {
     uint32_t *base,*cur;
     size_t cap;
@@ -1116,9 +1086,6 @@ struct Ctx {
     void ldCpu()   {E(ppc_lwz(TB,FRAME_CPUIDX,1));}
 };
 
-// ═══════════════════════════════════════════════════════════════════════
-// C helpers
-// ═══════════════════════════════════════════════════════════════════════
 extern "C" {
 
 int JitHelp_testCond(uint32_t cpsr,uint32_t cond){
@@ -1157,7 +1124,6 @@ int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
     return 0;
 }
 
-// CPSR written before setPC so flushPipeline sees correct thumb bit
 int JitHelp_commit(Interpreter* interp,int cpu,
                    uint32_t* regs,uint32_t cpsr,
                    uint32_t pc,int reason){
@@ -1289,11 +1255,8 @@ void JitHelp_tick(Core* core,uint32_t cycles){
     }
 }
 
-} // extern "C"
+} 
 
-// ═══════════════════════════════════════════════════════════════════════
-// Prologue / Epilogue
-// ═══════════════════════════════════════════════════════════════════════
 static void emitPrologue(Ctx& ctx){
     ctx.E(ppc_mflr(0));
     ctx.E(ppc_stwu(1,-(int16_t)FRAME_SIZE,1));
@@ -1365,9 +1328,6 @@ static void emitCommitExitDyn(Ctx& ctx,int reason){
     emitEpilogue(ctx);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Condition skip
-// ═══════════════════════════════════════════════════════════════════════
 static size_t emitCondSkip(Ctx& ctx,uint8_t cond){
     if(cond==14||cond==15)return SIZE_MAX;
     ctx.E(ppc_mr(TA,RCPSR));
@@ -1385,9 +1345,6 @@ static void patchSkip(Ctx& ctx,size_t idx){
     ctx.base[idx]=ppc_bc(12,2,(int16_t)off);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Flag helpers
-// ═══════════════════════════════════════════════════════════════════════
 static void setNZ(Ctx& ctx,uint8_t r){
     ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,2,31));
     ctx.E(ppc_rlwimi(RCPSR,r,0,0,0));
@@ -1422,9 +1379,6 @@ static void primeCarry(Ctx& ctx){
     ctx.E(ppc_addic(0,TA,-1));
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Shifter
-// ═══════════════════════════════════════════════════════════════════════
 static void sLslI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
     if(i==0){if(d!=s)ctx.E(ppc_mr(d,s));if(sc)ctx.E(ppc_rlwinm(TC,RCPSR,3,31,31));}
     else if(i<32){if(sc)ctx.E(ppc_rlwinm(TC,s,(uint8_t)i,31,31));ctx.E(ppc_rlwinm(d,s,(uint8_t)i,0,(uint8_t)(31-i)));}
@@ -1488,9 +1442,6 @@ static bool emitShifter(Ctx& ctx,uint32_t op,uint8_t dst,bool sc){
     return false;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// ARM data-processing
-// ═══════════════════════════════════════════════════════════════════════
 enum DP{AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN};
 
 static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
@@ -1647,23 +1598,9 @@ static bool emitMul(Ctx& ctx,uint32_t op){
     patchSkip(ctx,si);return true;
 }
 
-// ── MSR/MRS ──────────────────────────────────────────────────────────
-// CRITICAL FIX: MSR with any control bits (mask & 0x7 != 0) changes the
-// CPU mode and swaps banked registers.  The JIT cannot do this safely
-// because it holds r0-r14 in fixed PPC registers that correspond to the
-// CURRENT mode's register file.  Attempting to patch CPSR in-place and
-// continue emitting would use the wrong register aliases.
-//
-// The correct solution is to fall back to the interpreter for ANY MSR
-// that touches control bits.  Only MSR that touches ONLY the flags field
-// (mask == 0x8, bits 31:24) is safe to handle inline because it doesn't
-// swap register banks.
-//
-// MRS is always safe (it reads CPSR/SPSR into a GPR, no mode switch).
 static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
 
-    // MRS Rd, CPSR  (0x010F0000 pattern)
     if((op&0x0FBF0FFF)==0x010F0000){
         uint8_t rd=(op>>12)&0xF;if(rd==15)return false;
         size_t si=emitCondSkip(ctx,cond);
@@ -1672,44 +1609,33 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         return true;
     }
 
-    // MRS Rd, SPSR  (0x014F0000 pattern) — always fall back (SPSR is mode-dependent)
     if((op&0x0FBF0FFF)==0x014F0000) return false;
 
-    // MSR — check the field mask
     uint8_t mask=(op>>16)&0xF;
 
-    // If control bits are involved (mask & 0x7), we MUST fall back to the
-    // interpreter because a mode switch swaps banked registers.
-    // This covers mask values: 0x1(c), 0x2(x), 0x3(cx), 0x4(s), 0x5(cs),
-    // 0x6(xs), 0x7(cxs), 0x9(cf), 0xB(cxf), 0xD(csf), 0xF(cxsf).
     if(mask & 0x7) return false;
 
-    // mask == 0x8: flags field only (bits 31:24) — safe to handle inline.
-    // MSR CPSR_f, #imm
     if((op&0x0DB0F000)==0x0320F000){
         uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
         if(rot)imm=(imm>>rot)|(imm<<(32-rot));
         imm&=0xFF000000u;  // only flags field
         size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));  // clear bits 31:24
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));  
         ctx.li(TA,imm);
         ctx.E(ppc_or(RCPSR,RCPSR,TA));
         patchSkip(ctx,si);
         return true;
     }
 
-    // MSR CPSR_f, Rm
     if((op&0x0DB0FFF0)==0x0120F000){
         uint8_t rm=op&0xF;if(rm==15)return false;
         size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));          // clear bits 31:24
-        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));              // keep only bits 31:24 of Rm
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));          
+        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));              
         ctx.E(ppc_or(RCPSR,RCPSR,TA));
         patchSkip(ctx,si);
         return true;
     }
-
-    // MSR SPSR_f — fall back (SPSR is mode-dependent)
     return false;
 }
 
@@ -1747,10 +1673,6 @@ static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
     if((op&0x0F000000)==0x0F000000)return false;
     if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)return emitBranch(ctx,op,curPC);
-    // MSR/MRS: handle the 0x01000000 space carefully.
-    // Note: some multiply instructions also fall in this space when bit 7
-    // and bit 4 are set — the dispatcher already checked for those above
-    // via the it==0 case, so here we only see genuine MRS/MSR.
     if((op&0x0F900000)==0x01000000){if(emitMrsMsr(ctx,op,curPC))return true;return false;}
     uint32_t it=(op>>25)&7;
     switch(it){
@@ -1766,9 +1688,6 @@ static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Thumb emitters
-// ═══════════════════════════════════════════════════════════════════════
 static bool emitT_shifts(Ctx& ctx,uint16_t op){
     uint8_t ty=(op>>11)&3,rd=op&7,rs=(op>>3)&7;int i=(op>>6)&0x1F;
     switch(ty){case 0:sLslI(ctx,RA[rd],RA[rs],i,true);break;case 1:sLsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;case 2:sAsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;default:return false;}
@@ -1944,9 +1863,6 @@ static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Address validation
-// ═══════════════════════════════════════════════════════════════════════
 static bool validPC(uint32_t pc, bool gba) {
     pc &= ~1u;
     if (pc >= 0x80000000u) return false;
@@ -1966,9 +1882,6 @@ static bool validPC(uint32_t pc, bool gba) {
            (pc >= 0xFFFF0000u);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Compile
-// ═══════════════════════════════════════════════════════════════════════
 static JitBlock* compile(Interpreter* interp,Core* core,
                           uint32_t armPC,bool arm7,int cpuIdx){
     if(!codeBuf||!g_jitLive||!interp||!core)return nullptr;
@@ -2034,9 +1947,6 @@ static JitBlock* compile(Interpreter* interp,Core* core,
     codePos+=wds;return &slot;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Inline scheduler tick
-// ═══════════════════════════════════════════════════════════════════════
 static inline void tickInline(Core& core,uint32_t cycles){
     core.globalCycles+=cycles;
     while(!core.events.empty()&&
@@ -2048,9 +1958,6 @@ static inline void tickInline(Core& core,uint32_t cycles){
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Per-CPU runner
-// ═══════════════════════════════════════════════════════════════════════
 static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
     if(interp.halted) return 0;
@@ -2187,9 +2094,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Status log
-// ═══════════════════════════════════════════════════════════════════════
 static uint32_t g_statusTick=0;
 static void logStatus(Core& core){
     g_statusTick++;
@@ -2204,24 +2108,14 @@ static void logStatus(Core& core){
              core.fps,core.globalCycles);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Run functions
-// ═══════════════════════════════════════════════════════════════════════
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
-
-    // Run both CPUs. ARM9 is master clock.
-    // ARM7 runs at half the clock rate, so one ARM7 cycle = 2 ARM9 cycles.
-    // We run them interleaved: for each ARM9 step, do one ARM7 step.
-    // globalCycles counts ARM9 cycles.
     uint32_t acc0=0;
     for(int i=0;i<ITERS_NDS;i++){
-        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
-        runCpu(core,1,false);          // ARM7: runs but doesn't add to acc
+        acc0 += runCpu(core,0,false);  
+        runCpu(core,1,false);          
     }
 
-    // Always advance at least one scanline so events fire on time.
-    // If both CPUs were halted, still advance so IRQs can fire.
     uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
     tickInline(core,charge);
     logStatus(core);
@@ -2230,14 +2124,9 @@ void runJitNds(Core& core){
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    // GBA mode: only cpu1 (ARM7) runs. cpu0 is permanently halted.
-    // Must always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
     uint32_t acc=0;
     for(int i=0;i<ITERS_GBA;i++){
         uint32_t c=runCpu(core,1,true);
-        // When halted (HALT opcode waiting for IRQ), charge 1 cycle so
-        // the accumulator reflects time passing — otherwise the floor
-        // never gets reached and the VBlank IRQ never fires.
         acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
     }
 
@@ -2246,9 +2135,6 @@ void runJitGba(Core& core){
     logStatus(core);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Init / shutdown
-// ═══════════════════════════════════════════════════════════════════════
 bool initJit(Core* core){
     g_jitLive=false;codeBuf=nullptr;
     void* raw=memalign(32,JIT_BYTES);
@@ -2304,4 +2190,4 @@ void invalidateJitRange(uint32_t start,uint32_t end){
             cache[i].valid=false;
 }
 
-} // namespace JitPpc
+} 
