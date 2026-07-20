@@ -204,53 +204,19 @@ enum CoreError {
 };
 
 enum SchedTask {
-    UPDATE_RUN,
-    RESET_CYCLES,
-    CART9_WORD_READY,
-    CART7_WORD_READY,
-    DMA9_TRANSFER0,
-    DMA9_TRANSFER1,
-    DMA9_TRANSFER2,
-    DMA9_TRANSFER3,
-    DMA7_TRANSFER0,
-    DMA7_TRANSFER1,
-    DMA7_TRANSFER2,
-    DMA7_TRANSFER3,
-    NDS_SCANLINE256,
-    NDS_SCANLINE355,
-    GBA_SCANLINE240,
-    GBA_SCANLINE308,
-    GPU3D_COMMANDS,
-    ARM9_INTERRUPT,
-    ARM7_INTERRUPT,
-    NDS_SPU_SAMPLE,
-    GBA_SPU_SAMPLE,
-    TIMER9_OVERFLOW0,
-    TIMER9_OVERFLOW1,
-    TIMER9_OVERFLOW2,
-    TIMER9_OVERFLOW3,
-    TIMER7_OVERFLOW0,
-    TIMER7_OVERFLOW1,
-    TIMER7_OVERFLOW2,
-    TIMER7_OVERFLOW3,
-    WIFI_COUNT_MS,
-    WIFI_TRANS_REPLY,
-    WIFI_TRANS_ACK,
-    MAX_TASKS
+//omitted for brevity
 };
 
 struct SchedCallback {
-    void (*fn)(void* obj, int arg);  // trampoline function
-    void*  obj;                      // receiver object
-    int    arg;                      // channel / index (0 if unused)
+    void (*fn)(void* obj, int arg);  
+    void*  obj;                      
+    int    arg;                      
 
-    // Default-construct to a safe no-op so the array is always callable.
     SchedCallback() : fn(nullptr), obj(nullptr), arg(0) {}
 
     SchedCallback(void (*f)(void*, int), void* o, int a = 0)
         : fn(f), obj(o), arg(a) {}
 
-    // Invoke — inlined at every call site, single indirect branch on PPC.
     inline void operator()() const {
         fn(obj, arg);
     }
