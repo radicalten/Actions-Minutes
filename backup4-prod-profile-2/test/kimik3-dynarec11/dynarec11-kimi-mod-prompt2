@@ -396,38 +396,7 @@ Core::Core(std::string ndsRom, std::string gbaRom, int id,
       lastFpsTimeTicks(0),
       fpsCount(0)
 {
-    tasks[UPDATE_RUN]       = SchedCallback(shim_updateRun,   this);
-    tasks[RESET_CYCLES]     = SchedCallback(shim_resetCycles, this);
-    tasks[CART9_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 0);
-    tasks[CART7_WORD_READY] = SchedCallback(shim_cartWordReady, &cartridgeNds, 1);
-    tasks[DMA9_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[0], 0);
-    tasks[DMA9_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[0], 1);
-    tasks[DMA9_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[0], 2);
-    tasks[DMA9_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[0], 3);
-    tasks[DMA7_TRANSFER0]   = SchedCallback(shim_dmaTransfer, &dma[1], 0);
-    tasks[DMA7_TRANSFER1]   = SchedCallback(shim_dmaTransfer, &dma[1], 1);
-    tasks[DMA7_TRANSFER2]   = SchedCallback(shim_dmaTransfer, &dma[1], 2);
-    tasks[DMA7_TRANSFER3]   = SchedCallback(shim_dmaTransfer, &dma[1], 3);
-    tasks[NDS_SCANLINE256]  = SchedCallback(shim_gpuScanline256,    &gpu);
-    tasks[NDS_SCANLINE355]  = SchedCallback(shim_gpuScanline355,    &gpu);
-    tasks[GBA_SCANLINE240]  = SchedCallback(shim_gpuGbaScanline240, &gpu);
-    tasks[GBA_SCANLINE308]  = SchedCallback(shim_gpuGbaScanline308, &gpu);
-    tasks[GPU3D_COMMANDS]   = SchedCallback(shim_gpu3dCommands, &gpu3D);
-    tasks[ARM9_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[0]);
-    tasks[ARM7_INTERRUPT]   = SchedCallback(shim_interpreterInterrupt, &interpreter[1]);
-    tasks[NDS_SPU_SAMPLE]   = SchedCallback(shim_spuSample,    &spu);
-    tasks[GBA_SPU_SAMPLE]   = SchedCallback(shim_spuGbaSample, &spu);
-    tasks[TIMER9_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[0], 0);
-    tasks[TIMER9_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[0], 1);
-    tasks[TIMER9_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[0], 2);
-    tasks[TIMER9_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[0], 3);
-    tasks[TIMER7_OVERFLOW0] = SchedCallback(shim_timersOverflow, &timers[1], 0);
-    tasks[TIMER7_OVERFLOW1] = SchedCallback(shim_timersOverflow, &timers[1], 1);
-    tasks[TIMER7_OVERFLOW2] = SchedCallback(shim_timersOverflow, &timers[1], 2);
-    tasks[TIMER7_OVERFLOW3] = SchedCallback(shim_timersOverflow, &timers[1], 3);
-    tasks[WIFI_COUNT_MS]    = SchedCallback(shim_wifiCountMs,  &wifi);
-    tasks[WIFI_TRANS_REPLY] = SchedCallback(shim_wifiTransmit, &wifi, CMD_REPLY);
-    tasks[WIFI_TRANS_ACK]   = SchedCallback(shim_wifiTransmit, &wifi, CMD_ACK);
+//omitted for brevity
 
     bool required = !Settings::directBoot ||
                     (ndsRom == "" && gbaRom == "" &&
