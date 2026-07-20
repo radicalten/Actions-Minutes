@@ -1,4 +1,4 @@
-Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. 
+Can you help me fix my arm v4/5 to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. 
 
 rockwrestler nds debug info:
 === NooDS-Wii status log ===
