@@ -1,30 +1,20 @@
 Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the error, followed by my code. 
-When launching a gba game I get the gba boot logo then a black screen but it gets stuck there at the black screen.
-nds rom debug info:
-=== NooDS-Wii status log ===
+When launching an nds or gba rom, I get a stuck on a white/black screen. 
+Status log
 [STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f76c
 [STATUS] fps=1 cycles=16936378 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
 [STATUS] fps=28 cycles=33890170 pc0=020001B4 pc1=038002B0 halt0=0 halt1=0 gba=0 dsi=0
-[STATUS] fps=28 cycles=50837110 pc0=020001B4 pc1=038002B0 halt0=0 halt1=0 gba=0 dsi=0
-=== NooDS-Wii JIT/CPU trace log ===
+trace-log
 FAT mounted, logging started
 [JIT] init buf=0x80549a60 tramp=0x800a0340 BLK_ARMS=8
 [JIT] cpu0 02000100 -> 02002D2C r=0 cpsr=000000DF
 [JIT] cpu1 03800100 -> 038002C0 r=0 cpsr=000000DF
 [JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
-[JIT] cpu0 02002D2C -> 02002D34 r=1 cpsr=000000DF
-[JIT] cpu1 038002C0 -> 038002EC r=0 cpsr=000000DF
-[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10
 ...
 [JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
 [JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
 [JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
 [JIT] cpu0 020001E8 -> 020001E4 r=0 cpsr=800000DF
-[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
-[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
-[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
-[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
-[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
 
 //debug_log.h
 #pragma once
