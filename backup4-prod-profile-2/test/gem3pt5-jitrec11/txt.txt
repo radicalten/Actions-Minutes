@@ -89,3 +89,59 @@ FAT mounted, logging started
 [JIT] STATUS jit0=7202 fb0=23 jit1=22 fb1=3 pos=8570 gen=0
 [JIT] STATUS pc0=02000CA4 pc1=03800728 h0=0 h1=0 fps=0 cyc=3746076
 [JIT] STATUS jit0=8226 fb0=23 jit1=22 fb1=3 pos=8570 gen=0
+
+
+====
+Ok rockwrestler shows 60 fps but the screen is not being drawn as a single frame buffer, rather with a linescroll, which should not be visble. 
+rockwrestler.nds
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006ed58
+[STATUS] fps=0 cycles=16662286 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=0 cycles=33478806 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=60 cycles=50293932 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=60 cycles=67109148 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80548ce0 tramp=0x8009f8c0 BLK_ARMS=8
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10
+[JIT] arm   FB cpu1 pc=038002FC op=E121F003
+[JIT] arm   FB cpu0 pc=02002D44 op=EE120F30
+[JIT] arm   FB cpu0 pc=02002D4C op=EE130F10
+[JIT] arm   FB cpu1 pc=03800304 op=E121F004
+[JIT] arm   FB cpu0 pc=02002D54 op=EE150F10
+[JIT] arm   FB cpu0 pc=02002D5C op=EE150F30
+[JIT] arm   FB cpu0 pc=02002D64 op=EE150F50
+[JIT] arm   FB cpu0 pc=02002D6C op=EE150F70
+[JIT] arm   FB cpu1 pc=0380074C op=E121F003
+[JIT] arm   FB cpu0 pc=02002D74 op=EE160F10
+[JIT] arm   FB cpu0 pc=02002D7C op=EE160F11
+[JIT] arm   FB cpu0 pc=02002D84 op=EE160F12
+[JIT] arm   FB cpu0 pc=02002D8C op=EE160F13
+[JIT] arm   FB cpu0 pc=02002D94 op=EE160F14
+[JIT] arm   FB cpu0 pc=02002D9C op=EE160F15
+[JIT] arm   FB cpu0 pc=02002DA4 op=EE160F16
+[JIT] arm   FB cpu0 pc=02002DAC op=EE160F17
+[JIT] arm   FB cpu0 pc=02002DB4 op=EE190F11
+[JIT] arm   FB cpu0 pc=02002DBC op=EE190F31
+[JIT] arm   FB cpu0 pc=02002DF0 op=E121F003
+[JIT] arm   FB cpu0 pc=02002DF8 op=E121F004
+[JIT] arm   FB cpu0 pc=02007D20 op=E121F003
+[JIT] arm   FB cpu0 pc=020050B4 op=E49DF004
+[JIT] arm   FB cpu0 pc=02000CA4 op=EE010F10
+[JIT] arm   FB cpu0 pc=02000CB4 op=EE090F11
+[JIT] arm   FB cpu0 pc=02000CC4 op=EE090F31
+[JIT] STATUS jit0=1078 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
+[JIT] STATUS pc0=020001E4 pc1=03800728 h0=0 h1=0 fps=0 cyc=535836
+[JIT] STATUS jit0=2102 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
+[JIT] STATUS pc0=020001E4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1070796
+[JIT] STATUS jit0=3126 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
+[JIT] STATUS pc0=020001E4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1605916
+[JIT] STATUS jit0=4150 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
+[JIT] STATUS pc0=020001E4 pc1=03800728 h0=0 h1=0 fps=0 cyc=2140650
+[JIT] STATUS jit0=5174 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
+[JIT] STATUS pc0=020001E4 pc1=03800728 h0=0 h1=0 fps=0 cyc=2675996
+[JIT] STATUS jit0=6198 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
+[JIT] STATUS pc0=020001E4 pc1=03800728 h0=0 h1=0 fps=0 cyc=3211446
+[JIT] STATUS jit0=7222 fb0=25 jit1=22 fb1=3 pos=11642 gen=0
+
