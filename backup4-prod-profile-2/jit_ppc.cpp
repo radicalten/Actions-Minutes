@@ -1443,7 +1443,7 @@ static void logStatus(Core& core){
 // Run functions  (fixed)
 // ═══════════════════════════════════════════════════════════════════════
 
-void JitPpc::runJitNds(Core& core) {
+void runJitNds(Core& core) {
     if (!g_jitLive || !codeBuf) { Interpreter::runCoreNds(core); return; }
 
     // NDS master clock: ARM9 @ 2 cycles/insn, ARM7 @ 1 cycle/insn (half speed).
@@ -1487,7 +1487,7 @@ void JitPpc::runJitNds(Core& core) {
     logStatus(core);
 }
 
-void JitPpc::runJitGba(Core& core) {
+void runJitGba(Core& core) {
     if (!g_jitLive || !codeBuf) { Interpreter::runCoreSingle<true, 0>(core); return; }
 
     // GBA mode: only ARM7 (cpu1) runs; cpu0 is permanently halted (halt bit 2).
