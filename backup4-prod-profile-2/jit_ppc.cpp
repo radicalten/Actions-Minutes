@@ -1,9 +1,9 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 5:
-// 1. Slice-Accurate Event Prediction: Run local CPU cycles up to the next 
-//    scheduled event cycle. Reduces scheduler overhead from O(N) per block to O(1) per event.
-// 2. Self-Loop Fast-Forwarding: Fast-forwards single-instruction self-loops (b .)
-//    directly to the next event to eliminate JIT/Interpreter thrashing entirely.
+// Fixed revision 6:
+// 1. Critical Bug Fix: Only fast-forward infinite loops when reason == EXIT_NORMAL.
+//    This prevents JIT fallback blocks from getting permanently stuck on their 
+//    first instruction (e.g. CP15/MCR instructions).
+// 2. Maintained O(1) slice event scheduling and cycle-accurate interleaving.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -1249,7 +1249,8 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
     // Single-instruction infinite loop detected (b .)
     // Fast-forward this CPU directly to the next scheduled event cycle.
-    if(expc == pc){
+    // CRITICAL FIX: Only apply to EXIT_NORMAL blocks so fallback opcodes can execute!
+    if(reason == EXIT_NORMAL && expc == pc){
         uint32_t nextEventCycles = core.events.front().cycles;
         if(nextEventCycles > core.globalCycles){
             uint32_t diff = nextEventCycles - core.globalCycles;
@@ -1261,9 +1262,14 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     }
 
     if(reason==EXIT_FALLBACK){
+        // Account for JIT blocks executed prior to fallback exit
+        uint32_t jit_insns = (expc >= pc) ? (expc - pc) / (interp.isThumb() ? 2u : 4u) : 0u;
+        uint32_t jit_cycles = jit_insns * cycPerInsn;
+        addCpuCycles(interp, jit_cycles);
+
         interp.jitRunOpcode();
         addCpuCycles(interp, cycPerInsn);
-        return cycPerInsn;
+        return jit_cycles + cycPerInsn;
     }else{
         uint32_t n=b->insnCount>0?b->insnCount:1u;
         uint32_t cycles = n*cycPerInsn;
