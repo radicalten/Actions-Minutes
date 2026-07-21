@@ -1286,9 +1286,14 @@ static inline void tickInline(Core& core,uint32_t cycles){
 // ═══════════════════════════════════════════════════════════════════════
 // Per-CPU runner
 // ═══════════════════════════════════════════════════════════════════════
-static uint32_t runCpu(Core& core,int cpu,bool gba){
+static uint32_t runCpu(Core& core,int cpu,bool gba){static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
-    if(interp.halted) return 0;
+    if(interp.halted) {
+        // Even when halted, we need to check if an interrupt should wake us
+        interp.interrupt();  // Check pending interrupts
+        if(interp.halted) return 0;  // Still halted
+        // Fall through to normal execution if woken up
+    }
 
     const bool     arm7      =(cpu==1)||gba;
     const uint32_t cycPerInsn=arm7?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
@@ -1452,7 +1457,9 @@ void runJitNds(Core& core){
     uint32_t acc0=0;
     for(int i=0;i<ITERS_NDS;i++){
         acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
-        runCpu(core,1,false);          // ARM7: runs but doesn't add to acc
+        // ARM7 runs at half speed - each ARM7 cycle = 2 ARM9 cycles
+        uint32_t arm7Cycles = runCpu(core,1,false);
+        acc0 += arm7Cycles * 2;  // Convert ARM7 cycles to ARM9 equivalent
     }
 
     // Always advance at least one scanline so events fire on time.
@@ -1474,6 +1481,12 @@ void runJitGba(Core& core){
         // the accumulator reflects time passing — otherwise the floor
         // never gets reached and the VBlank IRQ never fires.
         acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
+        
+        // If CPU is halted, check if an interrupt should wake it
+        if(core.interpreter[1].halted) {
+            // Process pending interrupts - this might unhalt the CPU
+            core.interpreter[1].interrupt();
+        }
     }
 
     uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
