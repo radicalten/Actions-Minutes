@@ -1334,3 +1334,434 @@ if(normSpinDetect(ls,pc,expc)){
 ```
 
 This should resolve the issue by ensuring both CPUs get a chance to execute during spin bursting, which should allow interrupts to be processed and the CPUs to break out of their spin loops.
+
+===========
+Looking at the logs more carefully, I can see the real issue now. Both CPUs are spinning but they're not actually making progress - they're just bouncing between two addresses. The key insight is in these lines:
+
+```
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
+[JIT] NORM SPIN cpu1 escaped 03800728->0380072C after 1 steps
+```
+
+Both CPUs escape their spin loops but immediately re-enter them. This is a classic **deadlock** - both CPUs are waiting for each other, but neither can make progress.
+
+## Root Cause: Deadlock Between CPUs
+
+The ARM9 is at `020001E4` (spinning) and the ARM7 is at `03800728` (spinning). They're both waiting for events that never come because:
+
+1. The ARM7 is likely waiting for a VBlank interrupt
+2. The VBlank interrupt is scheduled by GPU scanline events
+3. But the GPU events aren't firing because the cycle counter isn't advancing properly
+
+## The Real Fix: Force Event Processing During Spin Bursting
+
+The issue is that during spin bursting, you're calling `tickInline` which only processes events if `globalCycles >= event.cycles`. But if the cycle counter isn't advancing properly, events never fire.
+
+Here's the fix - **force-process all pending events during spin bursting**:
+
+```cpp
+// Add this helper function near the top of the file:
+
+static inline void forceProcessAllEvents(Core& core) {
+    while(!core.events.empty()) {
+        SchedEvent e = core.events.front();
+        if(core.globalCycles >= e.cycles) {
+            core.events.erase(core.events.begin());
+            if(e.task >= 0 && e.task < MAX_TASKS && core.tasks[e.task].fn)
+                core.tasks[e.task]();
+        } else {
+            break;
+        }
+    }
+}
+
+// Then modify the spin bursting section to use it:
+
+if(normSpinDetect(ls,pc,expc)){
+    const uint32_t spinA=ls.normBurstPC;
+    const uint32_t spinB=ls.normBurstExit;
+
+    DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+    ls.normBursting=true;
+
+    bool escaped=false;
+    for(int i=0;i<SPIN_STEPS;i++){
+        if(interp.halted){escaped=true;break;}
+        
+        // Run the spinning CPU for a few steps
+        interp.jitRunOpcode();
+        tickInline(core,SPIN_CYC_STEP);
+        
+        // CRITICAL: Force-process ALL pending events
+        forceProcessAllEvents(core);
+        
+        // CRITICAL: Run the OTHER CPU to give it a chance to signal us
+        int otherCpu = 1 - cpu;
+        if(!core.interpreter[otherCpu].halted) {
+            runCpu(core, otherCpu, false);
+            forceProcessAllEvents(core);
+            // Check if the other CPU's execution caused an interrupt
+            interp.interrupt();
+        }
+        
+        if(interp.halted){escaped=true;break;}
+        uint32_t newPC=interp.getActualPC();
+        if(newPC!=spinA&&newPC!=spinB){
+            DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                     cpu,spinA,newPC,i+1);
+            escaped=true;
+            break;
+        }
+    }
+
+    resetNormSpin(ls);
+
+    if(!escaped){
+        DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+    }
+
+    return cycPerInsn;
+}
+```
+
+But wait, I think there's an even deeper issue. Looking at the logs:
+
+```
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+```
+
+The ARM7 is executing but not making progress. This suggests it's executing the same instruction repeatedly. Let me check what's at address `03800728`.
+
+Looking at the NDS memory map, `03800728` is in the ARM7's internal RAM (0x03800000-0x0380FFFF). This is likely the ARM7's idle loop waiting for interrupts.
+
+The issue is that the ARM7 is in a `wfi` (Wait For Interrupt) loop, but interrupts aren't being delivered because:
+
+1. The GPU scanline events aren't firing (cycle counter issue)
+2. Or the interrupt delivery mechanism is broken
+
+Let me check the `interrupt()` method in the Interpreter class. Looking at your code, I see `handleHleIrq()` and `interrupt()` methods, but I don't see their implementation.
+
+Actually, looking at the logs more carefully, I notice that the ARM7's CPSR changes from `000000DF` to `200000DF`:
+
+```
+[JIT] cpu1 0380072C -> 03800728 r=0 cpsr=200000DF
+```
+
+The `0x20000000` bit is the **T bit** (Thumb mode). This suggests the ARM7 is switching between ARM and Thumb modes, which is unusual.
+
+Wait, let me recalculate:
+- `0x000000DF` = 0000 0000 0000 0000 0000 0000 1101 1111
+- `0x200000DF` = 0010 0000 0000 0000 0000 0000 1101 1111
+
+The difference is bit 29, which is... actually, let me check the CPSR bit layout:
+- Bit 31: N (Negative)
+- Bit 30: Z (Zero)
+- Bit 29: C (Carry)
+- Bit 28: V (Overflow)
+- Bit 27-24: Reserved
+- Bit 23: ?
+- Bit 22: T (Thumb) - wait, that's bit 5
+- Actually, in CPSR:
+  - Bit 31-28: NZCV
+  - Bit 27-25: Reserved
+  - Bit 24: ?
+  - Bit 23: ?
+  - Bit 22: T (Thumb) - no, that's wrong
+  - Actually:
+    - Bit 31: N
+    - Bit 30: Z
+    - Bit 29: C
+    - Bit 28: V
+    - Bit 27-25: Reserved
+    - Bit 24: ?
+    - Bit 23: ?
+    - Bit 22: T (Thumb) - no, T is bit 5
+    - Bit 7: I (IRQ disable)
+    - Bit 6: F (FIQ disable)
+    - Bit 5: T (Thumb)
+    - Bit 4-0: Mode
+
+So `0x200000DF`:
+- Bit 29: C = 1
+- Bit 7: I = 1
+- Bit 6: F = 1
+- Bit 5: T = 1
+- Bits 4-0: 11111 = User mode
+
+And `0x000000DF`:
+- Bit 7: I = 1
+- Bit 6: F = 1
+- Bit 5: T = 1
+- Bits 4-0: 11111 = User mode
+
+The difference is bit 29 (C flag). This suggests the ARM7 is executing instructions that modify the CPSR.
+
+Anyway, the core issue is that both CPUs are spinning and not making progress. The fix is to ensure that during spin bursting, we force-process events and run both CPUs.
+
+But I think there's an even more fundamental issue. Let me look at the `runJitNds` function again:
+
+```cpp
+void runJitNds(Core& core){
+    if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
+
+    uint32_t acc0=0;
+    for(int i=0;i<ITERS_NDS;i++){
+        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
+        uint32_t arm7Cycles = runCpu(core,1,false);
+        acc0 += arm7Cycles * 2;  // Convert ARM7 cycles to ARM9 equivalent
+    }
+
+    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
+    tickInline(core,charge);
+    logStatus(core);
+}
+```
+
+The issue is that when both CPUs are spinning, `runCpu` returns `cycPerInsn` (2 for ARM9, 1 for ARM7), so `acc0` accumulates `2 + 1*2 = 4` per iteration. After 32 iterations, `acc0 = 128`, which is less than `FLOOR_CYCLES_NDS = 2130`. So the floor kicks in and we charge 2130 cycles.
+
+But during the spin bursting, we're calling `tickInline` with `SPIN_CYC_STEP = 4` cycles, which should process events. But if the events are scheduled at cycle 1536 and 2130, and we're only advancing 4 cycles at a time, it would take 383 iterations to reach 1536 and 532 iterations to reach 2130.
+
+With `SPIN_STEPS = 256`, we're not advancing enough cycles to reach the event thresholds!
+
+## The Fix: Increase SPIN_STEPS or SPIN_CYC_STEP
+
+The issue is that during spin bursting, we're not advancing enough cycles to reach the GPU scanline events. We need to either:
+
+1. Increase `SPIN_STEPS` to at least 532 (to reach 2130 cycles)
+2. Or increase `SPIN_CYC_STEP` to at least 8 (so 256 steps = 2048 cycles)
+3. Or force-process events regardless of cycle count
+
+Let me go with option 3 - force-process events during spin bursting:
+
+```cpp
+// Add this helper function:
+
+static inline void forceProcessAllEvents(Core& core) {
+    while(!core.events.empty()) {
+        SchedEvent e = core.events.front();
+        if(core.globalCycles >= e.cycles) {
+            core.events.erase(core.events.begin());
+            if(e.task >= 0 && e.task < MAX_TASKS && core.tasks[e.task].fn)
+                core.tasks[e.task]();
+        } else {
+            break;
+        }
+    }
+}
+
+// Modify the spin bursting section:
+
+if(normSpinDetect(ls,pc,expc)){
+    const uint32_t spinA=ls.normBurstPC;
+    const uint32_t spinB=ls.normBurstExit;
+
+    DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+    ls.normBursting=true;
+
+    bool escaped=false;
+    for(int i=0;i<SPIN_STEPS;i++){
+        if(interp.halted){escaped=true;break;}
+        
+        // Run the spinning CPU for a few steps
+        interp.jitRunOpcode();
+        tickInline(core,SPIN_CYC_STEP);
+        
+        // CRITICAL: Force-process ALL pending events
+        forceProcessAllEvents(core);
+        
+        // CRITICAL: Run the OTHER CPU to give it a chance to signal us
+        int otherCpu = 1 - cpu;
+        if(!core.interpreter[otherCpu].halted) {
+            runCpu(core, otherCpu, false);
+            forceProcessAllEvents(core);
+            // Check if the other CPU's execution caused an interrupt
+            interp.interrupt();
+        }
+        
+        if(interp.halted){escaped=true;break;}
+        uint32_t newPC=interp.getActualPC();
+        if(newPC!=spinA&&newPC!=spinB){
+            DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                     cpu,spinA,newPC,i+1);
+            escaped=true;
+            break;
+        }
+    }
+
+    resetNormSpin(ls);
+
+    if(!escaped){
+        DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+    }
+
+    return cycPerInsn;
+}
+```
+
+But actually, `tickInline` already processes events if `globalCycles >= event.cycles`. The issue is that the events are scheduled at high cycle counts, and we're only advancing a few cycles at a time.
+
+Wait, I think I see the real issue now. Looking at the logs:
+
+```
+[STATUS] fps=27 cycles=16967350 pc0=020001B4 pc1=038002B0 halt0=0 halt1=0 gba=0 dsi=0
+```
+
+The cycle count is 16,967,350, which is quite high. But the GPU scanline events are scheduled at:
+```cpp
+schedule(NDS_SCANLINE256, 256 * 6);  // 1536 cycles from now
+schedule(NDS_SCANLINE355, 355 * 6);  // 2130 cycles from now
+```
+
+These are relative to `globalCycles`, so they should be at `globalCycles + 1536` and `globalCycles + 2130`.
+
+But if the cycle counter is at 16,967,350, and the events are scheduled at 16,968,886 and 16,969,480, we need to advance at least 1536 cycles to trigger the first event.
+
+With `SPIN_STEPS = 256` and `SPIN_CYC_STEP = 4`, we're only advancing 1024 cycles, which isn't enough!
+
+## The Real Fix: Increase SPIN_CYC_STEP
+
+The simplest fix is to increase `SPIN_CYC_STEP` so that the spin bursting advances enough cycles to trigger events:
+
+```cpp
+static const uint32_t SPIN_CYC_STEP = 16;  // Increased from 4
+```
+
+With this change, 256 steps × 16 cycles = 4096 cycles, which is more than enough to trigger the GPU scanline events.
+
+But this might cause other issues if the spin bursting advances too many cycles at once. Let me think about this more carefully...
+
+Actually, the better fix is to ensure that during spin bursting, we advance enough cycles to trigger at least one event. Here's the approach:
+
+```cpp
+// In the spin bursting section, calculate how many cycles we need to advance:
+
+if(normSpinDetect(ls,pc,expc)){
+    const uint32_t spinA=ls.normBurstPC;
+    const uint32_t spinB=ls.normBurstExit;
+
+    DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+    ls.normBursting=true;
+
+    bool escaped=false;
+    for(int i=0;i<SPIN_STEPS;i++){
+        if(interp.halted){escaped=true;break;}
+        
+        // Run the spinning CPU for a few steps
+        interp.jitRunOpcode();
+        
+        // Advance enough cycles to trigger at least one event
+        uint32_t cyclesToAdvance = SPIN_CYC_STEP;
+        if(!core.events.empty()) {
+            uint32_t nextEventCycle = core.events.front().cycles;
+            if(core.globalCycles < nextEventCycle) {
+                uint32_t needed = nextEventCycle - core.globalCycles;
+                if(needed > cyclesToAdvance && needed <= 4096) {
+                    cyclesToAdvance = needed;
+                }
+            }
+        }
+        
+        tickInline(core,cyclesToAdvance);
+        
+        // CRITICAL: Run the OTHER CPU to give it a chance to signal us
+        int otherCpu = 1 - cpu;
+        if(!core.interpreter[otherCpu].halted) {
+            runCpu(core, otherCpu, false);
+            interp.interrupt();
+        }
+        
+        if(interp.halted){escaped=true;break;}
+        uint32_t newPC=interp.getActualPC();
+        if(newPC!=spinA&&newPC!=spinB){
+            DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                     cpu,spinA,newPC,i+1);
+            escaped=true;
+            break;
+        }
+    }
+
+    resetNormSpin(ls);
+
+    if(!escaped){
+        DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+    }
+
+    return cycPerInsn;
+}
+```
+
+But this is getting complex. Let me just go with the simple fix - increase `SPIN_CYC_STEP`:
+
+```cpp
+static const uint32_t SPIN_CYC_STEP = 16;  // Increased from 4
+```
+
+And also add the cross-CPU execution:
+
+```cpp
+if(normSpinDetect(ls,pc,expc)){
+    const uint32_t spinA=ls.normBurstPC;
+    const uint32_t spinB=ls.normBurstExit;
+
+    DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+    ls.normBursting=true;
+
+    bool escaped=false;
+    for(int i=0;i<SPIN_STEPS;i++){
+        if(interp.halted){escaped=true;break;}
+        
+        // Run the spinning CPU for a few steps
+        interp.jitRunOpcode();
+        tickInline(core,SPIN_CYC_STEP);
+        
+        // CRITICAL: Run the OTHER CPU to give it a chance to signal us
+        int otherCpu = 1 - cpu;
+        if(!core.interpreter[otherCpu].halted) {
+            runCpu(core, otherCpu, false);
+            interp.interrupt();
+        }
+        
+        if(interp.halted){escaped=true;break;}
+        uint32_t newPC=interp.getActualPC();
+        if(newPC!=spinA&&newPC!=spinB){
+            DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                     cpu,spinA,newPC,i+1);
+            escaped=true;
+            break;
+        }
+    }
+
+    resetNormSpin(ls);
+
+    if(!escaped){
+        DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+    }
+
+    return cycPerInsn;
+}
+```
+
+Let me provide you with the complete set of changes:
+
+**Change 1**: Increase `SPIN_CYC_STEP`:
+
+Find:
+```cpp
+static const uint32_t SPIN_CYC_STEP = 4;
+```
+
+Replace with:
+```cpp
+static const uint32_t SPIN_CYC_STEP = 16;
+```
+
+**Change 2**: Modify the spin bursting section to run both CPUs:
+
+Find the entire `normSpinDetect` bursting section and replace it with the version that runs both CPUs.
+
+These changes should ensure that:
+1. During spin bursting, enough cycles are advanced to trigger GPU scanline events
+2. Both CPUs get a chance to execute during spin bursting
+3. Interrupts are properly delivered to wake CPUs from their spin loops
+
+This should resolve the deadlock and allow the game to progress past the white screen.
