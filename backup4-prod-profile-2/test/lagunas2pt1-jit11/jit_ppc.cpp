@@ -1286,7 +1286,7 @@ static inline void tickInline(Core& core,uint32_t cycles){
 // ═══════════════════════════════════════════════════════════════════════
 // Per-CPU runner
 // ═══════════════════════════════════════════════════════════════════════
-static uint32_t runCpu(Core& core,int cpu,bool gba){static uint32_t runCpu(Core& core,int cpu,bool gba){
+static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
     if(interp.halted) {
         // Even when halted, we need to check if an interrupt should wake us
