@@ -1,1 +1,20 @@
+The change made by laguna s 2.1 118b8a was inoffesive. It compiled. did not cause an obvious regression except MKDS dropping wii dolphin framerate. but rockwrestler is still 28fps.
+Otherwise its basically the same, no gains, no solution yet, but nice to know that a 118b8a model is so capable. 70.2% terminal bench v2.1
+Like grok 4.5 it likes to give you just the change for you to implement rather than the full file. probably for the best as otherwise it might make a mistake?
 
+Here is rockwrestler's debug logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f830
+[STATUS] fps=1 cycles=16936378 pc0=020001B4 pc1=03800728 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=28 cycles=33890170 pc0=020001B4 pc1=038002B0 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549ca0 tramp=0x800a0500 BLK_ARMS=8
+[JIT] cpu0 02000100 -> 02002D2C r=0 cpsr=000000DF
+[JIT] cpu1 03800100 -> 038002C0 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+...
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu0 020001E4 -> 020001E4 r=0 cpsr=800000DF
+[JIT] NORM SPIN cpu0 detected at 020001E4->020001E4, bursting
+[JIT] NORM SPIN cpu0 escaped 020001E4->020001E8 after 1 steps
