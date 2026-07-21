@@ -1391,36 +1391,47 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
         ls.fbCount=0;
         ls.fbDumped=false;
 
-        if(normSpinDetect(ls,pc,expc)){
-            const uint32_t spinA=ls.normBurstPC;
-            const uint32_t spinB=ls.normBurstExit;
+if(normSpinDetect(ls,pc,expc)){
+    const uint32_t spinA=ls.normBurstPC;
+    const uint32_t spinB=ls.normBurstExit;
 
-            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
-            ls.normBursting=true;
+    DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+    ls.normBursting=true;
 
-            bool escaped=false;
-            for(int i=0;i<SPIN_STEPS;i++){
-                if(interp.halted){escaped=true;break;}
-                interp.jitRunOpcode();
-                tickInline(core,SPIN_CYC_STEP);
-                if(interp.halted){escaped=true;break;}
-                uint32_t newPC=interp.getActualPC();
-                if(newPC!=spinA&&newPC!=spinB){
-                    DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
-                             cpu,spinA,newPC,i+1);
-                    escaped=true;
-                    break;
-                }
-            }
-
-            resetNormSpin(ls);
-
-            if(!escaped){
-                DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
-            }
-
-            return cycPerInsn;
+    bool escaped=false;
+    for(int i=0;i<SPIN_STEPS;i++){
+        if(interp.halted){escaped=true;break;}
+        
+        // Run the spinning CPU for a few steps
+        interp.jitRunOpcode();
+        tickInline(core,SPIN_CYC_STEP);
+        
+        // CRITICAL: Run the OTHER CPU to give it a chance to signal us
+        int otherCpu = 1 - cpu;
+        if(!core.interpreter[otherCpu].halted) {
+            runCpu(core, otherCpu, false);
+            // Check if the other CPU's execution caused an interrupt
+            interp.interrupt();
         }
+        
+        if(interp.halted){escaped=true;break;}
+        uint32_t newPC=interp.getActualPC();
+        if(newPC!=spinA&&newPC!=spinB){
+            DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                     cpu,spinA,newPC,i+1);
+            escaped=true;
+            break;
+        }
+    }
+
+    resetNormSpin(ls);
+
+    if(!escaped){
+        DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+    }
+
+    return cycPerInsn;
+}
 
         uint32_t n=b->insnCount>0?b->insnCount:1u;
         return n*cycPerInsn;
