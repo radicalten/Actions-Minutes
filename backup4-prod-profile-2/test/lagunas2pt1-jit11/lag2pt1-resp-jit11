@@ -1,0 +1,361 @@
+< među>
+
+Looking at your debug logs and code, I can identify several critical issues in your JIT recompiler. Let me analyze the problems systematically:
+
+## Root Cause Analysis
+
+### Issue 1: ARM7 Cycle Accounting in NDS Mode (Critical)
+
+The most critical issue is in `runJitNds()` - you're not accumulating ARM7 cycles into the master clock:
+
+```cpp
+acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
+runCpu(core,1,false);          // ARM7: runs but doesn't add to acc
+```
+
+**Problem**: The ARM7 runs at half the clock rate of ARM9, meaning 1 ARM7 cycle = 2 ARM9 cycles. But you're completely ignoring ARM7's cycle contribution. This causes the scheduler to never fire ARM7-related events (like IPCSYNC), which explains why Rockwrestler gets "Timeout when ARM7 light is red."
+
+**Fix**:
+```cpp
+void runJitNds(Core& core){
+    if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
+
+    uint32_t acc0=0;
+    for(int i=0;i<ITERS_NDS;i++){
+        acc0 += runCpu(core,0,false);  // ARM9 cycles
+        // ARM7 runs at half speed - each ARM7 cycle = 2 ARM9 cycles
+        uint32_t arm7Cycles = runCpu(core,1,false);
+        acc0 += arm7Cycles * 2;  // Convert ARM7 cycles to ARM9 equivalent
+    }
+
+    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
+    tickInline(core,charge);
+    logStatus(core);
+}
+```
+
+### Issue 2: GBA HALT Instruction Handling (Critical)
+
+In the GBA logs, you see `pc0=FFFF0000` which indicates the ARM7 is stuck. Looking at your GBA runner:
+
+```cpp
+// When halted (HALT opcode waiting for IRQ), charge 1 cycle
+acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
+```
+
+**Problem**: When the CPU executes a HALT instruction, `runCpu` returns 0 (because `interp.halted` is true), and you charge only 1 cycle. This is insufficient - the CPU needs to advance enough cycles to reach the next interrupt event (VBlank). The floor of 1232 cycles should handle this, but the issue is that when halted, you're not properly checking if an interrupt should wake the CPU.
+
+**Fix**: You need to ensure that when the CPU is halted, interrupts can still be processed:
+
+```cpp
+void runJitGba(Core& core){
+    if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
+
+    uint32_t acc=0;
+    for(int i=0;i<ITERS_GBA;i++){
+        uint32_t c=runCpu(core,1,true);
+        acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
+        
+        // If CPU is halted, check if an interrupt should wake it
+        if(core.interpreter[1].halted) {
+            // Process pending interrupts - this might unhalt the CPU
+            core.interpreter[1].interrupt();
+        }
+    }
+
+    uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
+    tickInline(core,charge);
+    logStatus(core);
+}
+```
+
+### Issue 3: MSR Control Bits Fallback (Critical)
+
+Your MSR handling looks correct in principle, but there's a subtle issue. When you fall back for MSR with control bits, you're not properly preserving the register state:
+
+Looking at `JitHelp_commit`, you're committing registers to the interpreter, but when falling back due to MSR, the interpreter needs to handle the mode switch with proper banked register swapping.
+
+**Fix**: Ensure that when falling back for MSR, the interpreter's `setCpsr` method is called correctly. The issue might be in how `JitHelp_commit` interacts with the interpreter's mode switching.
+
+### Issue 4: Memory Map Update Timing
+
+In `enterGbaMode()`, you call `memory.updateMap7()` but there might be timing issues with when this happens relative to the JIT cache flush:
+
+```cpp
+void Core::enterGbaMode() {
+    gbaMode = true;
+    interpreter[0].halt(2);
+    interpreter[1].unhalt(2);
+
+    if (jitAvailable)
+        JitPpc::flushJitCache();  // Cache flushed here
+
+    updateRun();
+
+    // ... later ...
+    memory.updateMap7(0x00000000, 0xFFFFFFFF);  // Map updated here
+    interpreter[1].init();
+    // ...
+}
+```
+
+This should be fine, but make sure `updateMap7` is called before any JIT execution begins.
+
+### Issue 5: Interrupt Handling During JIT Execution
+
+Looking at the ARM7 interrupt handling, when the ARM7 is waiting for IPCSYNC, the interrupt should wake it up. But if your JIT is not properly calling `interrupt()` when events fire, the CPU will stay halted.
+
+In `runCpu`, when the CPU is halted, you return 0, but you don't check if an interrupt event should have fired. The `tickInline` function processes events, but the JIT loop might not be giving enough time for events to fire.
+
+**Fix**: Add interrupt checking in the JIT loop:
+
+```cpp
+static uint32_t runCpu(Core& core,int cpu,bool gba){
+    Interpreter& interp=core.interpreter[cpu];
+    if(interp.halted) {
+        // Even when halted, we need to check if an interrupt should wake us
+        interp.interrupt();  // Check pending interrupts
+        if(interp.halted) return 0;  // Still halted
+        // Fall through to normal execution if woken up
+    }
+    // ... rest of function
+}
+```
+
+## Summary of Fixes
+
+1. **Fix ARM7 cycle accounting in NDS mode** - Multiply ARM7 cycles by 2 when adding to master clock
+2. **Fix GBA HALT handling** - Ensure interrupts are checked when CPU is halted
+3. **Verify MSR fallback** - Ensure proper register state preservation during mode switches
+4. **Add interrupt checking** - Call `interrupt()` even when CPU appears halted to handle wake-up events
+
+The primary issue causing both the NDS white screen and GBA black screen is likely the incorrect cycle accounting for ARM7 in NDS mode, combined with improper handling of the HALT state in GBA mode. The ARM7 is either not getting enough cycles to process interrupts, or interrupts aren't being properly delivered to wake it from HALT.
+
+Would you like me to elaborate on any of these fixes or help implement them in your code?
+
+
+
+==============
+
+I'll implement the fixes for your JIT recompiler. Here are the specific changes needed:
+
+## Fix 1: ARM7 Cycle Accounting in NDS Mode
+
+In `jit_ppc.cpp`, modify the `runJitNds` function:
+
+```cpp
+void runJitNds(Core& core){
+    if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
+
+    // Run both CPUs. ARM9 is master clock.
+    // ARM7 runs at half the clock rate, so one ARM7 cycle = 2 ARM9 cycles.
+    // We run them interleaved: for each ARM9 step, do one ARM7 step.
+    // globalCycles counts ARM9 cycles.
+    uint32_t acc0=0;
+    for(int i=0;i<ITERS_NDS;i++){
+        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
+        // ARM7 runs at half speed - each ARM7 cycle = 2 ARM9 cycles
+        uint32_t arm7Cycles = runCpu(core,1,false);
+        acc0 += arm7Cycles * 2;  // Convert ARM7 cycles to ARM9 equivalent
+    }
+
+    // Always advance at least one scanline so events fire on time.
+    // If both CPUs were halted, still advance so IRQs can fire.
+    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
+    tickInline(core,charge);
+    logStatus(core);
+}
+```
+
+## Fix 2: GBA HALT Instruction Handling
+
+Modify the `runJitGba` function:
+
+```cpp
+void runJitGba(Core& core){
+    if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
+
+    // GBA mode: only cpu1 (ARM7) runs. cpu0 is permanently halted.
+    // Must always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
+    uint32_t acc=0;
+    for(int i=0;i<ITERS_GBA;i++){
+        uint32_t c=runCpu(core,1,true);
+        // When halted (HALT opcode waiting for IRQ), charge 1 cycle so
+        // the accumulator reflects time passing — otherwise the floor
+        // never gets reached and the VBlank IRQ never fires.
+        acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
+        
+        // If CPU is halted, check if an interrupt should wake it
+        if(core.interpreter[1].halted) {
+            // Process pending interrupts - this might unhalt the CPU
+            core.interpreter[1].interrupt();
+        }
+    }
+
+    uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
+    tickInline(core,charge);
+    logStatus(core);
+}
+```
+
+## Fix 3: Interrupt Checking in runCpu
+
+Modify the beginning of the `runCpu` function to check for interrupts even when halted:
+
+```cpp
+static uint32_t runCpu(Core& core,int cpu,bool gba){
+    Interpreter& interp=core.interpreter[cpu];
+    if(interp.halted) {
+        // Even when halted, we need to check if an interrupt should wake us
+        interp.interrupt();  // Check pending interrupts
+        if(interp.halted) return 0;  // Still halted
+        // Fall through to normal execution if woken up
+    }
+
+    const bool     arm7      =(cpu==1)||gba;
+    const uint32_t cycPerInsn=arm7?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
+
+    if(!interp.isReady()){
+        interp.jitRunOpcode();
+        return cycPerInsn;
+    }
+
+    uint32_t pc=interp.getActualPC();
+
+    if(pc==0xFFFFFFFFu){
+        interp.jitRunOpcode();
+        return cycPerInsn;
+    }
+
+    if(!validPC(pc,gba)){
+        static uint32_t lastBadPC[2]={0u,0u};
+        if(pc!=lastBadPC[cpu]){
+            DebugLog("[JIT] cpu%d bad PC %08X\n",cpu,pc);
+            lastBadPC[cpu]=pc;
+        }
+        interp.jitRunOpcode();
+        return cycPerInsn;
+    }
+
+    g_exitReason[cpu]=EXIT_FALLBACK;
+    g_exitPC[cpu]    =pc;
+
+    JitBlock* b=compile(&interp,&core,pc,arm7,cpu);
+    if(!b||!b->code||b->nW<16||
+       b->code<codeBuf||b->code+b->nW>codeBuf+JIT_WORDS){
+        interp.jitRunOpcode();
+        return cycPerInsn;
+    }
+
+    executeBlock_asm(b->code);
+
+    const int      reason=g_exitReason[cpu];
+    const uint32_t expc  =g_exitPC[cpu];
+    g_totalJIT[cpu]++;
+
+    DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
+             cpu,pc,expc,reason,interp.getCpsrRef());
+
+    LoopState& ls=s_loop[cpu];
+
+    if(reason==EXIT_FALLBACK){
+        if(!ls.normBursting) resetNormSpin(ls);
+
+        if(ls.fbPC==expc){
+            ls.fbCount++;
+            if(ls.fbCount==SPIN_THRESH&&!ls.fbDumped){
+                ls.fbDumped=true;
+                DebugLog("[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
+                         cpu,expc,interp.getCpsrRef(),(int)interp.isThumb());
+                int stride=interp.isThumb()?2:4;
+                for(int k=-2;k<=4;k++){
+                    uint32_t a=expc+(uint32_t)(k*stride);
+                    uint32_t w=interp.isThumb()
+                        ?(uint32_t)core.memory.read<uint16_t>(arm7,a)
+                        :core.memory.read<uint32_t>(arm7,a);
+                    DebugLog("[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
+                }
+                uint32_t** regs=interp.getRegisters();
+                if(regs)for(int i=0;i<15;i++)if(regs[i])DebugLog("[JIT]   r%d=%08X\n",i,*regs[i]);
+            }
+            if(ls.fbCount>=SPIN_THRESH){
+                for(int i=0;i<SPIN_STEPS;i++){
+                    if(interp.halted)break;
+                    interp.jitRunOpcode();
+                    tickInline(core,SPIN_CYC_STEP);
+                    if(interp.halted)break;
+                    uint32_t newPC=interp.getActualPC();
+                    if(newPC!=expc){
+                        DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",cpu,newPC,i+1);
+                        ls.fbPC=0xFFFFFFFFu;ls.fbCount=0;ls.fbDumped=false;
+                        resetNormSpin(ls);
+                        break;
+                    }
+                }
+                return cycPerInsn;
+            }
+        }else{
+            if(ls.fbDumped)DebugLog("[JIT] SPIN cpu%d escaped to %08X\n",cpu,expc);
+            ls.fbPC   =expc;
+            ls.fbCount=1;
+            ls.fbDumped=false;
+        }
+        interp.jitRunOpcode();
+        return cycPerInsn;
+
+    }else{
+        ls.fbPC   =0xFFFFFFFFu;
+        ls.fbCount=0;
+        ls.fbDumped=false;
+
+        if(normSpinDetect(ls,pc,expc)){
+            const uint32_t spinA=ls.normBurstPC;
+            const uint32_t spinB=ls.normBurstExit;
+
+            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+            ls.normBursting=true;
+
+            bool escaped=false;
+            for(int i=0;i<SPIN_STEPS;i++){
+                if(interp.halted){escaped=true;break;}
+                interp.jitRunOpcode();
+                tickInline(core,SPIN_CYC_STEP);
+                if(interp.halted){escaped=true;break;}
+                uint32_t newPC=interp.getActualPC();
+                if(newPC!=spinA&&newPC!=spinB){
+                    DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                             cpu,spinA,newPC,i+1);
+                    escaped=true;
+                    break;
+                }
+            }
+
+            resetNormSpin(ls);
+
+            if(!escaped){
+                DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+            }
+
+            return cycPerInsn;
+        }
+
+        uint32_t n=b->insnCount>0?b->insnCount:1u;
+        return n*cycPerInsn;
+    }
+}
+```
+
+## Summary of Changes
+
+These three fixes address the core issues:
+
+1. **ARM7 cycle accounting** - Now properly converts ARM7 cycles to ARM9 equivalent (multiply by 2), ensuring the scheduler fires events at the correct rate for ARM7-related operations like IPCSYNC.
+
+2. **GBA HALT handling** - When the CPU is halted, we now check for pending interrupts that should wake it up, and ensure the VBlank interrupt can properly wake the CPU from HALT state.
+
+3. **Interrupt checking in runCpu** - Even when the CPU appears halted, we now check if an interrupt should wake it up, preventing the CPU from getting stuck indefinitely.
+
+These changes should resolve:
+- The NDS white screen issue (ARM7 not getting enough cycles for IPCSYNC)
+- The GBA black screen issue (CPU stuck in HALT waiting for VBlank interrupt)
+- The ARM7 light turning red in Rockwrestler (timeout due to incorrect cycle accounting)
