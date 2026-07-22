@@ -1418,15 +1418,18 @@ if(normSpinDetect(ls,pc,expc)){
         // Run the spinning CPU for a few steps
         interp.jitRunOpcode();
         
-        // Advance enough cycles to trigger events
+        // Limit cycle advancement to prevent GPU from rendering too many scanlines
         uint32_t cyclesToAdvance = SPIN_CYC_STEP;
         
         // If there are pending events, advance enough cycles to trigger the next one
+        // BUT limit to a reasonable amount to prevent frame timing issues
         if(!core.events.empty()) {
             uint32_t nextEventCycle = core.events.front().cycles;
             if(core.globalCycles < nextEventCycle) {
                 uint32_t needed = nextEventCycle - core.globalCycles;
-                if(needed > 0 && needed <= 8192) {
+                // Limit to at most 512 cycles per spin bursting step
+                // This prevents the GPU from rendering too many scanlines at once
+                if(needed > 0 && needed <= 512) {
                     cyclesToAdvance = needed;
                 }
             }
