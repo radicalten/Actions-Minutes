@@ -157,3 +157,6 @@ FAT mounted, logging started
 [JIT] cpu1 023801C0 -> 023801C0 r=0 cpsr=0000001F
 [JIT] cpu0 02000A64 -> 02000A60 r=0 cpsr=0000001F
 
+=====
+###NEver solved the issue, ran out of tokens laguna s 2.1 has only 1M context (same as gemini and claude sonnet which is big, but not big enough for this problem).
+
