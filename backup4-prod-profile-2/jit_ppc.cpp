@@ -1418,17 +1418,16 @@ if(normSpinDetect(ls,pc,expc)){
         // Run the spinning CPU for a few steps
         interp.jitRunOpcode();
         
-        // Limit cycle advancement to prevent GPU from rendering too many scanlines
+        // Advance enough cycles to trigger events
         uint32_t cyclesToAdvance = SPIN_CYC_STEP;
         
         // If there are pending events, advance enough cycles to trigger the next one
-        // BUT limit to a reasonable amount to prevent frame timing issues
+        // BUT limit to prevent GPU timing issues
         if(!core.events.empty()) {
             uint32_t nextEventCycle = core.events.front().cycles;
             if(core.globalCycles < nextEventCycle) {
                 uint32_t needed = nextEventCycle - core.globalCycles;
-                // Limit to at most 512 cycles per spin bursting step
-                // This prevents the GPU from rendering too many scanlines at once
+                // Limit to at most 512 cycles per step
                 if(needed > 0 && needed <= 512) {
                     cyclesToAdvance = needed;
                 }
@@ -1490,22 +1489,19 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    // Run both CPUs. ARM9 is master clock.
-    // ARM7 runs at half the clock rate, so one ARM7 cycle = 2 ARM9 cycles.
-    // We run them interleaved: for each ARM9 step, do one ARM7 step.
-    // globalCycles counts ARM9 cycles.
     uint32_t acc0=0;
     for(int i=0;i<ITERS_NDS;i++){
         acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
-        // ARM7 runs at half speed - each ARM7 cycle = 2 ARM9 cycles
         uint32_t arm7Cycles = runCpu(core,1,false);
         acc0 += arm7Cycles * 2;  // Convert ARM7 cycles to ARM9 equivalent
     }
 
-    // Always advance at least one scanline so events fire on time.
-    // If both CPUs were halted, still advance so IRQs can fire.
     uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
     tickInline(core,charge);
+    
+    // CRITICAL: Ensure all pending events are processed
+    forceProcessAllEvents(core);
+    
     logStatus(core);
 }
 
