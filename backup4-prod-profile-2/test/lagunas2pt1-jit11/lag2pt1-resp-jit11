@@ -2417,3 +2417,95 @@ These changes should break the deadlock by ensuring that:
 - Interrupts are properly delivered to wake CPUs from their spin loops
 
 This should resolve the white screen issue in NDS games by allowing the CPUs to properly synchronize and process interrupts.
+
+===
+I see the issue now! The regression is caused by the dynamic cycle advancement - when we advance enough cycles to trigger the next event, we're advancing too many cycles at once, which causes the GPU to render too many scanlines in a single frame, resulting in the bad linescroll.
+
+The problem is in this part:
+```cpp
+// If there are pending events, advance enough cycles to trigger the next one
+if(!core.events.empty()) {
+    uint32_t nextEventCycle = core.events.front().cycles;
+    if(core.globalCycles < nextEventCycle) {
+        uint32_t needed = nextEventCycle - core.globalCycles;
+        if(needed > 0 && needed <= 8192) {
+            cyclesToAdvance = needed;
+        }
+    }
+}
+```
+
+This advances ALL the cycles needed to reach the next event, which can be thousands of cycles. This causes the GPU to process too many scanlines at once.
+
+## The Fix: Limit Cycle Advancement During Spin Bursting
+
+We need to limit how many cycles we advance at once during spin bursting to prevent the GPU from rendering too many scanlines:
+
+```cpp
+if(normSpinDetect(ls,pc,expc)){
+    const uint32_t spinA=ls.normBurstPC;
+    const uint32_t spinB=ls.normBurstExit;
+
+    DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+    ls.normBursting=true;
+
+    bool escaped=false;
+    for(int i=0;i<SPIN_STEPS;i++){
+        if(interp.halted){escaped=true;break;}
+        
+        // Run the spinning CPU for a few steps
+        interp.jitRunOpcode();
+        
+        // Limit cycle advancement to prevent GPU from rendering too many scanlines
+        uint32_t cyclesToAdvance = SPIN_CYC_STEP;
+        
+        // If there are pending events, advance enough cycles to trigger the next one
+        // BUT limit to a reasonable amount to prevent frame timing issues
+        if(!core.events.empty()) {
+            uint32_t nextEventCycle = core.events.front().cycles;
+            if(core.globalCycles < nextEventCycle) {
+                uint32_t needed = nextEventCycle - core.globalCycles;
+                // Limit to at most 512 cycles per spin bursting step
+                // This prevents the GPU from rendering too many scanlines at once
+                if(needed > 0 && needed <= 512) {
+                    cyclesToAdvance = needed;
+                }
+            }
+        }
+        
+        tickInline(core,cyclesToAdvance);
+        
+        // CRITICAL: Run the OTHER CPU to give it a chance to signal us
+        int otherCpu = 1 - cpu;
+        if(!core.interpreter[otherCpu].halted) {
+            runCpu(core, otherCpu, false);
+            interp.interrupt();
+        }
+        
+        if(interp.halted){escaped=true;break;}
+        uint32_t newPC=interp.getActualPC();
+        if(newPC!=spinA&&newPC!=spinB){
+            DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                     cpu,spinA,newPC,i+1);
+            escaped=true;
+            break;
+        }
+    }
+
+    resetNormSpin(ls);
+
+    if(!escaped){
+        DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+    }
+
+    return cycPerInsn;
+}
+```
+
+The key change is limiting the cycle advancement to at most 512 cycles per spin bursting step. This ensures:
+1. Events still fire (512 cycles is enough to reach the next GPU scanline event in most cases)
+2. The GPU doesn't render too many scanlines at once (which causes the linescroll regression)
+
+With `SPIN_STEPS = 256` and a maximum of 512 cycles per step, we can advance up to 256 × 512 = 131,072 cycles during spin bursting, which should be more than enough to trigger events while preventing the GPU timing issues.
+
+This should fix the linescroll regression while still allowing the CPUs to break out of their spin loops.
