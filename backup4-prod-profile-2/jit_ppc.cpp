@@ -50,7 +50,7 @@ static const uint32_t FLOOR_CYCLES_GBA = 1232;
 // Spin detection
 static const uint32_t SPIN_THRESH   = 6;
 static const int      SPIN_STEPS    = 256;  // increased for GBA VBlank wait
-static const uint32_t SPIN_CYC_STEP = 4;
+static const uint32_t SPIN_CYC_STEP = 16;
 
 // ── Frame layout ──────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
