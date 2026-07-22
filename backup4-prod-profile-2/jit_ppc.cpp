@@ -1283,6 +1283,19 @@ static inline void tickInline(Core& core,uint32_t cycles){
     }
 }
 
+static inline void forceProcessAllEvents(Core& core) {
+    while(!core.events.empty()) {
+        SchedEvent e = core.events.front();
+        if(core.globalCycles >= e.cycles) {
+            core.events.erase(core.events.begin());
+            if(e.task >= 0 && e.task < MAX_TASKS && core.tasks[e.task].fn)
+                core.tasks[e.task]();
+        } else {
+            break;
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Per-CPU runner
 // ═══════════════════════════════════════════════════════════════════════
@@ -1404,13 +1417,27 @@ if(normSpinDetect(ls,pc,expc)){
         
         // Run the spinning CPU for a few steps
         interp.jitRunOpcode();
-        tickInline(core,SPIN_CYC_STEP);
+        
+        // Advance enough cycles to trigger events
+        uint32_t cyclesToAdvance = SPIN_CYC_STEP;
+        
+        // If there are pending events, advance enough cycles to trigger the next one
+        if(!core.events.empty()) {
+            uint32_t nextEventCycle = core.events.front().cycles;
+            if(core.globalCycles < nextEventCycle) {
+                uint32_t needed = nextEventCycle - core.globalCycles;
+                if(needed > 0 && needed <= 8192) {
+                    cyclesToAdvance = needed;
+                }
+            }
+        }
+        
+        tickInline(core,cyclesToAdvance);
         
         // CRITICAL: Run the OTHER CPU to give it a chance to signal us
         int otherCpu = 1 - cpu;
         if(!core.interpreter[otherCpu].halted) {
             runCpu(core, otherCpu, false);
-            // Check if the other CPU's execution caused an interrupt
             interp.interrupt();
         }
         
@@ -1432,7 +1459,6 @@ if(normSpinDetect(ls,pc,expc)){
 
     return cycPerInsn;
 }
-
         uint32_t n=b->insnCount>0?b->insnCount:1u;
         return n*cycPerInsn;
     }
