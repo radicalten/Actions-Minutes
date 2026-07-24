@@ -1,14 +1,11 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 4:
-// 1. MSR: implement full control-field (mask=1,3,9,b,f) mode switches via fallback
-//    The key fix: MSR with control bits must be handled — emit fallback so
-//    interpreter does the mode switch with correct banked register swap.
-// 2. GBA spin at VBlank wait: detect the single-instruction B . loop and
-//    run the interpreter for a full scanline worth of cycles before resuming JIT.
-// 3. NDS: ARM7 stuck waiting for IPCSYNC — the MSR mode switch fallback
-//    was clobbering state; fix by always falling back MSR with control bits.
-// 4. NDS cycle accounting: ARM7 cycles must pace correctly relative to ARM9.
-// 5. GBA: when burst escapes and immediately re-enters, use longer burst window.
+// Fixed revision 5:
+// 1. Fixed spin burst escape condition: distance check (diff >= 64) prevents
+//    fake escapes on step 1 of multi-instruction spin loops.
+// 2. Fixed cycle accounting: removed hardcoded FLOOR_CYCLES_NDS/GBA warping
+//    which caused ARM9/ARM7 clock desync and IPCSYNC timeouts.
+// 3. Expanded SPIN_STEPS to 2048 for proper IRQ/IPC servicing during bursts.
+// 4. Fixed invalidateJitRange overlap bounds check.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -41,16 +38,10 @@ static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 static const int ITERS_NDS = 32;
 static const int ITERS_GBA = 32;
 
-// Floor: one scanline worth of cycles per runJit* call.
-// NDS: 355*6 = 2130 ARM9 cycles
-// GBA: 308*4 = 1232 cycles
-static const uint32_t FLOOR_CYCLES_NDS = 2130;
-static const uint32_t FLOOR_CYCLES_GBA = 1232;
-
 // Spin detection
 static const uint32_t SPIN_THRESH   = 6;
-static const int      SPIN_STEPS    = 256;  // increased for GBA VBlank wait
-static const uint32_t SPIN_CYC_STEP = 16;
+static const int      SPIN_STEPS    = 2048;  // Sufficient window for VBlank/IPC wait
+static const uint32_t SPIN_CYC_STEP = 4;
 
 // ── Frame layout ──────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
@@ -882,23 +873,10 @@ static bool emitMul(Ctx& ctx,uint32_t op){
     patchSkip(ctx,si);return true;
 }
 
-// ── MSR/MRS ──────────────────────────────────────────────────────────
-// CRITICAL FIX: MSR with any control bits (mask & 0x7 != 0) changes the
-// CPU mode and swaps banked registers.  The JIT cannot do this safely
-// because it holds r0-r14 in fixed PPC registers that correspond to the
-// CURRENT mode's register file.  Attempting to patch CPSR in-place and
-// continue emitting would use the wrong register aliases.
-//
-// The correct solution is to fall back to the interpreter for ANY MSR
-// that touches control bits.  Only MSR that touches ONLY the flags field
-// (mask == 0x8, bits 31:24) is safe to handle inline because it doesn't
-// swap register banks.
-//
-// MRS is always safe (it reads CPSR/SPSR into a GPR, no mode switch).
 static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
 
-    // MRS Rd, CPSR  (0x010F0000 pattern)
+    // MRS Rd, CPSR
     if((op&0x0FBF0FFF)==0x010F0000){
         uint8_t rd=(op>>12)&0xF;if(rd==15)return false;
         size_t si=emitCondSkip(ctx,cond);
@@ -907,44 +885,37 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         return true;
     }
 
-    // MRS Rd, SPSR  (0x014F0000 pattern) — always fall back (SPSR is mode-dependent)
+    // MRS Rd, SPSR — fall back (SPSR is mode-dependent)
     if((op&0x0FBF0FFF)==0x014F0000) return false;
 
-    // MSR — check the field mask
     uint8_t mask=(op>>16)&0xF;
 
-    // If control bits are involved (mask & 0x7), we MUST fall back to the
-    // interpreter because a mode switch swaps banked registers.
-    // This covers mask values: 0x1(c), 0x2(x), 0x3(cx), 0x4(s), 0x5(cs),
-    // 0x6(xs), 0x7(cxs), 0x9(cf), 0xB(cxf), 0xD(csf), 0xF(cxsf).
+    // Control/extension/status field write -> mode switch fallback
     if(mask & 0x7) return false;
 
-    // mask == 0x8: flags field only (bits 31:24) — safe to handle inline.
-    // MSR CPSR_f, #imm
+    // mask == 0x8: flags field only (bits 31:24)
     if((op&0x0DB0F000)==0x0320F000){
         uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
         if(rot)imm=(imm>>rot)|(imm<<(32-rot));
-        imm&=0xFF000000u;  // only flags field
+        imm&=0xFF000000u;
         size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));  // clear bits 31:24
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
         ctx.li(TA,imm);
         ctx.E(ppc_or(RCPSR,RCPSR,TA));
         patchSkip(ctx,si);
         return true;
     }
 
-    // MSR CPSR_f, Rm
     if((op&0x0DB0FFF0)==0x0120F000){
         uint8_t rm=op&0xF;if(rm==15)return false;
         size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));          // clear bits 31:24
-        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));              // keep only bits 31:24 of Rm
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
+        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));
         ctx.E(ppc_or(RCPSR,RCPSR,TA));
         patchSkip(ctx,si);
         return true;
     }
 
-    // MSR SPSR_f — fall back (SPSR is mode-dependent)
     return false;
 }
 
@@ -982,10 +953,6 @@ static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
     if((op&0x0F000000)==0x0F000000)return false;
     if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)return emitBranch(ctx,op,curPC);
-    // MSR/MRS: handle the 0x01000000 space carefully.
-    // Note: some multiply instructions also fall in this space when bit 7
-    // and bit 4 are set — the dispatcher already checked for those above
-    // via the it==0 case, so here we only see genuine MRS/MSR.
     if((op&0x0F900000)==0x01000000){if(emitMrsMsr(ctx,op,curPC))return true;return false;}
     uint32_t it=(op>>25)&7;
     switch(it){
@@ -1283,30 +1250,12 @@ static inline void tickInline(Core& core,uint32_t cycles){
     }
 }
 
-static inline void forceProcessAllEvents(Core& core) {
-    while(!core.events.empty()) {
-        SchedEvent e = core.events.front();
-        if(core.globalCycles >= e.cycles) {
-            core.events.erase(core.events.begin());
-            if(e.task >= 0 && e.task < MAX_TASKS && core.tasks[e.task].fn)
-                core.tasks[e.task]();
-        } else {
-            break;
-        }
-    }
-}
-
 // ═══════════════════════════════════════════════════════════════════════
 // Per-CPU runner
 // ═══════════════════════════════════════════════════════════════════════
 static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
-    if(interp.halted) {
-        // Even when halted, we need to check if an interrupt should wake us
-        interp.interrupt();  // Check pending interrupts
-        if(interp.halted) return 0;  // Still halted
-        // Fall through to normal execution if woken up
-    }
+    if(interp.halted) return 0;
 
     const bool     arm7      =(cpu==1)||gba;
     const uint32_t cycPerInsn=arm7?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
@@ -1381,7 +1330,8 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                     tickInline(core,SPIN_CYC_STEP);
                     if(interp.halted)break;
                     uint32_t newPC=interp.getActualPC();
-                    if(newPC!=expc){
+                    uint32_t diff = (newPC > expc) ? (newPC - expc) : (expc - newPC);
+                    if(diff >= 64){
                         DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",cpu,newPC,i+1);
                         ls.fbPC=0xFFFFFFFFu;ls.fbCount=0;ls.fbDumped=false;
                         resetNormSpin(ls);
@@ -1404,63 +1354,39 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
         ls.fbCount=0;
         ls.fbDumped=false;
 
-if(normSpinDetect(ls,pc,expc)){
-    const uint32_t spinA=ls.normBurstPC;
-    const uint32_t spinB=ls.normBurstExit;
+        if(normSpinDetect(ls,pc,expc)){
+            const uint32_t spinA=ls.normBurstPC;
+            const uint32_t spinB=ls.normBurstExit;
 
-    DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
-    ls.normBursting=true;
+            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
+            ls.normBursting=true;
 
-    bool escaped=false;
-    for(int i=0;i<SPIN_STEPS;i++){
-        if(interp.halted){escaped=true;break;}
-        
-        // Run the spinning CPU for a few steps
-        interp.jitRunOpcode();
-        
-        // Advance enough cycles to trigger events
-        uint32_t cyclesToAdvance = SPIN_CYC_STEP;
-        
-        // If there are pending events, advance enough cycles to trigger the next one
-        // BUT limit to prevent GPU timing issues
-        if(!core.events.empty()) {
-            uint32_t nextEventCycle = core.events.front().cycles;
-            if(core.globalCycles < nextEventCycle) {
-                uint32_t needed = nextEventCycle - core.globalCycles;
-                // Limit to at most 512 cycles per step
-                if(needed > 0 && needed <= 512) {
-                    cyclesToAdvance = needed;
+            bool escaped=false;
+            for(int i=0;i<SPIN_STEPS;i++){
+                if(interp.halted){escaped=true;break;}
+                interp.jitRunOpcode();
+                tickInline(core,SPIN_CYC_STEP);
+                if(interp.halted){escaped=true;break;}
+                uint32_t newPC=interp.getActualPC();
+                uint32_t diffA = (newPC > spinA) ? (newPC - spinA) : (spinA - newPC);
+                uint32_t diffB = (newPC > spinB) ? (newPC - spinB) : (spinB - newPC);
+                if(diffA >= 64 && diffB >= 64){
+                    DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
+                             cpu,spinA,newPC,i+1);
+                    escaped=true;
+                    break;
                 }
             }
-        }
-        
-        tickInline(core,cyclesToAdvance);
-        
-        // CRITICAL: Run the OTHER CPU to give it a chance to signal us
-        int otherCpu = 1 - cpu;
-        if(!core.interpreter[otherCpu].halted) {
-            runCpu(core, otherCpu, false);
-            interp.interrupt();
-        }
-        
-        if(interp.halted){escaped=true;break;}
-        uint32_t newPC=interp.getActualPC();
-        if(newPC!=spinA&&newPC!=spinB){
-            DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
-                     cpu,spinA,newPC,i+1);
-            escaped=true;
-            break;
-        }
-    }
 
-    resetNormSpin(ls);
+            resetNormSpin(ls);
 
-    if(!escaped){
-        DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
-    }
+            if(!escaped){
+                DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
+            }
 
-    return cycPerInsn;
-}
+            return cycPerInsn;
+        }
+
         uint32_t n=b->insnCount>0?b->insnCount:1u;
         return n*cycPerInsn;
     }
@@ -1489,44 +1415,33 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    uint32_t acc0=0;
-    for(int i=0;i<ITERS_NDS;i++){
-        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
-        uint32_t arm7Cycles = runCpu(core,1,false);
-        acc0 += arm7Cycles * 2;  // Convert ARM7 cycles to ARM9 equivalent
+    uint32_t acc0 = 0;
+    uint32_t acc1 = 0;
+    for(int i = 0; i < ITERS_NDS; i++){
+        acc0 += runCpu(core, 0, false);  // ARM9 cycles
+        acc1 += runCpu(core, 1, false);  // ARM7 cycles
     }
 
-    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
-    tickInline(core,charge);
-    
-    // CRITICAL: Ensure all pending events are processed
-    forceProcessAllEvents(core);
-    
+    // ARM7 runs at half speed relative to ARM9 (1 ARM7 cycle = 2 ARM9 cycles)
+    uint32_t cyc7_in_9 = acc1 * 2;
+    uint32_t charge = (acc0 > cyc7_in_9) ? acc0 : cyc7_in_9;
+
+    if(charge == 0) charge = 16;  // Idle step if both CPUs halted
+
+    tickInline(core, charge);
     logStatus(core);
 }
 
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    // GBA mode: only cpu1 (ARM7) runs. cpu0 is permanently halted.
-    // Must always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
-    uint32_t acc=0;
-    for(int i=0;i<ITERS_GBA;i++){
-        uint32_t c=runCpu(core,1,true);
-        // When halted (HALT opcode waiting for IRQ), charge 1 cycle so
-        // the accumulator reflects time passing — otherwise the floor
-        // never gets reached and the VBlank IRQ never fires.
-        acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
-        
-        // If CPU is halted, check if an interrupt should wake it
-        if(core.interpreter[1].halted) {
-            // Process pending interrupts - this might unhalt the CPU
-            core.interpreter[1].interrupt();
-        }
+    uint32_t acc = 0;
+    for(int i = 0; i < ITERS_GBA; i++){
+        acc += runCpu(core, 1, true);
     }
 
-    uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
-    tickInline(core,charge);
+    uint32_t charge = (acc > 0) ? acc : 16;
+    tickInline(core, charge);
     logStatus(core);
 }
 
@@ -1584,7 +1499,7 @@ void shutdownJit(Core* core){
 
 void invalidateJitRange(uint32_t start,uint32_t end){
     for(size_t i=0;i<CSIZ;i++)
-        if(cache[i].valid&&cache[i].armPC>=start&&cache[i].armPC<end)
+        if(cache[i].valid && cache[i].armPC < end && (cache[i].armPC + 32) > start)
             cache[i].valid=false;
 }
 
