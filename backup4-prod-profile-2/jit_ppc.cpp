@@ -1,11 +1,9 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Revision 7 (Complete)
-// Fixes:
-// 1. Fixed LDM/STM exit logic in emitBlockXfer: Corrected PPC conditional branch
-//    so successful LDM/STM (TA == 0) continues block execution instead of
-//    falling through to EXIT_FALLBACK and re-executing in interpreter.
-// 2. Fixed spin burst escape condition (diff >= 64).
-// 3. Balanced clock accounting for dual-core NDS execution.
+// Revision 8:
+// 1. Removed destructive spin burst interpreter loops that desynchronized
+//    ARM9 and ARM7 cores and caused PC corruption to 0x00000000 / 0x00800000.
+// 2. Fixed emitBlockXfer (LDM/STM) conditional branch error path.
+// 3. Clean, lockstep dual-core execution for NDS and accurate timing for GBA.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -37,11 +35,6 @@ static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 
 static const int ITERS_NDS = 32;
 static const int ITERS_GBA = 32;
-
-// Spin detection
-static const uint32_t SPIN_THRESH   = 6;
-static const int      SPIN_STEPS    = 2048;
-static const uint32_t SPIN_CYC_STEP = 4;
 
 // ── Frame layout ──────────────────────────────────────────────────────
 static const int FRAME_SIZE    = 256;
@@ -85,66 +78,6 @@ static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
     }
     if (thumb) DebugLog("[JIT] thumb FB cpu%d pc=%08X op=%04X\n", cpu, pc, op);
     else       DebugLog("[JIT] arm   FB cpu%d pc=%08X op=%08X\n", cpu, pc, op);
-}
-
-// ── Loop detector ─────────────────────────────────────────────────────
-struct LoopState {
-    uint32_t fbPC    = 0xFFFFFFFFu;
-    uint32_t fbCount = 0;
-    bool     fbDumped= false;
-
-    uint32_t normHist[4]  = {0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu,0xFFFFFFFFu};
-    uint32_t normCount    = 0;
-    uint32_t normBurstPC  = 0xFFFFFFFFu;
-    uint32_t normBurstExit= 0xFFFFFFFFu;
-    bool     normBursting = false;
-};
-static LoopState s_loop[2];
-
-static void resetNormSpin(LoopState& ls) {
-    for(int j=0;j<4;j++) ls.normHist[j]=0xFFFFFFFFu;
-    ls.normCount     = 0;
-    ls.normBurstPC   = 0xFFFFFFFFu;
-    ls.normBurstExit = 0xFFFFFFFFu;
-    ls.normBursting  = false;
-}
-
-static bool normSpinDetect(LoopState& ls, uint32_t entryPC, uint32_t exitPC) {
-    if(ls.normBursting) return false;
-
-    ls.normHist[3] = ls.normHist[2];
-    ls.normHist[2] = ls.normHist[1];
-    ls.normHist[1] = ls.normHist[0];
-    ls.normHist[0] = exitPC;
-
-    if(exitPC == entryPC){
-        ls.normCount++;
-        if(ls.normCount >= SPIN_THRESH){
-            ls.normBurstPC   = entryPC;
-            ls.normBurstExit = exitPC;
-            return true;
-        }
-        return false;
-    }
-
-    if(ls.normHist[0] != 0xFFFFFFFFu &&
-       ls.normHist[1] != 0xFFFFFFFFu &&
-       ls.normHist[2] != 0xFFFFFFFFu &&
-       ls.normHist[3] != 0xFFFFFFFFu &&
-       ls.normHist[0] == ls.normHist[2] &&
-       ls.normHist[1] == ls.normHist[3] &&
-       ls.normHist[0] != ls.normHist[1]){
-        ls.normCount++;
-        if(ls.normCount >= SPIN_THRESH){
-            ls.normBurstPC   = ls.normHist[1];
-            ls.normBurstExit = ls.normHist[0];
-            return true;
-        }
-        return false;
-    }
-
-    ls.normCount = 0;
-    return false;
 }
 
 namespace JitPpc {
@@ -884,13 +817,12 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         return true;
     }
 
-    // MRS Rd, SPSR — fall back (SPSR is mode-dependent)
+    // MRS Rd, SPSR — fall back
     if((op&0x0FBF0FFF)==0x014F0000) return false;
 
     uint8_t mask=(op>>16)&0xF;
 
-    // MSR with control bits (mask & 0x7) causes CPU mode switches
-    // -> fall back to interpreter.
+    // Control/mode bits (mask & 0x7) -> mode switch fallback
     if(mask & 0x7) return false;
 
     // mask == 0x8: flags field only (bits 31:24)
@@ -921,7 +853,7 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
 
 static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;
-    if(cond==15||((op>>22)&1))return false;
+    if(cond==15||((op>>22)&1))return false; // If S==1, fallback
     uint8_t rn=(op>>16)&0xF;uint16_t list=(uint16_t)(op&0xFFFF);
     if(rn>14||!list)return false;
     bool load=(op>>20)&1,loadPC=load&&(list&0x8000);
@@ -933,34 +865,33 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     ctx.li(TC,op);ctx.E(ppc_addi(TD,1,(int16_t)FRAME_REGSYNC));
     ctx.E(ppc_lwz(TE,FRAME_SCR2,1));
     ctx.E(ppc_addi(TF,1,(int16_t)FRAME_PC));ctx.E(ppc_addi(TG,1,(int16_t)FRAME_CPSR));
-    
-    // Call helper
+
+    // Call helper: TA = -1 (error), 0 (ok, no PC), 1 (ok, PC loaded)
     ctx.call((void*)JitHelp_armBlock);
-    // TA = -1 (error), 0 (ok, no PC load), 1 (ok, PC loaded)
 
     // Check for error (TA < 0)
     ctx.E(ppc_cmpi(0,TA,0));
     size_t bGe=ctx.sz();
-    ctx.E(ppc_bc(12,0,0)); // bge (if TA >= 0, branch over fallback)
+    ctx.E(ppc_bc(4,0,0)); // bge cr0 (branch over the fallback if TA >= 0)
 
     // TA < 0: Error fallback
     emitReload(ctx);
     emitCommitExit(ctx,curPC,EXIT_FALLBACK);
 
-    // TA >= 0: Success path
-    patchSkip(ctx,bGe);
+    // TA >= 0: patch branch target here (success path)
+    {int32_t d=(int32_t)((ctx.sz()-bGe)*4);ctx.base[bGe]=ppc_bc(4,0,(int16_t)d);}
     emitReload(ctx);
 
     if(loadPC){
         ctx.E(ppc_cmpi(0,TA,1));
         size_t bEq=ctx.sz();
-        ctx.E(ppc_bc(12,2,0)); // beq (if TA == 1, branch to dynamic exit)
+        ctx.E(ppc_bc(12,2,0)); // beq (if TA == 1, PC loaded)
 
-        // TA == 0 (PC was not loaded)
+        // TA == 0 (PC not loaded)
         emitCommitExit(ctx,curPC+4,EXIT_NORMAL);
 
-        // TA == 1 (PC was written to FRAME_PC)
-        patchSkip(ctx,bEq);
+        // TA == 1 (PC was written into FRAME_PC)
+        {int32_t d=(int32_t)((ctx.sz()-bEq)*4);ctx.base[bEq]=ppc_bc(12,2,(int16_t)d);}
         emitCommitExitDyn(ctx,EXIT_NORMAL);
 
         if(si!=SIZE_MAX){patchSkip(ctx,si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);}
@@ -1274,7 +1205,7 @@ static inline void tickInline(Core& core,uint32_t cycles){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Per-CPU runner
+// Per-CPU runner (single block, no blocking spin loops)
 // ═══════════════════════════════════════════════════════════════════════
 static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
@@ -1317,102 +1248,20 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
     executeBlock_asm(b->code);
 
-    const int      reason=g_exitReason[cpu];
-    const uint32_t expc  =g_exitPC[cpu];
+    const int reason=g_exitReason[cpu];
     g_totalJIT[cpu]++;
 
-    DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
-             cpu,pc,expc,reason,interp.getCpsrRef());
-
-    LoopState& ls=s_loop[cpu];
-
     if(reason==EXIT_FALLBACK){
-        if(!ls.normBursting) resetNormSpin(ls);
-
-        if(ls.fbPC==expc){
-            ls.fbCount++;
-            if(ls.fbCount==SPIN_THRESH&&!ls.fbDumped){
-                ls.fbDumped=true;
-                DebugLog("[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
-                         cpu,expc,interp.getCpsrRef(),(int)interp.isThumb());
-                int stride=interp.isThumb()?2:4;
-                for(int k=-2;k<=4;k++){
-                    uint32_t a=expc+(uint32_t)(k*stride);
-                    uint32_t w=interp.isThumb()
-                        ?(uint32_t)core.memory.read<uint16_t>(arm7,a)
-                        :core.memory.read<uint32_t>(arm7,a);
-                    DebugLog("[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
-                }
-                uint32_t** regs=interp.getRegisters();
-                if(regs)for(int i=0;i<15;i++)if(regs[i])DebugLog("[JIT]   r%d=%08X\n",i,*regs[i]);
-            }
-            if(ls.fbCount>=SPIN_THRESH){
-                for(int i=0;i<SPIN_STEPS;i++){
-                    if(interp.halted)break;
-                    interp.jitRunOpcode();
-                    tickInline(core,SPIN_CYC_STEP);
-                    if(interp.halted)break;
-                    uint32_t newPC=interp.getActualPC();
-                    uint32_t diff = (newPC > expc) ? (newPC - expc) : (expc - newPC);
-                    if(diff >= 64){
-                        DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",cpu,newPC,i+1);
-                        ls.fbPC=0xFFFFFFFFu;ls.fbCount=0;ls.fbDumped=false;
-                        resetNormSpin(ls);
-                        break;
-                    }
-                }
-                return cycPerInsn;
-            }
-        }else{
-            if(ls.fbDumped)DebugLog("[JIT] SPIN cpu%d escaped to %08X\n",cpu,expc);
-            ls.fbPC   =expc;
-            ls.fbCount=1;
-            ls.fbDumped=false;
-        }
+        // The block committed at the faulting PC. Run exactly one interpreter
+        // instruction to make progress, then return to the caller so the
+        // other CPU and the scheduler can advance in lockstep.
         interp.jitRunOpcode();
         return cycPerInsn;
-
-    }else{
-        ls.fbPC   =0xFFFFFFFFu;
-        ls.fbCount=0;
-        ls.fbDumped=false;
-
-        if(normSpinDetect(ls,pc,expc)){
-            const uint32_t spinA=ls.normBurstPC;
-            const uint32_t spinB=ls.normBurstExit;
-
-            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
-            ls.normBursting=true;
-
-            bool escaped=false;
-            for(int i=0;i<SPIN_STEPS;i++){
-                if(interp.halted){escaped=true;break;}
-                interp.jitRunOpcode();
-                tickInline(core,SPIN_CYC_STEP);
-                if(interp.halted){escaped=true;break;}
-                uint32_t newPC=interp.getActualPC();
-                uint32_t diffA = (newPC > spinA) ? (newPC - spinA) : (spinA - newPC);
-                uint32_t diffB = (newPC > spinB) ? (newPC - spinB) : (spinB - newPC);
-                if(diffA >= 64 && diffB >= 64){
-                    DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
-                             cpu,spinA,newPC,i+1);
-                    escaped=true;
-                    break;
-                }
-            }
-
-            resetNormSpin(ls);
-
-            if(!escaped){
-                DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
-            }
-
-            return cycPerInsn;
-        }
-
-        uint32_t n=b->insnCount>0?b->insnCount:1u;
-        return n*cycPerInsn;
     }
+
+    // Normal exit: charge for the instructions the block actually executed.
+    uint32_t n=b->insnCount>0?b->insnCount:1u;
+    return n*cycPerInsn;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1438,33 +1287,31 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    uint32_t acc0 = 0;
-    uint32_t acc1 = 0;
+    // Lockstep interleave: run one block on each core, then tick the
+    // scheduler by the elapsed ARM9-equivalent cycles. Neither core is
+    // ever allowed to run ahead of the other by more than one block.
     for(int i = 0; i < ITERS_NDS; i++){
-        acc0 += runCpu(core, 0, false);  // ARM9
-        acc1 += runCpu(core, 1, false);  // ARM7
+        uint32_t c0 = runCpu(core, 0, false);  // ARM9
+        uint32_t c1 = runCpu(core, 1, false);  // ARM7 (1 cyc = 2 ARM9 cyc)
+
+        uint32_t cyc7_in_9 = c1 * 2;
+        uint32_t charge = (c0 > cyc7_in_9) ? c0 : cyc7_in_9;
+        if(charge == 0) charge = 8;  // both halted: idle step
+        tickInline(core, charge);
     }
 
-    // 1 ARM7 cycle = 2 ARM9 cycles
-    uint32_t cyc7_in_9 = acc1 * 2;
-    uint32_t charge = (acc0 > cyc7_in_9) ? acc0 : cyc7_in_9;
-
-    if(charge == 0) charge = 16;  // Idle step if both CPUs halted
-
-    tickInline(core, charge);
     logStatus(core);
 }
 
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    uint32_t acc = 0;
     for(int i = 0; i < ITERS_GBA; i++){
-        acc += runCpu(core, 1, true);
+        uint32_t c = runCpu(core, 1, true);
+        if(c == 0) c = 8;  // halted: idle step so VBlank IRQ can fire
+        tickInline(core, c);
     }
 
-    uint32_t charge = (acc > 0) ? acc : 16;
-    tickInline(core, charge);
     logStatus(core);
 }
 
@@ -1487,12 +1334,6 @@ bool initJit(Core* core){
     g_totalFB[0]=g_totalFB[1]=0;
     g_totalJIT[0]=g_totalJIT[1]=0;
     g_statusTick=0;
-    s_loop[0]={};s_loop[1]={};
-    for(int j=0;j<4;j++){s_loop[0].normHist[j]=0xFFFFFFFFu;s_loop[1].normHist[j]=0xFFFFFFFFu;}
-    s_loop[0].fbPC=s_loop[1].fbPC=0xFFFFFFFFu;
-    s_loop[0].normBurstPC=s_loop[0].normBurstExit=0xFFFFFFFFu;
-    s_loop[1].normBurstPC=s_loop[1].normBurstExit=0xFFFFFFFFu;
-    s_loop[0].normBursting=s_loop[1].normBursting=false;
     for(size_t i=0;i<CSIZ;i++)cache[i].valid=false;
     memset(g_exitPC,  0,sizeof g_exitPC);
     memset(g_exitCPSR,0,sizeof g_exitCPSR);
