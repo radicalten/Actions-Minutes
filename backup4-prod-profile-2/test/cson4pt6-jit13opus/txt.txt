@@ -1,1 +1,55 @@
 cson4pt6 did not make a good update brought it down to 2.5fps on the Dolphin emu itself not the ingame fps, games don't even load now, not even rockwrestler.nds
+
+This update was a regression, it lowered fps. 
+Here is the rockwrestler.nds dbug logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006e9fc
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80548760 tramp=0x8009f340 BLK_ARMS=8
+[JIT] cache flushed gen=1
+[JIT] cache flushed gen=2
+[JIT] cache flushed gen=3
+[JIT] cache flushed gen=4
+[JIT] cache flushed gen=5
+[JIT] cache flushed gen=6
+[JIT] cache flushed gen=7
+[JIT] cache flushed gen=8
+[JIT] cache flushed gen=9
+[JIT] cache flushed gen=10
+[JIT] cache flushed gen=11
+[JIT] cache flushed gen=12
+[JIT] cache flushed gen=13
+[JIT] cache flushed gen=14
+[JIT] cache flushed gen=15
+[JIT] STATUS jit0=32768 fb0=0 jit1=32768 fb1=0 pos=339500 gen=15
+[JIT] STATUS pc0=02000100 pc1=03800100 h0=0 h1=0 fps=0 cyc=65536
+[JIT] cache flushed gen=16
+[JIT] cache flushed gen=17
+[JIT] cache flushed gen=18
+[JIT] cache flushed gen=19
+[JIT] cache flushed gen=20
+[JIT] cache flushed gen=21
+[JIT] cache flushed gen=22
+[JIT] cache flushed gen=23
+[JIT] cache flushed gen=24
+[JIT] cache flushed gen=25
+[JIT] cache flushed gen=26
+[JIT] cache flushed gen=27
+[JIT] cache flushed gen=28
+[JIT] cache flushed gen=29
+[JIT] cache flushed gen=30
+[JIT] cache flushed gen=31
+[JIT] STATUS jit0=65536 fb0=0 jit1=65536 fb1=0 pos=155500 gen=31
+[JIT] STATUS pc0=02000100 pc1=03800100 h0=0 h1=0 fps=0 cyc=131072
+[JIT] cache flushed gen=32
+[JIT] cache flushed gen=33
+[JIT] cache flushed gen=34
+[JIT] cache flushed gen=35
+[JIT] cache flushed gen=36
+[JIT] cache flushed gen=37
+[JIT] cache flushed gen=38
+[JIT] cache flushed gen=39
+[JIT] cache flushed gen=40
+[JIT] cache flushed gen=41
+[JIT] cache flushed gen=42
