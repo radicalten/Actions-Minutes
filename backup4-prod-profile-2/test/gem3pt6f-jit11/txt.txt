@@ -25,3 +25,156 @@ FAT mounted, logging started
 [JIT] NORM SPIN cpu1 burst exhausted at 03800728
 [JIT] cpu0 020002CC -> 020002C0 r=0 cpsr=000000DF
 [JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+
+###The fix broke it even more now rockwrestler displays a black topscreen and a white bottom screen.
+Now even the rockwrestler.nds rom appears incorrectly. the top screen is black and the bottom screen is white.
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f824
+[STATUS] fps=7 cycles=16975350 pc0=FFFFFFFF pc1=FFFFFFFF halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=7 cycles=34146602 pc0=FFFFFFFF pc1=FFFFFFFF halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=7 cycles=51317598 pc0=FFFFFFFF pc1=FFFFFFFF halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80549b20 tramp=0x800a03e0 BLK_ARMS=8
+[JIT] cpu0 02000100 -> 02002D2C r=0 cpsr=000000DF
+[JIT] cpu1 03800100 -> 038002C0 r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] cpu0 02002D2C -> 02002D34 r=1 cpsr=000000DF
+[JIT] cpu1 038002C0 -> 038002EC r=0 cpsr=000000DF
+[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10
+[JIT] cpu0 02002D38 -> 02002D3C r=1 cpsr=000000DF
+[JIT] arm   FB cpu1 pc=038002FC op=E121F003
+...
+[JIT] cpu0 00000240 -> 00000260 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 burst exhausted at 03800728
+[JIT] cpu0 00000260 -> 00000280 r=0 cpsr=000000DF
+...
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] cpu1 03800728 -> 03800728 r=0 cpsr=000000DF
+[JIT] NORM SPIN cpu1 detected at 03800728->03800728, bursting
+[JIT] NORM SPIN cpu1 escaped 03800728->03800210 after 1037 steps
+[JIT] cpu1 03800210 -> 03800230 r=0 cpsr=600000DF
+[JIT] arm   FB cpu1 pc=0380023C op=979FF103
+[JIT] cpu1 03800230 -> 0380023C r=1 cpsr=800000DF
+[JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
+[JIT] STATUS pc0=00000000 pc1=00000000 h0=0 h1=0 fps=2 cyc=2165686
+[JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
+[JIT] STATUS pc0=00000000 pc1=00000000 h0=0 h1=0 fps=2 cyc=2231222
+[JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
+[JIT] STATUS pc0=00000000 pc1=00000000 h0=0 h1=0 fps=2 cyc=2296758
+[JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
+[JIT] STATUS pc0=00000000 pc1=00000000 h0=0 h1=0 fps=2 cyc=2362294
+[JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
+[JIT] STATUS pc0=00000000 pc1=00000000 h0=0 h1=0 fps=2 cyc=2427830
+[JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
+...
+JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
+[JIT] STATUS pc0=00000000 pc1=00000000 h0=0 h1=0 fps=3 cyc=6228918
+[JIT] cpu0 bad PC 007FFFFC
+[JIT] cpu0 bad PC 00800000
+[JIT] cpu0 bad PC 00800004
+[JIT] cpu0 bad PC 00800008
+[JIT] cpu0 bad PC 0080000C
+[JIT] cpu0 bad PC 00800010
+[JIT] cpu0 bad PC 00800014
+[JIT] cpu0 bad PC 00800018
+[JIT] cpu0 bad PC 0080001C
+[JIT] cpu0 bad PC 00800020
+[JIT] cpu0 bad PC 00800024
+[JIT] cpu0 bad PC 00800028
+[JIT] cpu0 bad PC 0080002C
+[JIT] cpu0 bad PC 00800030
+[JIT] cpu0 bad PC 00800034
+[JIT] cpu0 bad PC 00800038
+[JIT] cpu0 bad PC 0080003C
+[JIT] cpu0 bad PC 00800040
+[JIT] cpu0 bad PC 00800044
+[JIT] cpu0 bad PC 00800048
+[JIT] cpu0 bad PC 0080004C
+[JIT] cpu0 bad PC 00800050
+[JIT] cpu0 bad PC 00800054
+[JIT] cpu0 bad PC 00800058
+[JIT] cpu0 bad PC 0080005C
+[JIT] cpu0 bad PC 00800060
+[JIT] cpu0 bad PC 00800064
+[JIT] cpu0 bad PC 00800068
+[JIT] cpu0 bad PC 0080006C
+[JIT] cpu0 bad PC 00800070
+[JIT] cpu0 bad PC 00800074
+[JIT] cpu0 bad PC 00800078
+[JIT] cpu0 bad PC 0080007C
+[JIT] cpu0 bad PC 00800080
+[JIT] cpu0 bad PC 00800084
+[JIT] cpu0 bad PC 00800088
+[JIT] cpu0 bad PC 0080008C
+[JIT] cpu0 bad PC 00800090
+[JIT] cpu0 bad PC 00800094
+[JIT] cpu0 bad PC 00800098
+[JIT] cpu0 bad PC 0080009C
+[JIT] cpu0 bad PC 008000A0
+[JIT] cpu0 bad PC 008000A4
+[JIT] cpu0 bad PC 008000A8
+[JIT] cpu0 bad PC 008000AC
+[JIT] cpu0 bad PC 008000B0
+[JIT] cpu0 bad PC 008000B4
+[JIT] cpu0 bad PC 008000B8
+[JIT] cpu0 bad PC 008000BC
+[JIT] cpu0 bad PC 008000C0
+[JIT] cpu0 bad PC 008000C4
+[JIT] cpu0 bad PC 008000C8
+[JIT] cpu0 bad PC 008000CC
+[JIT] cpu0 bad PC 008000D0
+[JIT] cpu0 bad PC 008000D4
+[JIT] cpu0 bad PC 008000D8
+[JIT] cpu0 bad PC 008000DC
+[JIT] cpu0 bad PC 008000E0
+[JIT] cpu0 bad PC 008000E4
+[JIT] cpu0 bad PC 008000E8
+[JIT] cpu0 bad PC 008000EC
+[JIT] cpu0 bad PC 008000F0
+[JIT] cpu0 bad PC 008000F4
+[JIT] cpu0 bad PC 008000F8
+[JIT] cpu0 bad PC 008000FC
+[JIT] cpu0 bad PC 00800100
+[JIT] cpu0 bad PC 00800104
+[JIT] cpu0 bad PC 00800108
+[JIT] cpu0 bad PC 0080010C
+[JIT] cpu0 bad PC 00800110
+[JIT] cpu0 bad PC 00800114
+[JIT] cpu0 bad PC 00800118
+[JIT] cpu0 bad PC 0080011C
+[JIT] cpu0 bad PC 00800120
+[JIT] cpu0 bad PC 00800124
+[JIT] cpu0 bad PC 00800128
+[JIT] cpu0 bad PC 0080012C
+[JIT] cpu0 bad PC 00800130
+[JIT] cpu0 bad PC 00800134
+[JIT] cpu0 bad PC 00800138
+[JIT] cpu0 bad PC 0080013C
+[JIT] cpu0 bad PC 00800140
+[JIT] cpu0 bad PC 00800144
+[JIT] cpu0 bad PC 00800148
+[JIT] cpu0 bad PC 0080014C
+[JIT] cpu0 bad PC 00800150
+[JIT] cpu0 bad PC 00800154
+[JIT] cpu0 bad PC 00800158
+[JIT] cpu0 bad PC 0080015C
+[JIT] cpu0 bad PC 00800160
+[JIT] cpu0 bad PC 00800164
+[JIT] cpu0 bad PC 00800168
+[JIT] cpu0 bad PC 0080016C
+[JIT] cpu0 bad PC 00800170
+[JIT] cpu0 bad PC 00800174
+[JIT] cpu0 bad PC 00800178
+[JIT] cpu0 bad PC 0080017C
+[JIT] cpu0 bad PC 00800180
+[JIT] cpu0 bad PC 00800184
+[JIT] cpu0 bad PC 00800188
+[JIT] cpu0 bad PC 0080018C
+[JIT] cpu0 bad PC 00800190
+[JIT] cpu0 bad PC 00800194
+[JIT] cpu0 bad PC 00800198
+[JIT] cpu0 bad PC 0080019C
+
