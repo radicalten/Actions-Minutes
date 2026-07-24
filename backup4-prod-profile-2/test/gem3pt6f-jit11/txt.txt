@@ -234,3 +234,4 @@ FAT mounted, logging started
 [JIT] STATUS pc0=020001A4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1635162
 [JIT] arm   FB cpu1 pc=0380023C op=979FF103
 
+#hit the token limit here. ah well another failed attempt perhaps try this opus version as jit13? could be worth a try.
