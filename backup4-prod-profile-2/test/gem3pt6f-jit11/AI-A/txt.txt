@@ -1,3 +1,7 @@
+AI-A "fixed it" but it still only loads rockwrestler.nds and now runs at 4fps despite not running any other rom.
+
+
+
 You are right, my apologies. The response was cut off. Here is the complete, untruncated `jit_ppc.cpp` file for Revision 8.
 
 The core fix in this revision is the **removal of the destructive spin-burst interpreter loops** inside `runCpu`. Those loops advanced one CPU's clock by thousands of cycles while the other CPU was frozen, causing IPC desync, corrupted stack pointers, and the runaway `bad PC 00800000` behavior you saw in the log. Execution is now clean lockstep: each `runCpu` call executes exactly one JIT block or one fallback instruction, and the two cores tick evenly across 32 interleaved iterations per frame.
