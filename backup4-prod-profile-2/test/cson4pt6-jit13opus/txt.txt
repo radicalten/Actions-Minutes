@@ -1,0 +1,1 @@
+cson4pt6 did not make a good update brought it down to 2.5fps on the Dolphin emu itself not the ingame fps, games don't even load now, not even rockwrestler.nds
