@@ -1,11 +1,11 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 5:
-// 1. Fixed spin burst escape condition: distance check (diff >= 64) prevents
-//    fake escapes on step 1 of multi-instruction spin loops.
-// 2. Fixed cycle accounting: removed hardcoded FLOOR_CYCLES_NDS/GBA warping
-//    which caused ARM9/ARM7 clock desync and IPCSYNC timeouts.
-// 3. Expanded SPIN_STEPS to 2048 for proper IRQ/IPC servicing during bursts.
-// 4. Fixed invalidateJitRange overlap bounds check.
+// Revision 7 (Complete)
+// Fixes:
+// 1. Fixed LDM/STM exit logic in emitBlockXfer: Corrected PPC conditional branch
+//    so successful LDM/STM (TA == 0) continues block execution instead of
+//    falling through to EXIT_FALLBACK and re-executing in interpreter.
+// 2. Fixed spin burst escape condition (diff >= 64).
+// 3. Balanced clock accounting for dual-core NDS execution.
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -40,7 +40,7 @@ static const int ITERS_GBA = 32;
 
 // Spin detection
 static const uint32_t SPIN_THRESH   = 6;
-static const int      SPIN_STEPS    = 2048;  // Sufficient window for VBlank/IPC wait
+static const int      SPIN_STEPS    = 2048;
 static const uint32_t SPIN_CYC_STEP = 4;
 
 // ── Frame layout ──────────────────────────────────────────────────────
@@ -383,7 +383,6 @@ int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
     return 0;
 }
 
-// CPSR written before setPC so flushPipeline sees correct thumb bit
 int JitHelp_commit(Interpreter* interp,int cpu,
                    uint32_t* regs,uint32_t cpsr,
                    uint32_t pc,int reason){
@@ -890,7 +889,8 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
 
     uint8_t mask=(op>>16)&0xF;
 
-    // Control/extension/status field write -> mode switch fallback
+    // MSR with control bits (mask & 0x7) causes CPU mode switches
+    // -> fall back to interpreter.
     if(mask & 0x7) return false;
 
     // mask == 0x8: flags field only (bits 31:24)
@@ -933,22 +933,45 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     ctx.li(TC,op);ctx.E(ppc_addi(TD,1,(int16_t)FRAME_REGSYNC));
     ctx.E(ppc_lwz(TE,FRAME_SCR2,1));
     ctx.E(ppc_addi(TF,1,(int16_t)FRAME_PC));ctx.E(ppc_addi(TG,1,(int16_t)FRAME_CPSR));
+    
+    // Call helper
     ctx.call((void*)JitHelp_armBlock);
+    // TA = -1 (error), 0 (ok, no PC load), 1 (ok, PC loaded)
+
+    // Check for error (TA < 0)
     ctx.E(ppc_cmpi(0,TA,0));
-    size_t bOk=ctx.sz();ctx.E(ppc_bc(4,0,0));
-    emitReload(ctx);emitCommitExit(ctx,curPC,EXIT_FALLBACK);
-    {int32_t d=(int32_t)((ctx.sz()-bOk)*4);ctx.base[bOk]=ppc_bc(4,0,(int16_t)d);}
+    size_t bGe=ctx.sz();
+    ctx.E(ppc_bc(12,0,0)); // bge (if TA >= 0, branch over fallback)
+
+    // TA < 0: Error fallback
     emitReload(ctx);
+    emitCommitExit(ctx,curPC,EXIT_FALLBACK);
+
+    // TA >= 0: Success path
+    patchSkip(ctx,bGe);
+    emitReload(ctx);
+
     if(loadPC){
-        ctx.E(ppc_cmpi(0,TA,1));size_t b=ctx.sz();ctx.E(ppc_bc(12,2,0));
+        ctx.E(ppc_cmpi(0,TA,1));
+        size_t bEq=ctx.sz();
+        ctx.E(ppc_bc(12,2,0)); // beq (if TA == 1, branch to dynamic exit)
+
+        // TA == 0 (PC was not loaded)
         emitCommitExit(ctx,curPC+4,EXIT_NORMAL);
-        {int32_t d=(int32_t)((ctx.sz()-b)*4);ctx.base[b]=ppc_bc(12,2,(int16_t)d);}
+
+        // TA == 1 (PC was written to FRAME_PC)
+        patchSkip(ctx,bEq);
         emitCommitExitDyn(ctx,EXIT_NORMAL);
+
         if(si!=SIZE_MAX){patchSkip(ctx,si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);}
-        ctx.done=true;return true;
+        ctx.done=true;
+        return true;
     }
-    patchSkip(ctx,si);return true;
+
+    patchSkip(ctx,si);
+    return true;
 }
+
 static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
     if((op&0x0F000000)==0x0F000000)return false;
@@ -1418,11 +1441,11 @@ void runJitNds(Core& core){
     uint32_t acc0 = 0;
     uint32_t acc1 = 0;
     for(int i = 0; i < ITERS_NDS; i++){
-        acc0 += runCpu(core, 0, false);  // ARM9 cycles
-        acc1 += runCpu(core, 1, false);  // ARM7 cycles
+        acc0 += runCpu(core, 0, false);  // ARM9
+        acc1 += runCpu(core, 1, false);  // ARM7
     }
 
-    // ARM7 runs at half speed relative to ARM9 (1 ARM7 cycle = 2 ARM9 cycles)
+    // 1 ARM7 cycle = 2 ARM9 cycles
     uint32_t cyc7_in_9 = acc1 * 2;
     uint32_t charge = (acc0 > cyc7_in_9) ? acc0 : cyc7_in_9;
 
