@@ -178,3 +178,59 @@ JIT] STATUS jit0=1068 fb0=25 jit1=1553 fb1=4 pos=226474 gen=0
 [JIT] cpu0 bad PC 00800198
 [JIT] cpu0 bad PC 0080019C
 
+====
+Was intercepted gy AI-A and AI-B, AI-A was claude opus 4.8 which fixed it but made it 4fps and only rockwrestler runs, not anything else. at least the arm7 is green in the top right for rockwrestler.nds
+
+Ok With this change rockwrestler.nds works just fine again. and the ARM7 light is green. however it is 4fps and no other rom loads still.
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006ebe0
+[STATUS] fps=5 cycles=16655578 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x80548920 tramp=0x8009f520 BLK_ARMS=8
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] arm   FB cpu0 pc=02002D3C op=EE120F10
+[JIT] arm   FB cpu1 pc=038002FC op=E121F003
+[JIT] arm   FB cpu0 pc=02002D44 op=EE120F30
+[JIT] arm   FB cpu1 pc=03800304 op=E121F004
+[JIT] arm   FB cpu0 pc=02002D4C op=EE130F10
+[JIT] arm   FB cpu0 pc=02002D54 op=EE150F10
+[JIT] arm   FB cpu0 pc=02002D5C op=EE150F30
+[JIT] arm   FB cpu0 pc=02002D64 op=EE150F50
+[JIT] arm   FB cpu1 pc=0380074C op=E121F003
+[JIT] arm   FB cpu0 pc=02002D6C op=EE150F70
+[JIT] arm   FB cpu0 pc=02002D74 op=EE160F10
+[JIT] arm   FB cpu0 pc=02002D7C op=EE160F11
+[JIT] arm   FB cpu0 pc=02002D84 op=EE160F12
+[JIT] arm   FB cpu0 pc=02002D8C op=EE160F13
+[JIT] arm   FB cpu0 pc=02002D94 op=EE160F14
+[JIT] arm   FB cpu0 pc=02002D9C op=EE160F15
+[JIT] arm   FB cpu0 pc=02002DA4 op=EE160F16
+[JIT] arm   FB cpu0 pc=02002DAC op=EE160F17
+[JIT] arm   FB cpu0 pc=02002DB4 op=EE190F11
+[JIT] arm   FB cpu0 pc=02002DBC op=EE190F31
+[JIT] arm   FB cpu0 pc=02002DF0 op=E121F003
+[JIT] arm   FB cpu0 pc=02002DF8 op=E121F004
+[JIT] arm   FB cpu0 pc=02007D20 op=E121F003
+[JIT] arm   FB cpu0 pc=020050B4 op=E49DF004
+[JIT] arm   FB cpu0 pc=02000CA4 op=EE010F10
+[JIT] arm   FB cpu0 pc=02000CB4 op=EE090F11
+[JIT] arm   FB cpu0 pc=02000CC4 op=EE090F31
+[JIT] STATUS jit0=32768 fb0=25 jit1=32768 fb1=3 pos=17360 gen=0
+[JIT] STATUS pc0=02000288 pc1=03800728 h0=0 h1=0 fps=0 cyc=242572
+[JIT] STATUS jit0=65536 fb0=25 jit1=65536 fb1=3 pos=24025 gen=0
+[JIT] STATUS pc0=020001A4 pc1=03800728 h0=0 h1=0 fps=0 cyc=450926
+[JIT] STATUS jit0=98304 fb0=25 jit1=98304 fb1=3 pos=24025 gen=0
+[JIT] STATUS pc0=020001B4 pc1=03800728 h0=0 h1=0 fps=0 cyc=647536
+[JIT] STATUS jit0=131072 fb0=25 jit1=131072 fb1=3 pos=24025 gen=0
+[JIT] STATUS pc0=020001B4 pc1=03800728 h0=0 h1=0 fps=0 cyc=844144
+[JIT] STATUS jit0=163840 fb0=25 jit1=163840 fb1=3 pos=24237 gen=0
+[JIT] STATUS pc0=020001A4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1043044
+[JIT] STATUS jit0=196608 fb0=25 jit1=196608 fb1=3 pos=24237 gen=0
+[JIT] STATUS pc0=020001B4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1239654
+[JIT] STATUS jit0=229376 fb0=25 jit1=229376 fb1=3 pos=24237 gen=0
+[JIT] STATUS pc0=020001B4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1436262
+[JIT] STATUS jit0=262144 fb0=25 jit1=262144 fb1=3 pos=24237 gen=0
+[JIT] STATUS pc0=020001A4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1635162
+[JIT] arm   FB cpu1 pc=0380023C op=979FF103
+
