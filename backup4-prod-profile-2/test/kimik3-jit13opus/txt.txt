@@ -1,1 +1,4 @@
 used the kimi-k3-code version on jit13-opus, it produced a webpage with a fix. but the fix did not meaningfully change anything. still 3fps on rockwrestler as the jit13-opus version was as well on rockwrestler. no other game launched nds or gba same as before. only gba boot logo. will try with jitrec 11 in the text rather than code verision and hope that works. 
+
+===
+the jit11 kimi k3 fix runs the same as default jit11. no improvement found although I only applied patch 1 of 5 it suggested. where it stated only patch 1 was required to fix it. and the patch 2-5 were only recommendations. 
