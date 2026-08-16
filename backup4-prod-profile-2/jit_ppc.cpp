@@ -294,7 +294,7 @@ static void flushICache(uint32_t* p,size_t nW){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Interpreter Next-PC Helper (accounting for NooDS pipeline)
+// Next-PC Helper (accounting for NooDS pipeline)
 // ═══════════════════════════════════════════════════════════════════════
 static inline uint32_t getInterpPC(Interpreter* interp) {
     if (!interp) return 0;
@@ -874,7 +874,7 @@ static bool emitLSExtra(Ctx& ctx,uint32_t op,uint32_t){
     ctx.E(ppc_lwz(TA,FRAME_SCR0,1));
     if(!p){
         if(!l || rn != rd){
-            if(u)ctx.E(ppc_add(RA[rn],RA[rn],TA));else ctx.E(ppc_subf(RA[rn],TA,RA[rn])); // FIX: changed 'up' to 'u'
+            if(u)ctx.E(ppc_add(RA[rn],RA[rn],TA));else ctx.E(ppc_subf(RA[rn],TA,RA[rn]));
         }
     } else if(w&&rn!=rd)ctx.E(ppc_lwz(RA[rn],FRAME_SCR1,1));
     patchSkip(ctx,si);return true;
@@ -999,6 +999,7 @@ static bool emitT_shifts(Ctx& ctx,uint16_t op){
     }
     setNZ(ctx,RA[rd]);setC_imm(ctx,TC);return true;
 }
+
 static bool emitT_addSub3(Ctx& ctx,uint16_t op){
     uint8_t rd=op&7,rs=(op>>3)&7;bool sub=(op>>9)&1,imm3=(op>>10)&1;
     if(imm3)ctx.li(TA,(op>>6)&7);else ctx.E(ppc_mr(TA,RA[(op>>6)&7]));
@@ -1007,6 +1008,7 @@ static bool emitT_addSub3(Ctx& ctx,uint16_t op){
     else{ctx.E(ppc_addc(RA[rd],TB,TA));setNZ(ctx,RA[rd]);setC_xer(ctx);setV_add(ctx,RA[rd],TB,TA);}
     return true;
 }
+
 static bool emitT_imm8(Ctx& ctx,uint16_t op){
     uint8_t ty=(op>>11)&3,rd=(op>>8)&7;uint32_t imm=op&0xFF;uint8_t p=RA[rd];
     switch(ty){
@@ -1017,6 +1019,7 @@ static bool emitT_imm8(Ctx& ctx,uint16_t op){
     }
     return false;
 }
+
 static bool emitT_alu(Ctx& ctx,uint16_t op){
     uint8_t rd=op&7,rs=(op>>3)&7,o=(op>>6)&0xF;uint8_t d=RA[rd],s=RA[rs];
     switch(o){
@@ -1040,6 +1043,7 @@ static bool emitT_alu(Ctx& ctx,uint16_t op){
     }
     return true;
 }
+
 static bool emitT_hiReg(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t o=(op>>8)&3,rs=((op>>3)&7)|(((op>>6)&1)<<3),rd=(op&7)|(((op>>7)&1)<<3);
     if(o==3){
@@ -1064,11 +1068,13 @@ static bool emitT_hiReg(Ctx& ctx,uint16_t op,uint32_t curPC){
     }
     return true;
 }
+
 static bool emitT_ldrPc(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t rd=(op>>8)&7;uint32_t addr=((curPC+4)&~3u)+((uint32_t)(op&0xFF)<<2);
     ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.li(TC,addr);ctx.call((void*)JitHelp_r32);
     ctx.E(ppc_mr(RA[rd],TA));return true;
 }
+
 static bool emitT_memReg(Ctx& ctx,uint16_t op){
     uint8_t rd=op&7,rb=(op>>3)&7,ro=(op>>6)&7,k=(op>>9)&7;
     void* fn=nullptr;bool ld=true,sxb=false,sxh=false;
@@ -1079,6 +1085,7 @@ static bool emitT_memReg(Ctx& ctx,uint16_t op){
     if(ld){if(sxb)ctx.E(ppc_extsb(RA[rd],TA));else if(sxh)ctx.E(ppc_extsh(RA[rd],TA));else ctx.E(ppc_mr(RA[rd],TA));}
     return true;
 }
+
 static bool emitT_memImm(Ctx& ctx,uint16_t op){
     uint8_t rd=op&7,rb=(op>>3)&7;bool ld=(op>>11)&1;
     uint8_t h=(op>>12)&0xF;bool by=(h==7),hw=(h==8);
@@ -1089,24 +1096,37 @@ static bool emitT_memImm(Ctx& ctx,uint16_t op){
     void* fn=ld?(hw?(void*)JitHelp_r16:by?(void*)JitHelp_r8:(void*)JitHelp_r32):(hw?(void*)JitHelp_w16:by?(void*)JitHelp_w8:(void*)JitHelp_w32);
     ctx.call(fn);if(ld)ctx.E(ppc_mr(RA[rd],TA));return true;
 }
+
 static bool emitT_spLoad(Ctx& ctx,uint16_t op,uint32_t curPC){
-    bool ld=(op>>11)&1;uint8_t rd=(op>>8)&7;bool sp=(((op>>12)&0xF)==0x9);
+    bool ld=(op>>11)&1;uint8_t rd=(op>>8)&7;
     uint32_t off=(uint32_t)(op&0xFF)<<2;
-    if(sp){ctx.li(TA,off);ctx.E(ppc_add(TC,RA[13],TA));}else ctx.li(TC,((curPC+4)&~3u)+off);
+    ctx.li(TA,off);ctx.E(ppc_add(TC,RA[13],TA));
     ctx.E(ppc_stw(TC,FRAME_SCR0,1));
     ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.E(ppc_lwz(TC,FRAME_SCR0,1));
     if(!ld)ctx.E(ppc_mr(TD,RA[rd]));ctx.call(ld?(void*)JitHelp_r32:(void*)JitHelp_w32);
     if(ld)ctx.E(ppc_mr(RA[rd],TA));return true;
 }
+
 static bool emitT_addSpPc(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t h=(op>>12)&0xF;
-    if(h==0xA){uint8_t rd=(op>>8)&7;bool sp=(op>>11)&1;uint32_t imm=(uint32_t)(op&0xFF)<<2;
-        if(sp){ctx.li(TA,imm);ctx.E(ppc_add(RA[rd],RA[13],TA));}else ctx.li(RA[rd],((curPC+4)&~3u)+imm);return true;}
-    if(h==0xB){uint8_t s=(op>>8)&0xF;
-        if(s==0){ctx.li(TA,(uint32_t)(op&0x7F)<<2);ctx.E(ppc_add(RA[13],RA[13],TA));return true;}
-        if(s==1){ctx.li(TA,(uint32_t)(op&0x7F)<<2);ctx.E(ppc_subf(RA[13],TA,RA[13]));return true;}}
+    if(h==0xA){
+        uint8_t rd=(op>>8)&7;bool sp=(op>>11)&1;uint32_t imm=(uint32_t)(op&0xFF)<<2;
+        if(sp){ctx.li(TA,imm);ctx.E(ppc_add(RA[rd],RA[13],TA));}
+        else ctx.li(RA[rd],((curPC+4)&~3u)+imm);
+        return true;
+    }
+    if(h==0xB){
+        if(((op>>8)&0xF)==0){
+            bool sub = (op >> 7) & 1; // FIX: bit 7 distinguishes ADD SP and SUB SP
+            ctx.li(TA,(uint32_t)(op&0x7F)<<2);
+            if(sub) ctx.E(ppc_subf(RA[13],TA,RA[13]));
+            else    ctx.E(ppc_add(RA[13],RA[13],TA));
+            return true;
+        }
+    }
     return false;
 }
+
 static bool emitT_pushPop(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t opA=(op>>9)&7;if(opA!=2&&opA!=6)return false;
     emitSpill(ctx);ctx.li(TA,curPC+2);ctx.E(ppc_stw(TA,FRAME_PC,1));
@@ -1125,11 +1145,13 @@ static bool emitT_pushPop(Ctx& ctx,uint16_t op,uint32_t curPC){
     }
     return true;
 }
+
 static bool emitT_ldmStm(Ctx& ctx,uint16_t op){
     emitSpill(ctx);ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));
     ctx.li(TC,(uint32_t)(uint16_t)op);ctx.E(ppc_addi(TD,1,(int16_t)FRAME_REGSYNC));
     ctx.call((void*)JitHelp_thumbBlock);emitReload(ctx);return true;
 }
+
 static bool emitT_branch(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t h=(op>>12)&0xF;
     if(h==0xE){
@@ -1148,6 +1170,7 @@ static bool emitT_branch(Ctx& ctx,uint16_t op,uint32_t curPC){
     }
     return false;
 }
+
 static bool emitT_bl(Ctx& ctx,uint16_t op1,uint16_t op2,uint32_t curPC){
     int32_t hi=(int32_t)((op1&0x7FF)<<21)>>9,lo=(op2&0x7FF)<<1;
     uint32_t tgt=(uint32_t)(curPC+4+hi+lo);
@@ -1156,23 +1179,47 @@ static bool emitT_bl(Ctx& ctx,uint16_t op1,uint16_t op2,uint32_t curPC){
     if(blx){tgt&=~3u;ctx.li(TA,~(1u<<5));ctx.E(ppc_and(RCPSR,RCPSR,TA));}
     emitCommitExit(ctx,tgt&~1u,EXIT_NORMAL);ctx.done=true;return true;
 }
+
+// Fixed Thumb opcode dispatcher table
 static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t h=(op>>12)&0xF;
     switch(h){
-        case 0x0:if(((op>>11)&3)<3)return emitT_shifts(ctx,op);return emitT_addSub3(ctx,op);
-        case 0x1:return emitT_imm8(ctx,op);
-        case 0x2:{uint8_t b=(op>>10)&3;if(b==0)return emitT_alu(ctx,op);if(b==1)return emitT_hiReg(ctx,op,curPC);return emitT_ldrPc(ctx,op,curPC);}
-        case 0x3:case 0x4:case 0x5:return emitT_memReg(ctx,op);
-        case 0x6:case 0x7:case 0x8:return emitT_memImm(ctx,op);
-        case 0x9:return emitT_spLoad(ctx,op,curPC);
-        case 0xA:return emitT_addSpPc(ctx,op,curPC);
-        case 0xB:
-            if(((op>>8)&0xF)<=1)return emitT_addSpPc(ctx,op,curPC);
-            if(((op>>9)&7)==2||((op>>9)&7)==6)return emitT_pushPop(ctx,op,curPC);
+        case 0x0:
+            return emitT_shifts(ctx,op);
+        case 0x1:
+            if(((op>>11)&1)==0) return emitT_shifts(ctx,op);
+            return emitT_addSub3(ctx,op);
+        case 0x2:
+        case 0x3:
+            return emitT_imm8(ctx,op);
+        case 0x4:{
+            uint8_t b=(op>>10)&3;
+            if(b==0) return emitT_alu(ctx,op);
+            if(b==1) return emitT_hiReg(ctx,op,curPC);
+            return emitT_ldrPc(ctx,op,curPC);
+        }
+        case 0x5:
+            return emitT_memReg(ctx,op);
+        case 0x6:
+        case 0x7:
+        case 0x8:
+            return emitT_memImm(ctx,op);
+        case 0x9:
+            return emitT_spLoad(ctx,op,curPC);
+        case 0xA:
+            return emitT_addSpPc(ctx,op,curPC);
+        case 0xB:{
+            uint8_t opA=(op>>9)&7;
+            if(opA==2 || opA==6) return emitT_pushPop(ctx,op,curPC);
+            return emitT_addSpPc(ctx,op,curPC);
+        }
+        case 0xC:
+            return emitT_ldmStm(ctx,op);
+        case 0xD:
+        case 0xE:
+            return emitT_branch(ctx,op,curPC);
+        default:
             return false;
-        case 0xC:return emitT_ldmStm(ctx,op);
-        case 0xD:case 0xE:return emitT_branch(ctx,op,curPC);
-        default:return false;
     }
 }
 
@@ -1184,16 +1231,15 @@ static bool validPC(uint32_t pc, bool gba) {
     if (pc >= 0x80000000u && pc < 0xFFFF0000u) return false;
     if (gba) {
         return (pc < 0x00004000u) ||
-               (pc >= 0x02000000u && pc < 0x02040000u) ||
-               (pc >= 0x03000000u && pc < 0x03008000u) ||
-               (pc >= 0x06000000u && pc < 0x06018000u) ||
+               (pc >= 0x02000000u && pc < 0x04000000u) ||
+               (pc >= 0x06000000u && pc < 0x07000000u) ||
                (pc >= 0x08000000u && pc < 0x0E000000u);
     }
-    return (pc < 0x00008000u) ||
-           (pc >= 0x01000000u && pc < 0x04000000u) || // ITCM, Main RAM (mirrored 16MB), Shared WRAM
-           (pc >= 0x06000000u && pc < 0x07000000u) || // VRAM
-           (pc >= 0x08000000u && pc < 0x0A000000u) || // Cart ROM
-           (pc >= 0xFFFF0000u);                       // ARM9 BIOS/Vectors
+    // NDS: 0x00000000..0x03FFFFFF (ITCM, Main RAM mirrors, Shared WRAM), VRAM, Cart, High Vectors
+    return (pc < 0x04000000u) ||
+           (pc >= 0x06000000u && pc < 0x07000000u) ||
+           (pc >= 0x08000000u && pc < 0x0A000000u) ||
+           (pc >= 0xFFFF0000u);
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1408,26 +1454,18 @@ static void logStatus(Core& core){
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    if(core.interpreter[0].halted && core.interpreter[1].halted){
-        uint32_t untilNext = 64;
-        if(!core.events.empty()){
-            uint32_t nextEv = core.events.front().cycles;
-            if(nextEv > core.globalCycles)
-                untilNext = nextEv - core.globalCycles;
+    while(core.running){
+        if(core.interpreter[0].halted && core.interpreter[1].halted){
+            uint32_t untilNext = 64;
+            if(!core.events.empty()){
+                uint32_t nextEv = core.events.front().cycles;
+                if(nextEv > core.globalCycles)
+                    untilNext = nextEv - core.globalCycles;
+            }
+            tickInline(core, untilNext > 0 ? untilNext : 1);
+            continue;
         }
-        tickInline(core, untilNext);
-        logStatus(core);
-        return;
-    }
 
-    uint32_t targetCycles = core.globalCycles + 256;
-    if(!core.events.empty()){
-        uint32_t nextEv = core.events.front().cycles;
-        if(nextEv > core.globalCycles && (nextEv - core.globalCycles) < 256)
-            targetCycles = nextEv;
-    }
-
-    while(core.globalCycles < targetCycles){
         uint32_t c0 = 0;
         if(!core.interpreter[0].halted)
             c0 = runCpu(core, 0, false);
@@ -1438,9 +1476,6 @@ void runJitNds(Core& core){
 
         uint32_t cyc = c0 ? c0 : (c1 ? c1 * 2 : 2);
         tickInline(core, cyc);
-
-        if(core.interpreter[0].halted && core.interpreter[1].halted)
-            break;
     }
     logStatus(core);
 }
@@ -1448,32 +1483,21 @@ void runJitNds(Core& core){
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    if(core.interpreter[1].halted){
-        uint32_t untilNext = 64;
-        if(!core.events.empty()){
-            uint32_t nextEv = core.events.front().cycles;
-            if(nextEv > core.globalCycles)
-                untilNext = nextEv - core.globalCycles;
+    while(core.running){
+        if(core.interpreter[1].halted){
+            uint32_t untilNext = 64;
+            if(!core.events.empty()){
+                uint32_t nextEv = core.events.front().cycles;
+                if(nextEv > core.globalCycles)
+                    untilNext = nextEv - core.globalCycles;
+            }
+            tickInline(core, untilNext > 0 ? untilNext : 1);
+            continue;
         }
-        tickInline(core, untilNext);
-        logStatus(core);
-        return;
-    }
 
-    uint32_t targetCycles = core.globalCycles + 256;
-    if(!core.events.empty()){
-        uint32_t nextEv = core.events.front().cycles;
-        if(nextEv > core.globalCycles && (nextEv - core.globalCycles) < 256)
-            targetCycles = nextEv;
-    }
-
-    while(core.globalCycles < targetCycles){
         uint32_t c = runCpu(core, 1, true);
         uint32_t cyc = (c > 0) ? c : CYCLES_PER_INSN_ARM7;
         tickInline(core, cyc);
-
-        if(core.interpreter[1].halted)
-            break;
     }
     logStatus(core);
 }
