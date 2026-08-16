@@ -86,3 +86,53 @@ FAT mounted, logging started
 
 #oddly enough gemini 3.7 flash gives blank answers 3x in a row even with regenerating when sending this prompt. I sent a follow-up. Can you help me with this?
 #saying can you help me with this did in fact cause it to try again. 
+
+
+===
+This fix2 update was bad. Tanks the wii dolphin frame rate itself to 3fps. rockwrestler doesn't even start MKDS black screens 0-1fps then after 10s gets to whitescreen where it stays stuck. GBA startup is actually improved 40 fps on launch logo then 4fps into black screen for doomgba. 
+
+This change appears to be a regressio. here are the debug logs. Can you read them then fix it? 
+rockwrestler.nds
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f29c
+[STATUS] fps=3 cycles=16668548 pc0=015F6598 pc1=03800748 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x805494a0 tramp=0x8009ff60 BLK_ARMS=8
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] arm   FB cpu1 pc=03800318 op=0380F000
+...
+[JIT] cpu0 bad PC 00008000
+[JIT] cpu0 bad PC 00008004
+[JIT] cpu0 bad PC 00008008
+[JIT] cpu0 bad PC 0000800C
+[JIT] cpu0 bad PC 00008010
+[JIT] cpu0 bad PC 00008014
+GBADoom.gba
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f29c
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f61c
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f61c
+...
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f61c
+[STATUS] fps=20 cycles=75758144 pc0=FFFF0000 pc1=080003E0 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=4 cycles=84185024 pc0=FFFF0000 pc1=080003E0 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=4 cycles=92611904 pc0=FFFF0000 pc1=080003E0 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=4 cycles=101038784 pc0=FFFF0000 pc1=080003E0 halt0=4 halt1=0 gba=1 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x805493e0 tramp=0x8009ff60 BLK_ARMS=8
+[JIT] cache flushed gen=1
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFEFFFC pc1=00000000 h0=4 h1=0 fps=0 cyc=188752
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFEFFFC pc1=00000000 h0=4 h1=0 fps=0 cyc=377344
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFEFFFC pc1=00000000 h0=4 h1=0 fps=0 cyc=566016
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFEFFFC pc1=00000000 h0=4 h1=0 fps=0 cyc=754688
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFEFFFC pc1=00000000 h0=4 h1=0 fps=0 cyc=942592
+[EXC] vector=18 pc=00002D62 sp=03007EA4 lr=00002BAF cpsr=0000007F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
