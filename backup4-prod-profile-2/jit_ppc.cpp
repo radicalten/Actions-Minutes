@@ -874,7 +874,7 @@ static bool emitLSExtra(Ctx& ctx,uint32_t op,uint32_t){
     ctx.E(ppc_lwz(TA,FRAME_SCR0,1));
     if(!p){
         if(!l || rn != rd){
-            if(up)ctx.E(ppc_add(RA[rn],RA[rn],TA));else ctx.E(ppc_subf(RA[rn],TA,RA[rn]));
+            if(u)ctx.E(ppc_add(RA[rn],RA[rn],TA));else ctx.E(ppc_subf(RA[rn],TA,RA[rn])); // FIX: changed 'up' to 'u'
         }
     } else if(w&&rn!=rd)ctx.E(ppc_lwz(RA[rn],FRAME_SCR1,1));
     patchSkip(ctx,si);return true;
