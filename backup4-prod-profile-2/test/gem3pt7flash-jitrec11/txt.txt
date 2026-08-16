@@ -1,2 +1,87 @@
 Gemini 3.7 Flash High 85.8% teminial Bench 2.1 released on Aug 13 2026 and added to lm arena ai. Testing here using my jitrec11 prompt as that seems to have been the best or most stable promising versions.
 Future revisions were no so good. 
+
+===
+jit_ppc.cpp v1 revision:
+same behavior as before the update with only rockwrestler working. but now the arm7 seems to stay green on rockwrestler.nds. However, now fps is at a low 4fps. GBA games still give boot at 33fps, then go to black screen afterwards it is 8fps. Another difference/regression is that in rockwrestler.nds pressing a/b does not enter the menus to inspect the different tests. 
+
+Here are my new debug logs. Things seem to run slower than before. 
+ACWW.nds logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f2a8
+[STATUS] fps=6 cycles=16675308 pc0=02000978 pc1=03810580 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=7 cycles=33490880 pc0=02117A54 pc1=03810564 halt0=0 halt1=0 gba=0 dsi=0
+[STATUS] fps=7 cycles=50302580 pc0=02117A54 pc1=03810590 halt0=0 halt1=0 gba=0 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x805494a0 tramp=0x8009fec0 BLK_ARMS=8
+[JIT] arm   FB cpu0 pc=02000A5C op=EE110F10
+[JIT] arm   FB cpu0 pc=02000A68 op=EE010F10
+[JIT] arm   FB cpu0 pc=02000A70 op=EE070F15
+...
+[JIT] arm   FB cpu1 pc=02380054 op=E12FF000
+[JIT] STATUS jit0=16384 fb0=25 jit1=16384 fb1=3 pos=10520 gen=0
+[JIT] STATUS pc0=02000968 pc1=02380068 h0=0 h1=0 fps=0 cyc=108970
+[JIT] STATUS jit0=32768 fb0=25 jit1=32768 fb1=3 pos=13512 gen=0
+[JIT] STATUS pc0=02000970 pc1=02380140 h0=0 h1=0 fps=0 cyc=208366
+[JIT] STATUS jit0=49152 fb0=25 jit1=49152 fb1=3 pos=13512 gen=0
+[JIT] STATUS pc0=020009AC pc1=02380128 h0=0 h1=0 fps=0 cyc=301588
+[JIT] cpu1 bad PC 027E0000
+[JIT] cpu1 bad PC 027E0004
+[JIT] cpu1 bad PC 027E0008
+[JIT] cpu1 bad PC 027E000C
+[JIT] cpu1 bad PC 027E0010
+[JIT] cpu1 bad PC 027E00B0
+[JIT] cpu1 bad PC 027E00B4
+[JIT] cpu1 bad PC 027E0014
+[JIT] cpu1 bad PC 027E0018
+...
+[JIT] cpu1 bad PC 027E0084
+[JIT] cpu1 bad PC 027E0074
+[JIT] STATUS jit0=65536 fb0=25 jit1=63416 fb1=3 pos=15665 gen=0
+[JIT] STATUS pc0=02000978 pc1=027E0078 h0=0 h1=0 fps=0 cyc=402016
+[JIT] cpu1 bad PC 027E0078
+[JIT] cpu1 bad PC 027E007C
+...
+[JIT] cpu1 bad PC 027E0078
+[JIT] cpu1 bad PC 027E007C
+
+GBADoom Debug Logs:
+=== NooDS-Wii status log ===
+[STATUS] updateRun: jitAvail=1 gba=0 dsi=0 halt0=0 halt1=0 -> func=0x8006f2a8
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f59c
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f59c
+...
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] fps=0 cycles=8343104 pc0=FFFF0000 pc1=FFFFFFFF halt0=4 halt1=1 gba=1 dsi=0
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f59c
+...
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=1 -> func=0x800454d4
+[STATUS] updateRun: jitAvail=1 gba=1 dsi=0 halt0=4 halt1=0 -> func=0x8006f59c
+[STATUS] fps=45 cycles=75758146 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=8 cycles=84185026 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+[STATUS] fps=8 cycles=92611906 pc0=FFFF0000 pc1=08000192 halt0=4 halt1=0 gba=1 dsi=0
+=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[JIT] init buf=0x805493e0 tramp=0x8009fec0 BLK_ARMS=8
+[JIT] cache flushed gen=1
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=16384
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=32768
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=49152
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+...
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=3007585
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[JIT] STATUS jit0=0 fb0=0 jit1=0 fb1=0 pos=0 gen=1
+[JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=4410865
+
+#oddly enough gemini 3.7 flash gives blank answers 3x in a row even with regenerating when sending this prompt. I sent a follow-up. Can you help me with this?
