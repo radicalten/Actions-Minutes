@@ -1,15 +1,4 @@
 // jit_ppc.cpp — ARM->PPC JIT for Wii/Broadway  
-// Fixed revision 4:
-// 1. MSR: implement full control-field (mask=1,3,9,b,f) mode switches via fallback
-//    The key fix: MSR with control bits must be handled — emit fallback so
-//    interpreter does the mode switch with correct banked register swap.
-// 2. GBA spin at VBlank wait: detect the single-instruction B . loop and
-//    run the interpreter for a full scanline worth of cycles before resuming JIT.
-// 3. NDS: ARM7 stuck waiting for IPCSYNC — the MSR mode switch fallback
-//    was clobbering state; fix by always falling back MSR with control bits.
-// 4. NDS cycle accounting: ARM7 cycles must pace correctly relative to ARM9.
-// 5. GBA: when burst escapes and immediately re-enters, use longer burst window.
-
 #include "jit_ppc.h"
 #include "core.h"
 #include "interpreter.h"
@@ -38,18 +27,12 @@ static int      g_exitReason[2]= {};
 static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
 static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
 
-static const int ITERS_NDS = 32;
-static const int ITERS_GBA = 32;
-
-// Floor: one scanline worth of cycles per runJit* call.
-// NDS: 355*6 = 2130 ARM9 cycles
-// GBA: 308*4 = 1232 cycles
-static const uint32_t FLOOR_CYCLES_NDS = 2130;
-static const uint32_t FLOOR_CYCLES_GBA = 1232;
+static const int ITERS_NDS = 16;
+static const int ITERS_GBA = 16;
 
 // Spin detection
 static const uint32_t SPIN_THRESH   = 6;
-static const int      SPIN_STEPS    = 256;  // increased for GBA VBlank wait
+static const int      SPIN_STEPS    = 256;
 static const uint32_t SPIN_CYC_STEP = 4;
 
 // ── Frame layout ──────────────────────────────────────────────────────
@@ -392,7 +375,6 @@ int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
     return 0;
 }
 
-// CPSR written before setPC so flushPipeline sees correct thumb bit
 int JitHelp_commit(Interpreter* interp,int cpu,
                    uint32_t* regs,uint32_t cpsr,
                    uint32_t pc,int reason){
@@ -621,40 +603,52 @@ static void patchSkip(Ctx& ctx,size_t idx){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Flag helpers
+// Flag helpers (FIXED PPC bit masks)
 // ═══════════════════════════════════════════════════════════════════════
 static void setNZ(Ctx& ctx,uint8_t r){
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,2,31));
-    ctx.E(ppc_rlwimi(RCPSR,r,0,0,0));
-    ctx.E(ppc_cmpi(6,r,0));
+    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,2,31)); // Clears PPC bits 0 and 1 (N and Z)
+    ctx.E(ppc_rlwimi(RCPSR,r,0,0,0));      // Copy MSB (PPC bit 0) to N
+    ctx.E(ppc_cmpi(6,r,0));                 // Compare r with 0 on CR6
     ctx.E(ppc_mfcr(TA));
-    ctx.E(ppc_rlwinm(TA,TA,25,1,1));
+    ctx.E(ppc_rlwinm(TA,TA,25,1,1));       // Move CR6 EQ (bit 26) to Z (PPC bit 1)
     ctx.E(ppc_or(RCPSR,RCPSR,TA));
 }
+
+// XER CA is PPC bit 2 (0x20000000), CPSR C is PPC bit 2
 static void setC_xer(Ctx& ctx){
     ctx.E(ppc_mfxer(TA));
-    ctx.E(ppc_rlwinm(TA,TA,0,2,2));        // XER[CA] is PPC bit 2 (0x20000000)
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));
+    ctx.E(ppc_rlwinm(TA,TA,0,2,2));         // FIX: mask PPC bit 2 (CA)
+    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));   // Clear C in RCPSR
     ctx.E(ppc_or(RCPSR,RCPSR,TA));
 }
+
+// Overflow V is PPC bit 3 (0x10000000)
 static void setV_add(Ctx& ctx,uint8_t res,uint8_t a,uint8_t b){
     ctx.E(ppc_xor(TE,res,a));ctx.E(ppc_xor(TF,res,b));ctx.E(ppc_and(TE,TE,TF));
-    ctx.E(ppc_rlwinm(TE,TE,0,0,0));ctx.E(ppc_rlwinm(TE,TE,29,28,28));
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));ctx.E(ppc_or(RCPSR,RCPSR,TE));
+    ctx.E(ppc_rlwinm(TE,TE,0,0,0));         // Sign bit at PPC bit 0
+    ctx.E(ppc_rlwinm(TE,TE,29,3,3));        // FIX: rotate to PPC bit 3 and mask bit 3
+    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));   // Clear V in RCPSR (keeps 4..31 and 0..2)
+    ctx.E(ppc_or(RCPSR,RCPSR,TE));
 }
+
 static void setV_sub(Ctx& ctx,uint8_t res,uint8_t a,uint8_t b){
     ctx.E(ppc_xor(TE,a,b));ctx.E(ppc_xor(TF,a,res));ctx.E(ppc_and(TE,TE,TF));
-    ctx.E(ppc_rlwinm(TE,TE,0,0,0));ctx.E(ppc_rlwinm(TE,TE,29,3,3));       // PPC bit 3 (0x10000000) = ARM V
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));ctx.E(ppc_or(RCPSR,RCPSR,TE));
+    ctx.E(ppc_rlwinm(TE,TE,0,0,0));         // Sign bit at PPC bit 0
+    ctx.E(ppc_rlwinm(TE,TE,29,3,3));        // FIX: rotate to PPC bit 3 and mask bit 3
+    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));   // Clear V in RCPSR
+    ctx.E(ppc_or(RCPSR,RCPSR,TE));
 }
+
+// Carry from bit 31 of cr to PPC bit 2 (CPSR C)
 static void setC_imm(Ctx& ctx,uint8_t cr){
-    ctx.E(ppc_rlwinm(TA,cr,29,2,2));       // rol 29: LSB → PPC bit 2 (0x20000000) = ARM C
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));
+    ctx.E(ppc_rlwinm(TA,cr,29,2,2));        // FIX: mask PPC bit 2
+    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));   // Clear C in RCPSR
     ctx.E(ppc_or(RCPSR,RCPSR,TA));
 }
+
 static void primeCarry(Ctx& ctx){
-    ctx.E(ppc_rlwinm(TA,RCPSR,3,31,31));
-    ctx.E(ppc_addic(0,TA,-1));
+    ctx.E(ppc_rlwinm(TA,RCPSR,3,31,31));   // Extract C (PPC bit 2) to bit 31 (0 or 1)
+    ctx.E(ppc_addic(0,TA,-1));             // 1 + (-1) -> CA=1; 0 + (-1) -> CA=0
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -842,6 +836,7 @@ static bool emitLS(Ctx& ctx,uint32_t op,uint32_t curPC){
     }
     patchSkip(ctx,si);return true;
 }
+
 static bool emitLSExtra(Ctx& ctx,uint32_t op,uint32_t){
     if((op&0x0E000090)!=0x00000090)return false;
     if(((op>>25)&7)!=0)return false;
@@ -849,14 +844,17 @@ static bool emitLSExtra(Ctx& ctx,uint32_t op,uint32_t){
     bool p=(op>>24)&1,u=(op>>23)&1,w=(op>>21)&1,l=(op>>20)&1,imm=(op>>22)&1;
     uint8_t rn=(op>>16)&0xF,rd=(op>>12)&0xF,sh=(op>>5)&3;
     if(rd==15||rn==15||sh==0)return false;
+    if(!l && sh != 1) return false; // FIX: validate store type upfront
+    if(!imm && (op&0xF)==15) return false;
+
     size_t si=emitCondSkip(ctx,cond);
     if(imm){ctx.li(TA,((op>>4)&0xF0)|(op&0xF));}
-    else{if((op&0xF)==15){patchSkip(ctx,si);return false;}ctx.E(ppc_mr(TA,RA[op&0xF]));}
+    else{ctx.E(ppc_mr(TA,RA[op&0xF]));}
     if(p){if(u)ctx.E(ppc_add(TB,RA[rn],TA));else ctx.E(ppc_subf(TB,TA,RA[rn]));}
     else ctx.E(ppc_mr(TB,RA[rn]));
     ctx.E(ppc_stw(TA,FRAME_SCR0,1));ctx.E(ppc_stw(TB,FRAME_SCR1,1));
     ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.E(ppc_lwz(TC,FRAME_SCR1,1));
-    if(!l){if(sh!=1){patchSkip(ctx,si);return false;}ctx.E(ppc_mr(TD,RA[rd]));ctx.call((void*)JitHelp_w16);}
+    if(!l){ctx.E(ppc_mr(TD,RA[rd]));ctx.call((void*)JitHelp_w16);}
     else{
         if(sh==1)ctx.call((void*)JitHelp_r16);
         else if(sh==2)ctx.call((void*)JitHelp_r8);
@@ -870,6 +868,7 @@ static bool emitLSExtra(Ctx& ctx,uint32_t op,uint32_t){
     else if(w&&rn!=rd)ctx.E(ppc_lwz(RA[rn],FRAME_SCR1,1));
     patchSkip(ctx,si);return true;
 }
+
 static bool emitMul(Ctx& ctx,uint32_t op){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
     bool s=(op>>20)&1,acc=(op>>21)&1,lng=(op>>23)&1;
@@ -882,23 +881,10 @@ static bool emitMul(Ctx& ctx,uint32_t op){
     patchSkip(ctx,si);return true;
 }
 
-// ── MSR/MRS ──────────────────────────────────────────────────────────
-// CRITICAL FIX: MSR with any control bits (mask & 0x7 != 0) changes the
-// CPU mode and swaps banked registers.  The JIT cannot do this safely
-// because it holds r0-r14 in fixed PPC registers that correspond to the
-// CURRENT mode's register file.  Attempting to patch CPSR in-place and
-// continue emitting would use the wrong register aliases.
-//
-// The correct solution is to fall back to the interpreter for ANY MSR
-// that touches control bits.  Only MSR that touches ONLY the flags field
-// (mask == 0x8, bits 31:24) is safe to handle inline because it doesn't
-// swap register banks.
-//
-// MRS is always safe (it reads CPSR/SPSR into a GPR, no mode switch).
 static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
 
-    // MRS Rd, CPSR  (0x010F0000 pattern)
+    // MRS Rd, CPSR
     if((op&0x0FBF0FFF)==0x010F0000){
         uint8_t rd=(op>>12)&0xF;if(rd==15)return false;
         size_t si=emitCondSkip(ctx,cond);
@@ -907,26 +893,18 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
         return true;
     }
 
-    // MRS Rd, SPSR  (0x014F0000 pattern) — always fall back (SPSR is mode-dependent)
-    if((op&0x0FBF0FFF)==0x014F0000) return false;
+    if((op&0x0FBF0FFF)==0x014F0000) return false; // MRS SPSR -> fallback
 
-    // MSR — check the field mask
     uint8_t mask=(op>>16)&0xF;
+    if(mask & 0x7) return false; // Mode switch -> fallback
 
-    // If control bits are involved (mask & 0x7), we MUST fall back to the
-    // interpreter because a mode switch swaps banked registers.
-    // This covers mask values: 0x1(c), 0x2(x), 0x3(cx), 0x4(s), 0x5(cs),
-    // 0x6(xs), 0x7(cxs), 0x9(cf), 0xB(cxf), 0xD(csf), 0xF(cxsf).
-    if(mask & 0x7) return false;
-
-    // mask == 0x8: flags field only (bits 31:24) — safe to handle inline.
     // MSR CPSR_f, #imm
     if((op&0x0DB0F000)==0x0320F000){
         uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
         if(rot)imm=(imm>>rot)|(imm<<(32-rot));
-        imm&=0xFF000000u;  // only flags field
+        imm&=0xFF000000u;
         size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));  // clear bits 31:24
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
         ctx.li(TA,imm);
         ctx.E(ppc_or(RCPSR,RCPSR,TA));
         patchSkip(ctx,si);
@@ -937,14 +915,13 @@ static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
     if((op&0x0DB0FFF0)==0x0120F000){
         uint8_t rm=op&0xF;if(rm==15)return false;
         size_t si=emitCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));          // clear bits 31:24
-        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));              // keep only bits 31:24 of Rm
+        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
+        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));
         ctx.E(ppc_or(RCPSR,RCPSR,TA));
         patchSkip(ctx,si);
         return true;
     }
 
-    // MSR SPSR_f — fall back (SPSR is mode-dependent)
     return false;
 }
 
@@ -964,7 +941,7 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     ctx.E(ppc_addi(TF,1,(int16_t)FRAME_PC));ctx.E(ppc_addi(TG,1,(int16_t)FRAME_CPSR));
     ctx.call((void*)JitHelp_armBlock);
     ctx.E(ppc_cmpi(0,TA,0));
-    size_t bOk=ctx.sz();ctx.E(ppc_bc(4,0,0));
+    size_t bOk=ctx.sz();ctx.E(ppc_bc(4,0,0)); // Branch if TA >= 0 (LT false)
     emitReload(ctx);emitCommitExit(ctx,curPC,EXIT_FALLBACK);
     {int32_t d=(int32_t)((ctx.sz()-bOk)*4);ctx.base[bOk]=ppc_bc(4,0,(int16_t)d);}
     emitReload(ctx);
@@ -978,14 +955,11 @@ static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
     }
     patchSkip(ctx,si);return true;
 }
+
 static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
     uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
     if((op&0x0F000000)==0x0F000000)return false;
     if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)return emitBranch(ctx,op,curPC);
-    // MSR/MRS: handle the 0x01000000 space carefully.
-    // Note: some multiply instructions also fall in this space when bit 7
-    // and bit 4 are set — the dispatcher already checked for those above
-    // via the it==0 case, so here we only see genuine MRS/MSR.
     if((op&0x0F900000)==0x01000000){if(emitMrsMsr(ctx,op,curPC))return true;return false;}
     uint32_t it=(op>>25)&7;
     switch(it){
@@ -1006,7 +980,12 @@ static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
 // ═══════════════════════════════════════════════════════════════════════
 static bool emitT_shifts(Ctx& ctx,uint16_t op){
     uint8_t ty=(op>>11)&3,rd=op&7,rs=(op>>3)&7;int i=(op>>6)&0x1F;
-    switch(ty){case 0:sLslI(ctx,RA[rd],RA[rs],i,true);break;case 1:sLsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;case 2:sAsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;default:return false;}
+    switch(ty){
+        case 0:sLslI(ctx,RA[rd],RA[rs],i,true);break;
+        case 1:sLsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;
+        case 2:sAsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;
+        default:return false;
+    }
     setNZ(ctx,RA[rd]);setC_imm(ctx,TC);return true;
 }
 static bool emitT_addSub3(Ctx& ctx,uint16_t op){
@@ -1052,7 +1031,14 @@ static bool emitT_alu(Ctx& ctx,uint16_t op){
 }
 static bool emitT_hiReg(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t o=(op>>8)&3,rs=((op>>3)&7)|(((op>>6)&1)<<3),rd=(op&7)|(((op>>7)&1)<<3);
-    if(o==3){if(rs==15)ctx.li(TA,(curPC+4)&~1u);else ctx.E(ppc_mr(TA,RA[rs]));ctx.E(ppc_stw(TA,FRAME_SCR0,1));emitBX_target(ctx);ctx.done=true;return true;}
+    if(o==3){
+        bool isBlx = (op >> 7) & 1; // FIX: handle BLX Rm
+        if(isBlx) ctx.li(RA[14], (curPC + 2) | 1u);
+        if(rs==15)ctx.li(TA,(curPC+4)&~1u);else ctx.E(ppc_mr(TA,RA[rs]));
+        ctx.E(ppc_stw(TA,FRAME_SCR0,1));
+        emitBX_target(ctx);
+        ctx.done=true;return true;
+    }
     if(rd==15){
         if(o==1)return false;
         if(rs==15)ctx.li(TA,curPC+4);else ctx.E(ppc_mr(TA,RA[rs]));
@@ -1154,7 +1140,7 @@ static bool emitT_branch(Ctx& ctx,uint16_t op,uint32_t curPC){
 static bool emitT_bl(Ctx& ctx,uint16_t op1,uint16_t op2,uint32_t curPC){
     int32_t hi=(int32_t)((op1&0x7FF)<<21)>>9,lo=(op2&0x7FF)<<1;
     uint32_t tgt=(uint32_t)(curPC+4+hi+lo);
-    bool blx=((op2>>11)&0x1F)==0x1C;
+    bool blx=((op2>>11)&0x1F)==0x1D; // FIX: 0x1D is BLX format 19
     ctx.li(RA[14],(curPC+4)|1u);
     if(blx){tgt&=~3u;ctx.li(TA,~(1u<<5));ctx.E(ppc_and(RCPSR,RCPSR,TA));}
     emitCommitExit(ctx,tgt&~1u,EXIT_NORMAL);ctx.done=true;return true;
@@ -1234,7 +1220,9 @@ static JitBlock* compile(Interpreter* interp,Core* core,
                 if(!validPC(curPC+2,core->gbaMode)){emitCommitExit(ctx,curPC,EXIT_FALLBACK);ctx.done=true;break;}
                 uint16_t op2=core->memory.read<uint16_t>(arm7,curPC+2);
                 uint8_t bb=(op2>>11)&0x1F;
-                if(bb==0x1F||bb==0x1C){emitT_bl(ctx,op,op2,curPC);curPC+=4;n+=2;ctx.insnCount+=2;continue;}
+                if(bb==0x1F||bb==0x1D){ // FIX: 0x1D is BLX format 19
+                    emitT_bl(ctx,op,op2,curPC);curPC+=4;n+=2;ctx.insnCount+=2;continue;
+                }
             }
             if(!dispThumb(ctx,op,curPC)){
                 fbLogOnce(true,cpuIdx,curPC,(uint32_t)op);
@@ -1331,9 +1319,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
     const uint32_t expc  =g_exitPC[cpu];
     g_totalJIT[cpu]++;
 
-    DebugLog("[JIT] cpu%d %08X -> %08X r=%d cpsr=%08X\n",
-             cpu,pc,expc,reason,interp.getCpsrRef());
-
     LoopState& ls=s_loop[cpu];
 
     if(reason==EXIT_FALLBACK){
@@ -1341,21 +1326,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
 
         if(ls.fbPC==expc){
             ls.fbCount++;
-            if(ls.fbCount==SPIN_THRESH&&!ls.fbDumped){
-                ls.fbDumped=true;
-                DebugLog("[JIT] SPIN cpu%d stuck at %08X cpsr=%08X thumb=%d\n",
-                         cpu,expc,interp.getCpsrRef(),(int)interp.isThumb());
-                int stride=interp.isThumb()?2:4;
-                for(int k=-2;k<=4;k++){
-                    uint32_t a=expc+(uint32_t)(k*stride);
-                    uint32_t w=interp.isThumb()
-                        ?(uint32_t)core.memory.read<uint16_t>(arm7,a)
-                        :core.memory.read<uint32_t>(arm7,a);
-                    DebugLog("[JIT]   [%08X]=%08X%s\n",a,w,k==0?" <--":"");
-                }
-                uint32_t** regs=interp.getRegisters();
-                if(regs)for(int i=0;i<15;i++)if(regs[i])DebugLog("[JIT]   r%d=%08X\n",i,*regs[i]);
-            }
             if(ls.fbCount>=SPIN_THRESH){
                 for(int i=0;i<SPIN_STEPS;i++){
                     if(interp.halted)break;
@@ -1364,7 +1334,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                     if(interp.halted)break;
                     uint32_t newPC=interp.getActualPC();
                     if(newPC!=expc){
-                        DebugLog("[JIT] SPIN cpu%d escaped to %08X after %d steps\n",cpu,newPC,i+1);
                         ls.fbPC=0xFFFFFFFFu;ls.fbCount=0;ls.fbDumped=false;
                         resetNormSpin(ls);
                         break;
@@ -1373,7 +1342,6 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                 return cycPerInsn;
             }
         }else{
-            if(ls.fbDumped)DebugLog("[JIT] SPIN cpu%d escaped to %08X\n",cpu,expc);
             ls.fbPC   =expc;
             ls.fbCount=1;
             ls.fbDumped=false;
@@ -1390,9 +1358,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
             const uint32_t spinA=ls.normBurstPC;
             const uint32_t spinB=ls.normBurstExit;
 
-            DebugLog("[JIT] NORM SPIN cpu%d detected at %08X->%08X, bursting\n",cpu,spinA,spinB);
             ls.normBursting=true;
-
             bool escaped=false;
             for(int i=0;i<SPIN_STEPS;i++){
                 if(interp.halted){escaped=true;break;}
@@ -1401,19 +1367,12 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                 if(interp.halted){escaped=true;break;}
                 uint32_t newPC=interp.getActualPC();
                 if(newPC!=spinA&&newPC!=spinB){
-                    DebugLog("[JIT] NORM SPIN cpu%d escaped %08X->%08X after %d steps\n",
-                             cpu,spinA,newPC,i+1);
                     escaped=true;
                     break;
                 }
             }
 
             resetNormSpin(ls);
-
-            if(!escaped){
-                DebugLog("[JIT] NORM SPIN cpu%d burst exhausted at %08X\n",cpu,spinA);
-            }
-
             return cycPerInsn;
         }
 
@@ -1440,44 +1399,61 @@ static void logStatus(Core& core){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Run functions
+// Run functions (Accurate Real-Time Hardware Synchronization)
 // ═══════════════════════════════════════════════════════════════════════
 void runJitNds(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
 
-    // Run both CPUs. ARM9 is master clock.
-    // ARM7 runs at half the clock rate, so one ARM7 cycle = 2 ARM9 cycles.
-    // We run them interleaved: for each ARM9 step, do one ARM7 step.
-    // globalCycles counts ARM9 cycles.
-    uint32_t acc0=0;
-    for(int i=0;i<ITERS_NDS;i++){
-        acc0 += runCpu(core,0,false);  // ARM9: contributes to master clock
-        runCpu(core,1,false);          // ARM7: runs but doesn't add to acc
+    // When both cores are sleeping/halted, fast-forward to next scheduled event
+    if(core.interpreter[0].halted && core.interpreter[1].halted){
+        if(!core.events.empty()){
+            uint32_t diff = core.events.front().cycles - core.globalCycles;
+            tickInline(core, diff > 0 ? diff : 1);
+        } else {
+            tickInline(core, 64);
+        }
+        logStatus(core);
+        return;
     }
 
-    // Always advance at least one scanline so events fire on time.
-    // If both CPUs were halted, still advance so IRQs can fire.
-    uint32_t charge=(acc0>FLOOR_CYCLES_NDS)?acc0:FLOOR_CYCLES_NDS;
-    tickInline(core,charge);
+    for(int i=0; i<ITERS_NDS; i++){
+        uint32_t c0 = runCpu(core, 0, false);
+        uint32_t c1 = runCpu(core, 1, false);
+
+        // 1 ARM7 cycle is equivalent to 2 ARM9 cycles
+        uint32_t cyc = c0 ? c0 : (c1 * 2);
+        if(cyc == 0) cyc = 2;
+
+        tickInline(core, cyc);
+
+        if(core.interpreter[0].halted && core.interpreter[1].halted)
+            break;
+    }
     logStatus(core);
 }
 
 void runJitGba(Core& core){
     if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
 
-    // GBA mode: only cpu1 (ARM7) runs. cpu0 is permanently halted.
-    // Must always advance at least FLOOR_CYCLES_GBA so VBlank events fire.
-    uint32_t acc=0;
-    for(int i=0;i<ITERS_GBA;i++){
-        uint32_t c=runCpu(core,1,true);
-        // When halted (HALT opcode waiting for IRQ), charge 1 cycle so
-        // the accumulator reflects time passing — otherwise the floor
-        // never gets reached and the VBlank IRQ never fires.
-        acc += (c>0)?c:CYCLES_PER_INSN_ARM7;
+    if(core.interpreter[1].halted){
+        if(!core.events.empty()){
+            uint32_t diff = core.events.front().cycles - core.globalCycles;
+            tickInline(core, diff > 0 ? diff : 1);
+        } else {
+            tickInline(core, 64);
+        }
+        logStatus(core);
+        return;
     }
 
-    uint32_t charge=(acc>FLOOR_CYCLES_GBA)?acc:FLOOR_CYCLES_GBA;
-    tickInline(core,charge);
+    for(int i=0; i<ITERS_GBA; i++){
+        uint32_t c = runCpu(core, 1, true);
+        uint32_t cyc = (c > 0) ? c : CYCLES_PER_INSN_ARM7;
+        tickInline(core, cyc);
+
+        if(core.interpreter[1].halted)
+            break;
+    }
     logStatus(core);
 }
 
