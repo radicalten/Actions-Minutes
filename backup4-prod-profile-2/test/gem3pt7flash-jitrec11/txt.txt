@@ -1,0 +1,2 @@
+Gemini 3.7 Flash High 85.8% teminial Bench 2.1 released on Aug 13 2026 and added to lm arena ai. Testing here using my jitrec11 prompt as that seems to have been the best or most stable promising versions.
+Future revisions were no so good. 
