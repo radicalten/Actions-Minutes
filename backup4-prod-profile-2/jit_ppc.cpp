@@ -294,16 +294,6 @@ static void flushICache(uint32_t* p,size_t nW){
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Next-PC Helper (accounting for NooDS pipeline)
-// ═══════════════════════════════════════════════════════════════════════
-static inline uint32_t getInterpPC(Interpreter* interp) {
-    if (!interp) return 0;
-    uint32_t** regs = interp->getRegisters();
-    if (!regs || !regs[15]) return 0;
-    return *regs[15] - (interp->isThumb() ? 4u : 8u);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Emit context
 // ═══════════════════════════════════════════════════════════════════════
 struct Ctx {
@@ -663,9 +653,10 @@ static void sAsrI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
 static void sRorI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
     if(i==0){
         if(sc)ctx.E(ppc_rlwinm(TC,s,0,31,31));
-        ctx.E(ppc_rlwinm(TA,RCPSR,2,0,0));
-        ctx.E(ppc_rlwinm(d,s,31,1,31));
-        ctx.E(ppc_or(d,d,TA));
+        ctx.E(ppc_rlwinm(TB,RCPSR,3,31,31)); // Extract CPSR C flag (bit 2) to LSB
+        ctx.E(ppc_rlwinm(TB,TB,31,0,0));     // Move to MSB
+        ctx.E(ppc_rlwinm(d,s,31,1,31));      // s >> 1
+        ctx.E(ppc_or(d,d,TB));
     }else{
         i&=31;
         if(i==0){if(d!=s)ctx.E(ppc_mr(d,s));if(sc)ctx.E(ppc_rlwinm(TC,s,1,31,31));}
@@ -722,7 +713,6 @@ static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
     if(rn==15&&regShift&&!immForm)return false;
     size_t si=emitCondSkip(ctx,cond);
     if(rn==15){ctx.li(TD,curPC+(ctx.thumb?4u:8u));ctx.E(ppc_stw(TD,FRAME_SCR2,1));}
-    if(dop==ADC||dop==SBC||dop==RSC)primeCarry(ctx);
     bool logC=(s&&(dop==AND||dop==EOR||dop==TST||dop==TEQ||dop==ORR||dop==MOV||dop==BIC||dop==MVN));
     bool cset=emitShifter(ctx,op,TA,logC);
     uint8_t srcRn;
@@ -731,6 +721,9 @@ static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
     if(needV){ctx.E(ppc_stw(TA,FRAME_SCR0,1));ctx.E(ppc_stw(srcRn,FRAME_SCR1,1));}
     bool isTest=(dop==TST||dop==TEQ||dop==CMP||dop==CMN);
     uint8_t res=isTest?TC:RA[rd];
+
+    if(dop==ADC||dop==SBC||dop==RSC) primeCarry(ctx);
+
     switch((DP)dop){
         case AND:case TST:ctx.E(ppc_and  (res,srcRn,TA));break;
         case EOR:case TEQ:ctx.E(ppc_xor  (res,srcRn,TA));break;
@@ -771,7 +764,7 @@ static void emitBX_target(Ctx& ctx){
         ctx.base[bArm]=ppc_bc(12,2,(int16_t)d);
     }
     ctx.E(ppc_stw(TB,FRAME_PC,1));
-    ctx.E(ppc_rlwinm(TC,TC,5,26,26)); // Move LSB to CPSR bit 5 (PPC bit 26)
+    ctx.E(ppc_rlwinm(TC,TC,5,26,26)); // Move LSB to CPSR bit 5
     ctx.li(TA,~(1u<<5));
     ctx.E(ppc_and(RCPSR,RCPSR,TA));
     ctx.E(ppc_or(RCPSR,RCPSR,TC));
@@ -1117,7 +1110,7 @@ static bool emitT_addSpPc(Ctx& ctx,uint16_t op,uint32_t curPC){
     }
     if(h==0xB){
         if(((op>>8)&0xF)==0){
-            bool sub = (op >> 7) & 1; // FIX: bit 7 distinguishes ADD SP and SUB SP
+            bool sub = (op >> 7) & 1;
             ctx.li(TA,(uint32_t)(op&0x7F)<<2);
             if(sub) ctx.E(ppc_subf(RA[13],TA,RA[13]));
             else    ctx.E(ppc_add(RA[13],RA[13],TA));
@@ -1180,7 +1173,6 @@ static bool emitT_bl(Ctx& ctx,uint16_t op1,uint16_t op2,uint32_t curPC){
     emitCommitExit(ctx,tgt&~1u,EXIT_NORMAL);ctx.done=true;return true;
 }
 
-// Fixed Thumb opcode dispatcher table
 static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
     uint8_t h=(op>>12)&0xF;
     switch(h){
@@ -1235,11 +1227,11 @@ static bool validPC(uint32_t pc, bool gba) {
                (pc >= 0x06000000u && pc < 0x07000000u) ||
                (pc >= 0x08000000u && pc < 0x0E000000u);
     }
-    // NDS: 0x00000000..0x03FFFFFF (ITCM, Main RAM mirrors, Shared WRAM), VRAM, Cart, High Vectors
-    return (pc < 0x04000000u) ||
-           (pc >= 0x06000000u && pc < 0x07000000u) ||
-           (pc >= 0x08000000u && pc < 0x0A000000u) ||
-           (pc >= 0xFFFF0000u);
+    return (pc < 0x00008000u) ||                      // ITCM / ARM7 BIOS
+           (pc >= 0x02000000u && pc < 0x04000000u) || // Main RAM & Shared WRAM
+           (pc >= 0x06000000u && pc < 0x07000000u) || // VRAM
+           (pc >= 0x08000000u && pc < 0x0A000000u) || // Cart ROM
+           (pc >= 0xFFFF0000u);                       // ARM9 BIOS & High Vectors
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1341,7 +1333,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
         return cycPerInsn;
     }
 
-    uint32_t pc=getInterpPC(&interp);
+    uint32_t pc=interp.getActualPC();
 
     if(!validPC(pc,gba)){
         static uint32_t lastBadPC[2]={0u,0u};
@@ -1382,7 +1374,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                     interp.jitRunOpcode();
                     tickInline(core,SPIN_CYC_STEP);
                     if(interp.halted)break;
-                    uint32_t newPC=getInterpPC(&interp);
+                    uint32_t newPC=interp.getActualPC();
                     if(newPC!=expc){
                         ls.fbPC=0xFFFFFFFFu;ls.fbCount=0;ls.fbDumped=false;
                         resetNormSpin(ls);
@@ -1415,7 +1407,7 @@ static uint32_t runCpu(Core& core,int cpu,bool gba){
                 interp.jitRunOpcode();
                 tickInline(core,SPIN_CYC_STEP);
                 if(interp.halted){escaped=true;break;}
-                uint32_t newPC=getInterpPC(&interp);
+                uint32_t newPC=interp.getActualPC();
                 if(newPC!=spinA&&newPC!=spinB){
                     escaped=true;
                     break;
@@ -1441,8 +1433,8 @@ static void logStatus(Core& core){
     DebugLog("[JIT] STATUS jit0=%u fb0=%u jit1=%u fb1=%u pos=%zu gen=%u\n",
              g_totalJIT[0],g_totalFB[0],g_totalJIT[1],g_totalFB[1],codePos,cacheGen);
     DebugLog("[JIT] STATUS pc0=%08X pc1=%08X h0=%d h1=%d fps=%d cyc=%u\n",
-             core.interpreter[0].isReady()?getInterpPC(&core.interpreter[0]):0u,
-             core.interpreter[1].isReady()?getInterpPC(&core.interpreter[1]):0u,
+             core.interpreter[0].isReady()?core.interpreter[0].getActualPC():0u,
+             core.interpreter[1].isReady()?core.interpreter[1].getActualPC():0u,
              (int)core.interpreter[0].halted,
              (int)core.interpreter[1].halted,
              core.fps,core.globalCycles);
@@ -1461,8 +1453,10 @@ void runJitNds(Core& core){
                 uint32_t nextEv = core.events.front().cycles;
                 if(nextEv > core.globalCycles)
                     untilNext = nextEv - core.globalCycles;
+                else
+                    untilNext = 1;
             }
-            tickInline(core, untilNext > 0 ? untilNext : 1);
+            tickInline(core, untilNext);
             continue;
         }
 
@@ -1490,8 +1484,10 @@ void runJitGba(Core& core){
                 uint32_t nextEv = core.events.front().cycles;
                 if(nextEv > core.globalCycles)
                     untilNext = nextEv - core.globalCycles;
+                else
+                    untilNext = 1;
             }
-            tickInline(core, untilNext > 0 ? untilNext : 1);
+            tickInline(core, untilNext);
             continue;
         }
 
