@@ -85,3 +85,4 @@ FAT mounted, logging started
 [JIT] STATUS pc0=FFFF0000 pc1=00000000 h0=4 h1=0 fps=0 cyc=4410865
 
 #oddly enough gemini 3.7 flash gives blank answers 3x in a row even with regenerating when sending this prompt. I sent a follow-up. Can you help me with this?
+#saying can you help me with this did in fact cause it to try again. 
