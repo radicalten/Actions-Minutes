@@ -1,1 +1,4 @@
+With the release of Gpt-6 on sep 3 26, Claude Fable 5.1-high became free for use on LM Arena AI direct chat on 9-1-26. Using my ppc-fix 7 as that was one of the best versions. 
 
+procedure:
+fix-ppc-dynarec7 to fable-5.1-high on lm arena ai
