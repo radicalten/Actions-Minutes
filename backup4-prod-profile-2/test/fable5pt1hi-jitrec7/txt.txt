@@ -6,4 +6,5 @@ fix-ppc-dynarec7 to fable-5.1-high on lm arena ai
 This failed as the prompt self terminated 60 lines in on lm arena ai. 
 
 procedure 2:
-ix-ppc-dynarec13-opus to fable-5.1-high on lm arena ai
+fix-ppc-dynarec13-opus to fable-5.1-high on lm arena ai
+This also failed 60 lines in sadly
