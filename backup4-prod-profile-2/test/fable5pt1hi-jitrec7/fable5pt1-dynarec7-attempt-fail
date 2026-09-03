@@ -1,0 +1,86 @@
+There are several independent problems. I went through the emitters instruction by instruction; the ones below are the ones that make guest code produce wrong results (and therefore explain the hangs and the garbage 0x8000-ish reads). I've ordered them by impact.
+1. The Thumb dispatch table is shifted (this is the big one)
+
+Thumb's top nibble decodes like this:
+h	encoding
+0	LSL/LSR imm
+1	ASR imm (bits 12‑11 = 10) / ADD‑SUB reg‑imm3 (bits 12‑11 = 11)
+2	MOV/CMP imm8
+3	ADD/SUB imm8
+4	ALU (bit 10 = 0), hi‑reg/BX (b = 1), LDR PC‑rel (b = 2,3)
+5	load/store reg offset
+
+Your dispThumb maps h=1 → imm8, h=2 → ALU/hireg/ldrPc, h=3/4 → memReg. So mov r1,#0x80 becomes an SBC, sub r1,#1 becomes a load from a tiny address (hence Invalid read from 0x00008001…), asr becomes add #imm8, etc. GBA games are ~all Thumb, and NDS SDK/libnds code is largely Thumb, so nothing survives this.
+
+C++
+
+static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    switch ((op >> 12) & 0xF) {
+        case 0x0: case 0x1:
+            if (((op >> 11) & 3) != 3) return emitT_shifts(ctx, op);   // LSL/LSR/ASR imm
+            return emitT_addSub3(ctx, op);                              // ADD/SUB reg/imm3
+        case 0x2: case 0x3:
+            return emitT_imm8(ctx, op);                                 // MOV/CMP/ADD/SUB imm8
+        case 0x4: {
+            uint8_t b = (op >> 10) & 3;
+            if (b == 0) return emitT_alu(ctx, op);
+            if (b == 1) return emitT_hiReg(ctx, op, curPC);
+            return emitT_ldrPc(ctx, op, curPC);
+        }
+        case 0x5:
+            return emitT_memReg(ctx, op);
+        case 0x6: case 0x7: case 0x8:
+            return emitT_memImm(ctx, op);
+        case 0x9:
+            return emitT_spLoad(ctx, op, curPC);
+        case 0xA:
+            return emitT_addSpPc(ctx, op, curPC);
+        case 0xB:
+            if (((op >> 8) & 0xF) == 0) return emitT_addSpPc(ctx, op, curPC);   // ADD/SUB SP,#imm7
+            if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6)
+                return emitT_pushPop(ctx, op, curPC);
+            return false;
+        case 0xC:
+            return emitT_ldmStm(ctx, op);
+        case 0xD: case 0xE:
+            return emitT_branch(ctx, op, curPC);
+        default:
+            return false;
+    }
+}
+
+2. SUB SP, #imm is emitted as ADD SP
+
+Format 13 is 1011 0000 S imm7 – the sign is bit 7, not (op>>8)&0xF == 1. Every Thumb function prologue therefore grows the stack instead of reserving it.
+
+C++
+
+if (h == 0xB) {
+    if (((op >> 8) & 0xF) != 0) return false;
+    ctx.li(TA, (uint32_t)(op & 0x7F) << 2);
+    if (op & 0x80) ctx.E(ppc_subf(RA[13], TA, RA[13]));   // SUB SP
+    else           ctx.E(ppc_add (RA[13], RA[13], TA));   // ADD SP
+    return true;
+}
+
+3. The V flag is never set, and N/Z/C clobber the operands used to compute V
+
+    rlwinm TE,TE,3,3,3 rotates left by 3, moving bit 31 to bit 2, and then masks bit 28 → V is always 0. You need rotate‑left 29 (= right 3). You already did it right in setC_bit0 (29,2,2).
+    setNZ/setC_xer use TA as scratch, but they run before setV_add/sub(res, TD, TA) in emitDP, and before setV_*( …, TB, TA) in every Thumb emitter – so V is computed from the Z/C bit values, not from op2.
+
+Use a scratch register that's never an operand (r10 is free), and fold the two rlwinms:
+
+C++
+
+static const uint8_t TS = 10;   // flag scratch, never an operand
+
+static inline uint32_t ppc_cntlzw(uint8_t a, uint8_t s) { return Xf(s, a, 0, 26); }
+
+static void setNZ(Ctx& ctx, uint8_t r) {
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 2, 31));   // clear N,Z
+    ctx.E(ppc_rlwimi(RCPSR, r, 0, 0, 0));        // N = r[31]
+    ctx.E(ppc_cntlzw(TS, r));                    // 32 iff r == 0  (bit 5)
+    ctx.E(ppc_rlwinm(TS, TS, 25, 1, 1));         // bit5 
+
+Something went wrong with this response, please try again.
+Trace ID: e4ce513d8349a05f17b536e05413ad81
