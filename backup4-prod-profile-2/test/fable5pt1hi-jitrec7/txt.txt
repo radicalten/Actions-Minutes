@@ -2,3 +2,8 @@ With the release of Gpt-6 on sep 3 26, Claude Fable 5.1-high became free for use
 
 procedure:
 fix-ppc-dynarec7 to fable-5.1-high on lm arena ai
+
+This failed as the prompt self terminated 60 lines in on lm arena ai. 
+
+procedure 2:
+ix-ppc-dynarec13-opus to fable-5.1-high on lm arena ai
