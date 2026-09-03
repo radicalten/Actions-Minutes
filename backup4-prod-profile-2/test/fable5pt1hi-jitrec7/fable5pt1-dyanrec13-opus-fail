@@ -1,0 +1,73 @@
+There isn't one bug here – there are several independent ones, and any one of them is enough to hang a game. The good news is they're all in the emitter, not in the runner/trampoline, and the log actually matches them nicely (only ARM fallbacks are ever logged, both CPUs end up in tight ARM spin loops with no fallbacks → the Thumb code the ARM7 runs went off the rails silently, and the ARM9 is waiting for something that never happens).
+
+In order of severity:
+1. The Thumb dispatcher is off by one nibble (fatal for all Thumb code)
+
+dispThumb switches on (op>>12)&0xF, but cases 0x1–0x5 are labelled as if it were op>>13:
+h (op>>12)	Real encoding	What your code does
+0x1	ASR imm / ADD‑SUB reg,imm3	emitT_imm8 → compiles as ADD/SUB imm8 to the wrong register
+0x2,0x3	MOV/CMP/ADD/SUB imm8	ALU / hi‑reg / LDR‑PC → garbage
+0x4	ALU / hi‑reg / LDR PC	emitT_memReg → random loads/stores
+
+Nothing falls back, it just silently computes garbage – which is exactly why there is no thumb FB line in your log. The GBA BIOS logo is ARM code; the game's main() is Thumb → black screen. NDS ARM7 SDK code is mostly Thumb → ARM7 wanders into a loop, ARM9 waits for IPC forever.
+
+C++
+
+static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
+    switch((op>>12)&0xF){
+        case 0x0: case 0x1:
+            if(((op>>11)&3)!=3) return emitT_shifts(ctx,op);   // LSL/LSR/ASR #imm
+            return emitT_addSub3(ctx,op);                       // ADD/SUB Rd,Rs,Rn/#imm3
+        case 0x2: case 0x3: return emitT_imm8(ctx,op);          // MOV/CMP/ADD/SUB #imm8
+        case 0x4: {
+            uint8_t b=(op>>10)&3;
+            if(b==0) return emitT_alu  (ctx,op);
+            if(b==1) return emitT_hiReg(ctx,op,curPC);
+            return emitT_ldrPc(ctx,op,curPC);
+        }
+        case 0x5: return emitT_memReg(ctx,op);
+        case 0x6: case 0x7: case 0x8: return emitT_memImm(ctx,op);
+        case 0x9: return emitT_spLoad (ctx,op,curPC);
+        case 0xA: return emitT_addSpPc(ctx,op,curPC);
+        case 0xB:
+            if((op&0xFF00)==0xB000) return emitT_addSpPc(ctx,op,curPC); // ADD/SUB SP,#imm7
+            if((op&0xF600)==0xB400) return emitT_pushPop(ctx,op,curPC); // PUSH/POP
+            return false;
+        case 0xC: return emitT_ldmStm(ctx,op);
+        case 0xD: case 0xE: return emitT_branch(ctx,op,curPC);
+        default:  return false;
+    }
+}
+
+2. SUB SP,#imm is compiled as ADD SP,#imm
+
+Format 13 is 1011 0000 S imm7; the sign is bit 7, not (op>>8)&0xF==1. Every Thumb function prologue is wrong.
+
+C++
+
+if(h==0xB){
+    uint32_t imm=(uint32_t)(op&0x7F)<<2;
+    ctx.li(TA,imm);
+    if(op&0x80) ctx.E(ppc_subf(RA[13],TA,RA[13]));
+    else        ctx.E(ppc_add (RA[13],RA[13],TA));
+    return true;
+}
+
+3. C and V flags are never set (wrong rlwinm mask bit numbering)
+
+rlwinm MB/ME use big‑endian numbering (bit 0 = MSB). You got that right in setNZ, sLslI etc., but not in the C/V helpers:
+
+    setC_xer: rlwinm TA,TA,0,29,29 keeps 0x00000004, not XER[CA] (0x20000000 = BE bit 2).
+    setC_imm: same mask bug.
+    setV_add/sub: rlwinm TE,TE,29,28,28 keeps 0x8, not V (0x10000000 = BE bit 3).
+
+Net effect: every CMP/SUBS/ADDS/LSLS… leaves C=0,V=0. BCS/BHS/BHI never taken, BCC/BLO/BLS always taken → infinite loops in any bounded loop / memcpy / compare.
+
+On top of that, setNZ and setC_xer use TA as scratch, and every caller then does setV_*(res, ..., TA) – so even with the mask fixed V would read a clobbered operand. Switch the scratch to TG (r9, never live across these):
+
+C++
+
+static void setNZ(Ctx& ctx,uint8_t r){
+    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,2,31));       // clear N,Z
+    ctx.E(ppc_rlwimi(RCPSR,r,0,0,0));            
+
