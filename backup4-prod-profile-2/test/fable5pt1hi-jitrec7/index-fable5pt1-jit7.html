@@ -1,0 +1,644 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ARM → PPC JIT (Wii) — Bug Report & Fixes</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  body { background:#0b0f14; color:#d5dbe3; }
+  pre { background:#0f1620; border:1px solid #1f2a37; border-radius:.5rem; padding:1rem; overflow:auto; font-size:12.5px; line-height:1.45; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  .sev-fatal { background:#7f1d1d; color:#fecaca; }
+  .sev-high  { background:#78350f; color:#fde68a; }
+  .sev-med   { background:#1e3a8a; color:#bfdbfe; }
+  .sev-perf  { background:#064e3b; color:#a7f3d0; }
+  .card { background:#111821; border:1px solid #1f2a37; border-radius:.75rem; }
+  .copy-btn { font-size:11px; }
+  nav a:hover { color:#fff; }
+</style>
+</head>
+<body class="min-h-screen">
+<div class="max-w-6xl mx-auto px-5 py-10">
+
+  <header class="mb-10">
+    <p class="text-xs uppercase tracking-widest text-sky-400 mb-2">Code review · jit_ppc.cpp</p>
+    <h1 class="text-3xl md:text-4xl font-bold text-white">ARM7/ARM9 → Broadway JIT: why games hang, and the fixes</h1>
+    <p class="mt-4 text-slate-300 max-w-3xl">
+      Every symptom you described — NDS white screen, GBA black screen after the logo, low FPS, and the
+      <code>Invalid read from 0x00007fff / 0x8000…</code> spam (a Thumb instruction fetch that wandered off into
+      unmapped memory) — is explained by the first five bugs below. Each one alone breaks basically every game.
+      Fixes are ordered by severity; paste the code blocks over the existing functions.
+    </p>
+  </header>
+
+  <!-- Summary table -->
+  <section class="card p-6 mb-10">
+    <h2 class="text-xl font-semibold text-white mb-4">Summary</h2>
+    <div class="overflow-x-auto">
+    <table class="w-full text-sm">
+      <thead class="text-slate-400 text-left border-b border-slate-700">
+        <tr><th class="py-2 pr-4">#</th><th class="py-2 pr-4">Where</th><th class="py-2 pr-4">Bug</th><th class="py-2">Effect</th></tr>
+      </thead>
+      <tbody class="divide-y divide-slate-800">
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-fatal">1</span></td><td class="pr-4 font-mono">emitBlockXfer</td><td class="pr-4">Both branch polarities inverted</td><td>Every ARM LDM/STM executes <b>twice</b>; LDM {…,pc} returns to next instr</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-fatal">2</span></td><td class="pr-4 font-mono">emitT_pushPop</td><td class="pr-4">Branch polarity inverted</td><td>Thumb <code>pop {…,pc}</code> falls through to next instruction</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-fatal">3</span></td><td class="pr-4 font-mono">emitT_addSpPc</td><td class="pr-4"><code>sub sp,#imm</code> decoded as <code>add sp,#imm</code></td><td>Every Thumb function prologue corrupts the stack</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-fatal">4</span></td><td class="pr-4 font-mono">emitT_hiReg</td><td class="pr-4"><code>add pc,rX</code>/<code>mov pc,rX</code> use BX semantics; <code>blx rX</code> never sets LR</td><td>Switch/jump tables drop into ARM mode at a Thumb address; indirect calls never return</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-fatal">5</span></td><td class="pr-4 font-mono">runCpu</td><td class="pr-4">HLE-BIOS addresses get JIT-compiled</td><td>IRQ return magic address never reaches <code>finishHleIrq</code> → hang after first IRQ</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-high">6</span></td><td class="pr-4 font-mono">setV_*, setNZ, setC_xer</td><td class="pr-4">V rotate is wrong (always 0); temps clobber operands; TST/TEQ result overwrites shifter carry</td><td>Signed branches / carry chains wrong</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-high">7</span></td><td class="pr-4 font-mono">sLsrI / sAsrI / sRorI</td><td class="pr-4">Carry-out rotated the wrong way</td><td>Thumb <code>lsr/asr #n</code> + <code>bcs/bcc</code> misbehave</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-high">8</span></td><td class="pr-4 font-mono">compile / emitLSExtra</td><td class="pr-4"><code>return false</code> after code was emitted; cond-skip left unpatched</td><td>Garbage code + <code>beq 0</code> (branch-to-self) → hard hang on cond. LDRD/STRD</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-med">9</span></td><td class="pr-4 font-mono">dispARM / emitDP</td><td class="pr-4">MRS/MSR mask swallows BX/CLZ/SWP; DP doesn't reject S=0 test ops</td><td>emitBX is dead code; CLZ/QADD would be mis-emitted once the mask is fixed</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-med">10</span></td><td class="pr-4 font-mono">helpers</td><td class="pr-4">No PC alignment on commit; ARM7 interworks on LDM/POP pc; LDR ignores unaligned rotate; Thumb reg-shifts don't set C</td><td>Interpreter/JIT divergence</td></tr>
+        <tr><td class="py-2 pr-4"><span class="px-2 py-0.5 rounded sev-perf">11</span></td><td class="pr-4 font-mono">runCpu / cache</td><td class="pr-4"><code>printf</code> every 64 blocks; block cache not tagged by CPU; 1:1 ARM9:ARM7 ratio</td><td>5–15 FPS; possible cross-CPU block reuse</td></tr>
+      </tbody>
+    </table>
+    </div>
+  </section>
+
+  <!-- BUG 1 -->
+  <section class="card p-6 mb-8" id="bug1">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-fatal">FATAL</span><h2 class="text-xl font-semibold text-white">1. emitBlockXfer — both conditional branches are inverted</h2></div>
+    <p class="text-slate-300 mb-3">
+      <code>ppc_bc(4, 0, 8)</code> is <em>bge +8</em>: it skips the following <code>b</code> when the helper result is ≥ 0 — which lands in the
+      <b>fail</b> stub (reload + <code>EXIT_FALLBACK</code> at <code>curPC</code>). The runner then re-runs the same LDM/STM in the interpreter, so
+      every LDM/STM executes twice: <code>ldmfd sp!, {r4-r11, pc}</code> pops once in the helper, then pops garbage from SP+N.
+      The second check (<code>cmpi 1; bne +8; b</code>) is inverted the same way, so a loaded PC is thrown away in favour of <code>curPC+4</code>.
+      Since FRAME_PC already holds the right value in both cases, just always use the dynamic exit.
+    </p>
+    <script type="text/plain" class="snippet" data-title="Replacement: patch helpers + emitBlockXfer">
+static void patchBc(Ctx& ctx, size_t idx, uint8_t bo, uint8_t bi) {
+    int32_t off = (int32_t)((ctx.sz() - idx) * 4);
+    if (off < -32768 || off > 32764) { ctx.overflow = true; return; }
+    ctx.base[idx] = ppc_bc(bo, bi, (int16_t)off);
+}
+static void patchB(Ctx& ctx, size_t idx) {
+    ctx.base[idx] = ppc_b((int32_t)((ctx.sz() - idx) * 4));
+}
+
+static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
+    uint8_t cond = (op >> 28) & 0xF;
+    if (cond == 15 || ((op >> 22) & 1)) return false;   // S bit (user regs / SPSR) -> interpreter
+
+    uint8_t  rn   = (op >> 16) & 0xF;
+    uint16_t list = (uint16_t)(op & 0xFFFF);
+    if (rn > 14 || !list) return false;
+
+    bool load   = (op >> 20) & 1;
+    bool loadPC = load && (list & 0x8000);
+
+    size_t si = emitCondSkip(ctx, cond);
+
+    emitSpill(ctx);
+    ctx.li(TA, curPC + 12); ctx.E(ppc_stw(TA, FRAME_SCR2, 1));  // value stored for r15 by STM
+    ctx.li(TA, curPC + 4);  ctx.E(ppc_stw(TA, FRAME_PC,   1));  // default next PC
+
+    ctx.ldCore();                                       // r3 = core
+    ctx.E(ppc_addi(TB, 0, ctx.arm7 ? 1 : 0));           // r4 = arm7
+    ctx.li(TC, op);                                     // r5 = opcode
+    ctx.E(ppc_addi(TD, 1, (int16_t)FRAME_REGSYNC));     // r6 = regs
+    ctx.E(ppc_lwz (TE, FRAME_SCR2, 1));                 // r7 = pcForR15
+    ctx.E(ppc_addi(TF, 1, (int16_t)FRAME_PC));          // r8 = pcOut
+    ctx.E(ppc_addi(TG, 1, (int16_t)FRAME_CPSR));        // r9 = cpsrInOut
+    ctx.call((void*)JitHelp_armBlock);
+
+    // r3 < 0 -> helper refused (guest regs untouched) -> let interpreter do it
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t bFail = ctx.sz();
+    ctx.E(ppc_bc(12, 0, 0));                            // blt fail   (patched below)
+
+    emitReload(ctx);                                    // pick up regs written by helper
+    size_t bJoin = SIZE_MAX;
+    if (loadPC) {
+        emitCommitExitDyn(ctx, EXIT_NORMAL);            // FRAME_PC = popped PC, FRAME_CPSR updated
+    } else {
+        bJoin = ctx.sz();
+        ctx.E(ppc_b(0));                                // jump over the fail stub
+    }
+
+    patchBc(ctx, bFail, 12, 0);                         // fail:
+    emitCommitExit(ctx, curPC, EXIT_FALLBACK);
+
+    if (bJoin != SIZE_MAX) patchB(ctx, bJoin);          // join:
+
+    if (loadPC) {
+        if (si != SIZE_MAX) { patchSkip(ctx, si); emitCommitExit(ctx, curPC + 4, EXIT_NORMAL); }
+        ctx.done = true;
+        return true;
+    }
+    patchSkip(ctx, si);
+    return true;
+}
+    </script>
+  </section>
+
+  <!-- BUG 2 -->
+  <section class="card p-6 mb-8" id="bug2">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-fatal">FATAL</span><h2 class="text-xl font-semibold text-white">2. emitT_pushPop — <code>pop {…, pc}</code> returns to the next instruction</h2></div>
+    <p class="text-slate-300 mb-3">
+      Same inverted <code>bne +8 / b</code> pattern: when the helper reports "PC was popped" (result == 1) the code jumps <em>past</em> the dynamic exit
+      and commits <code>curPC + 2</code>. Every Thumb function return falls through into whatever follows — this is exactly what produces
+      a Thumb fetch stream marching through unmapped memory (<code>0x8000, 0x8002, 0x8004…</code>).
+    </p>
+    <script type="text/plain" class="snippet" data-title="Replacement: emitT_pushPop">
+static bool emitT_pushPop(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    uint8_t opA = (op >> 9) & 7;
+    if (opA != 2 && opA != 6) return false;
+    const bool pop = (op >> 11) & 1;
+    const bool R   = (op >> 8) & 1;
+
+    emitSpill(ctx);
+    ctx.li(TA, curPC + 2);
+    ctx.E(ppc_stw(TA, FRAME_PC, 1));
+
+    ctx.ldCore();
+    ctx.E(ppc_addi(TB, 0, ctx.arm7 ? 1 : 0));
+    ctx.li(TC, (uint32_t)op);
+    ctx.E(ppc_addi(TD, 1, (int16_t)FRAME_REGSYNC));
+    ctx.E(ppc_addi(TE, 1, (int16_t)FRAME_PC));
+    ctx.E(ppc_addi(TF, 1, (int16_t)FRAME_CPSR));
+    ctx.call((void*)JitHelp_thumbPushPop);
+    emitReload(ctx);
+
+    if (pop && R) {                            // POP {..., pc}
+        emitCommitExitDyn(ctx, EXIT_NORMAL);   // helper wrote FRAME_PC (+ FRAME_CPSR on ARM9)
+        ctx.done = true;
+    }
+    return true;
+}
+    </script>
+  </section>
+
+  <!-- BUG 3 -->
+  <section class="card p-6 mb-8" id="bug3">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-fatal">FATAL</span><h2 class="text-xl font-semibold text-white">3. emitT_addSpPc — <code>sub sp, #imm</code> becomes <code>add sp, #imm</code></h2></div>
+    <p class="text-slate-300 mb-3">
+      Thumb format 13 is <code>1011 0000 S imm7</code>: bits 11-8 are <b>0000 for both</b> add and sub; the sign is bit 7.
+      The code tests <code>(op >> 8) & 0xF == 1</code> for sub, which never happens, so <code>0xB080|imm</code> takes the add path.
+    </p>
+    <script type="text/plain" class="snippet" data-title="Replacement: emitT_addSpPc">
+static bool emitT_addSpPc(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    uint8_t h = (op >> 12) & 0xF;
+    if (h == 0xA) {                                   // ADD Rd, PC/SP, #imm8*4
+        uint8_t rd = (op >> 8) & 7;
+        bool sp = (op >> 11) & 1;
+        uint32_t imm = (uint32_t)(op & 0xFF) << 2;
+        if (sp) { ctx.li(TA, imm); ctx.E(ppc_add(RA[rd], RA[13], TA)); }
+        else    { ctx.li(RA[rd], ((curPC + 4) & ~3u) + imm); }
+        return true;
+    }
+    if (h == 0xB) {                                   // ADD/SUB SP, #imm7*4
+        if (((op >> 8) & 0xF) != 0) return false;     // 0xB1xx.. is not this instruction
+        uint32_t imm = (uint32_t)(op & 0x7F) << 2;
+        ctx.li(TA, imm);
+        if (op & 0x80) ctx.E(ppc_subf(RA[13], TA, RA[13]));   // SUB sp
+        else           ctx.E(ppc_add (RA[13], RA[13], TA));   // ADD sp
+        return true;
+    }
+    return false;
+}
+    </script>
+  </section>
+
+  <!-- BUG 4 -->
+  <section class="card p-6 mb-8" id="bug4">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-fatal">FATAL</span><h2 class="text-xl font-semibold text-white">4. emitT_hiReg — <code>add/mov pc</code> must not interwork; <code>blx rX</code> must set LR</h2></div>
+    <p class="text-slate-300 mb-3">
+      Thumb <code>add pc, rX</code> is how GCC implements <code>switch</code> jump tables; the computed address has bit 0 clear. Routing it through
+      <code>emitBX_SCR0</code> clears the T bit and the CPU starts decoding Thumb code as ARM. Likewise <code>mov pc, rX</code> stays in Thumb on ARMv4/v5.
+      Also, bit 7 of the BX encoding means <b>BLX</b> on ARM9 (very common in DS code); the current code treats it as BX and never writes LR,
+      so the callee returns to a stale address.
+    </p>
+    <script type="text/plain" class="snippet" data-title="Replacement: emitJumpSameMode_SCR0 + emitT_hiReg">
+// Jump without touching the T bit (Thumb ADD/MOV pc)
+static void emitJumpSameMode_SCR0(Ctx& ctx) {
+    ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
+    ctx.E(ppc_rlwinm(TB, TA, 0, 0, 30));      // & ~1
+    ctx.E(ppc_stw(TB, FRAME_PC, 1));
+    emitCommitExitDyn(ctx, EXIT_NORMAL);
+}
+
+static bool emitT_hiReg(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    uint8_t o  = (op >> 8) & 3;
+    uint8_t rs = ((op >> 3) & 7) | (((op >> 6) & 1) << 3);
+    uint8_t rd = (op & 7)        | (((op >> 7) & 1) << 3);
+
+    if (o == 3) {                                   // BX / BLX Rs
+        bool link = (op >> 7) & 1;                  // H1 set => BLX (ARMv5 only)
+        if (link && ctx.arm7) return false;         // undefined on ARM7 -> interpreter
+        if (rs == 15) ctx.li(TA, curPC + 4);
+        else          ctx.E(ppc_mr(TA, RA[rs]));
+        ctx.E(ppc_stw(TA, FRAME_SCR0, 1));
+        if (link) ctx.li(RA[14], (curPC + 2) | 1u);
+        emitBX_SCR0(ctx);
+        ctx.done = true;
+        return true;
+    }
+    if (rd == 15) {                                 // ADD pc,Rs / MOV pc,Rs : stay in Thumb
+        if (o == 1) return false;
+        if (o == 2) {
+            if (rs == 15) ctx.li(TA, curPC + 4);
+            else          ctx.E(ppc_mr(TA, RA[rs]));
+        } else {
+            ctx.li(TA, curPC + 4);
+            if (rs != 15) ctx.E(ppc_add(TA, TA, RA[rs]));
+            else          ctx.E(ppc_add(TA, TA, TA));
+        }
+        ctx.E(ppc_stw(TA, FRAME_SCR0, 1));
+        emitJumpSameMode_SCR0(ctx);
+        ctx.done = true;
+        return true;
+    }
+    if (rs == 15) {
+        ctx.li(TA, curPC + 4);
+        if (o == 0) ctx.E(ppc_add(RA[rd], RA[rd], TA));
+        else if (o == 1) {
+            ctx.E(ppc_mr(TB, RA[rd]));
+            ctx.E(ppc_subfc(TH, TA, TB));
+            setNZ(ctx, TH); setC_xer(ctx); setV_sub(ctx, TH, TB, TA);
+        } else ctx.E(ppc_mr(RA[rd], TA));
+        return true;
+    }
+    if (o == 0) ctx.E(ppc_add(RA[rd], RA[rd], RA[rs]));
+    else if (o == 1) {
+        ctx.E(ppc_mr(TB, RA[rd]));
+        ctx.E(ppc_subfc(TH, RA[rs], TB));
+        setNZ(ctx, TH); setC_xer(ctx); setV_sub(ctx, TH, TB, RA[rs]);
+    } else ctx.E(ppc_mr(RA[rd], RA[rs]));
+    return true;
+}
+    </script>
+  </section>
+
+  <!-- BUG 5 -->
+  <section class="card p-6 mb-8" id="bug5">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-fatal">FATAL</span><h2 class="text-xl font-semibold text-white">5. runCpu — never JIT the BIOS region while an HLE BIOS is installed</h2></div>
+    <p class="text-slate-300 mb-3">
+      With <code>interp.bios != nullptr</code> the interpreter's <code>runOpcode()</code> intercepts special addresses inside the BIOS range
+      (IRQ entry / the magic IRQ-return address handled by <code>handleHleIrq / finishHleIrq</code>). <code>validPC()</code> allows
+      <code>pc < 0x8000</code> and <code>pc >= 0xFFFF0000</code>, so the JIT happily fetches zeros from a non-existent BIOS and compiles them.
+      The IRQ handler's <code>bx lr</code> then lands in JIT'd garbage instead of <code>finishHleIrq()</code>, CPSR/SPSR are never restored, and the
+      game hangs after its first VBlank interrupt. This also removes the per-64-blocks <code>printf</code>, which alone costs you most of your FPS.
+    </p>
+    <script type="text/plain" class="snippet" data-title="Replacement: runCpu (also see #11 for the cpu tag)">
+static inline bool hleBiosAddr(const Interpreter& interp, int cpu, uint32_t pc) {
+    if (!interp.bios) return false;                 // real BIOS loaded -> JIT is fine
+    if (cpu == 1) return pc < 0x4000u;              // ARM7 / GBA BIOS
+    return pc >= 0xFFFF0000u;                       // ARM9 BIOS
+}
+
+static void runCpu(Core& core, int cpu, bool gba) {
+    Interpreter& interp = core.interpreter[cpu];
+    if (interp.halted) return;
+    if (!interp.isReady()) { interp.jitRunOpcode(); return; }
+
+    uint32_t pc = interp.getActualPC();
+    if (!validPC(pc, gba) || hleBiosAddr(interp, cpu, pc)) {
+        interp.jitRunOpcode();                      // interpreter owns HLE hooks
+        return;
+    }
+
+    g_exitReason[cpu] = EXIT_FALLBACK;
+    g_exitPC[cpu]     = pc;
+
+    const bool arm7 = (cpu == 1) || gba;
+    JitBlock* b = compile(&interp, &core, pc, arm7, cpu);
+    if (!b || !b->code || b->nW < 16 ||
+        b->code < codeBuf || b->code + b->nW > codeBuf + JIT_WORDS) {
+        interp.jitRunOpcode();
+        return;
+    }
+
+    executeBlock_asm(b->code);
+
+    const int      reason = g_exitReason[cpu];
+    const uint32_t expc   = g_exitPC[cpu];
+
+    // NO printf here – a console print every 64 blocks is what caps you at 5–15 fps.
+
+    if (reason == EXIT_FALLBACK) {
+        if (validPC(expc, gba)) interp.setPC(expc);
+        interp.jitRunOpcode();
+    }
+}
+    </script>
+  </section>
+
+  <!-- BUG 6 -->
+  <section class="card p-6 mb-8" id="bug6">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-high">HIGH</span><h2 class="text-xl font-semibold text-white">6. Flag code — V is never set, temporaries get clobbered, TST/TEQ trash the shifter carry</h2></div>
+    <ul class="list-disc pl-6 text-slate-300 space-y-1 mb-3">
+      <li><code>rlwinm TE,TE,3,3,3</code> rotates bit 31 <em>left</em> by 3 → bit 2, then masks bit 28 → result is always 0. Needs <code>sh = 29</code>.</li>
+      <li><code>setNZ</code> and <code>setC_xer</code> use <code>TA</code> (r3) as scratch, but every caller then passes <code>TA</code> to <code>setV_*</code> as an operand (emitDP reloads opB into TA; Thumb CMP/ADD/SUB/NEG use TA). Move flag scratch to r12, which never holds an operand.</li>
+      <li>In <code>emitDP</code> the test result register is <code>TC</code> — the same register the shifter uses for carry-out — so <code>TST/TEQ</code> with a shifted operand set C from the result's bit 0. Use r10 for test results.</li>
+      <li>Reject the S=0 “test” opcodes in <code>emitDP</code> (that space is MRS/MSR/BX/CLZ/QADD/SMUL*).</li>
+    </ul>
+    <script type="text/plain" class="snippet" data-title="Replacement: register temps + flag setters + emitDP edits">
+// r14-r28 = ARM r0-r14, r29 = CPSR; temps r3-r10; r11 = call; r12 = flag scratch
+static const uint8_t TA = 3, TB = 4, TC = 5, TD = 6, TE = 7, TF = 8, TG = 9;
+static const uint8_t TH = 10;   // result temp for TST/TEQ/CMP/CMN (never the shifter carry)
+static const uint8_t TX = 12;   // scratch for flag code ONLY – never holds an operand
+static const uint8_t RCALL = 11;
+
+static void setNZ(Ctx& ctx, uint8_t r) {
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 2, 31));   // clear N,Z
+    ctx.E(ppc_rlwimi(RCPSR, r, 0, 0, 0));        // N = r[31]
+    ctx.E(ppc_cmpi(6, r, 0));
+    ctx.E(ppc_mfcr(TX));
+    ctx.E(ppc_rlwinm(TX, TX, 25, 1, 1));         // CR6.EQ -> bit 30
+    ctx.E(ppc_or(RCPSR, RCPSR, TX));
+}
+static void setC_xer(Ctx& ctx) {
+    ctx.E(ppc_mfxer(TX));
+    ctx.E(ppc_rlwinm(TX, TX, 0, 2, 2));          // keep CA (bit 29)
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));    // clear C
+    ctx.E(ppc_or(RCPSR, RCPSR, TX));
+}
+static void setV_add(Ctx& ctx, uint8_t res, uint8_t a, uint8_t b) {
+    ctx.E(ppc_xor(TE, res, a));
+    ctx.E(ppc_xor(TF, res, b));
+    ctx.E(ppc_and(TE, TE, TF));
+    ctx.E(ppc_rlwinm(TE, TE, 29, 3, 3));         // bit31 -> bit28 (V)   [was sh=3 => always 0]
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 4, 2));    // clear V
+    ctx.E(ppc_or(RCPSR, RCPSR, TE));
+}
+static void setV_sub(Ctx& ctx, uint8_t res, uint8_t a, uint8_t b) {
+    ctx.E(ppc_xor(TE, a, b));
+    ctx.E(ppc_xor(TF, a, res));
+    ctx.E(ppc_and(TE, TE, TF));
+    ctx.E(ppc_rlwinm(TE, TE, 29, 3, 3));
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 4, 2));
+    ctx.E(ppc_or(RCPSR, RCPSR, TE));
+}
+static void setC_bit0(Ctx& ctx, uint8_t cr) {
+    ctx.E(ppc_rlwinm(TX, cr, 29, 2, 2));         // bit0 -> bit29
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));
+    ctx.E(ppc_or(RCPSR, RCPSR, TX));
+}
+
+// ---- inside emitDP(): ----
+//   after computing isTest, add:
+//     if (isTest && !s) return false;   // MRS/MSR/BX/CLZ/QADD/SMUL space, never a DP op
+//   and change the result register:
+//     uint8_t res = isTest ? TH : RA[rd];
+// Also replace TC with TH in emitT_imm8 case 1 and in emitT_hiReg CMP paths
+// (see #4 above, already done there).
+    </script>
+  </section>
+
+  <!-- BUG 7 -->
+  <section class="card p-6 mb-8" id="bug7">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-high">HIGH</span><h2 class="text-xl font-semibold text-white">7. Right-shift carry-out is rotated the wrong direction</h2></div>
+    <p class="text-slate-300 mb-3">
+      For LSR/ASR/ROR #i the carry is bit <code>i-1</code> of the source. <code>rlwinm TC, s, i, 31, 31</code> rotates <em>left</em> by i, moving bit i-1 to
+      bit 2i-1, not to bit 0. You need a left rotate of <code>(32 - (i-1)) & 31</code>. (LSL was already correct.)
+    </p>
+    <script type="text/plain" class="snippet" data-title="Replacement: sLsrI / sAsrI / sRorI">
+static inline uint8_t rotBitTo0(int bit) { return (uint8_t)((32 - bit) & 31); }
+
+static void sLsrI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
+    if (i == 0 || i == 32) {
+        if (sc) ctx.E(ppc_rlwinm(TC, s, 1, 31, 31));                 // C = bit31
+        ctx.E(ppc_addi(d, 0, 0));
+    } else if (i < 32) {
+        if (sc) ctx.E(ppc_rlwinm(TC, s, rotBitTo0(i - 1), 31, 31));  // C = bit(i-1)
+        ctx.E(ppc_rlwinm(d, s, (uint8_t)(32 - i), (uint8_t)i, 31));
+    } else {
+        if (sc) ctx.E(ppc_addi(TC, 0, 0));
+        ctx.E(ppc_addi(d, 0, 0));
+    }
+}
+static void sAsrI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
+    if (i <= 0 || i >= 32) {
+        if (sc) ctx.E(ppc_rlwinm(TC, s, 1, 31, 31));
+        ctx.E(ppc_srawi(d, s, 31));
+    } else {
+        if (sc) ctx.E(ppc_rlwinm(TC, s, rotBitTo0(i - 1), 31, 31));
+        ctx.E(ppc_srawi(d, s, (uint8_t)i));
+    }
+}
+static void sRorI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
+    if (i == 0) {                                                    // RRX
+        if (sc) ctx.E(ppc_rlwinm(TC, s, 0, 31, 31));
+        ctx.E(ppc_rlwinm(TA, RCPSR, 2, 0, 0));                       // C -> bit31
+        ctx.E(ppc_rlwinm(d, s, 31, 1, 31));
+        ctx.E(ppc_or(d, d, TA));
+        return;
+    }
+    i &= 31;
+    if (i == 0) {                                                    // ROR #32
+        if (d != s) ctx.E(ppc_mr(d, s));
+        if (sc) ctx.E(ppc_rlwinm(TC, s, 1, 31, 31));
+        return;
+    }
+    if (sc) ctx.E(ppc_rlwinm(TC, s, rotBitTo0(i - 1), 31, 31));
+    ctx.E(ppc_rlwinm(d, s, (uint8_t)(32 - i), 0, 31));
+}
+    </script>
+  </section>
+
+  <!-- BUG 8 -->
+  <section class="card p-6 mb-8" id="bug8">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-high">HIGH</span><h2 class="text-xl font-semibold text-white">8. Late <code>return false</code> after code was already emitted</h2></div>
+    <p class="text-slate-300 mb-3">
+      <code>emitLSExtra</code> returns false <em>after</em> <code>emitCondSkip()</code> for LDRD/STRD and for <code>Rm == 15</code>. The half-emitted code stays in the
+      buffer and the cond-skip <code>bc</code> is left with offset 0 — <b>a branch to itself</b>. Any conditional LDRD/STRD whose condition is false
+      hangs the Wii. Fix both the specific function and make <code>compile()</code> roll back the cursor so this class of bug can't recur.
+    </p>
+    <script type="text/plain" class="snippet" data-title="Edits: emitLSExtra (hoist checks) + compile() rollback">
+// ---- emitLSExtra: move ALL rejections above emitCondSkip() ----
+    uint8_t sh = (op >> 5) & 3;
+    if (rd == 15 || rn == 15 || sh == 0) return false;
+    if (!imm && (op & 0xF) == 15) return false;     // Rm == PC
+    if (!l && sh != 1) return false;                // LDRD / STRD -> interpreter
+    size_t si = emitCondSkip(ctx, cond);
+    ...
+// and delete the two later "return false" lines inside the function body.
+
+// ---- compile(): roll back on any dispatcher failure ----
+        if (thumb) {
+            uint16_t op = core->memory.read<uint16_t>(arm7, curPC);
+            ... (BL pair handling unchanged) ...
+            uint32_t* mark = ctx.cur;
+            if (!dispThumb(ctx, op, curPC)) {
+                ctx.cur = mark;                        // discard partial emission
+                emitCommitExit(ctx, curPC, EXIT_FALLBACK);
+                ctx.done = true;
+            } else { curPC += 2; n++; }
+        } else {
+            uint32_t op = core->memory.read<uint32_t>(arm7, curPC);
+            uint32_t* mark = ctx.cur;
+            if (!dispARM(ctx, op, curPC)) {
+                ctx.cur = mark;
+                emitCommitExit(ctx, curPC, EXIT_FALLBACK);
+                ctx.done = true;
+            } else {
+                curPC += 4; n++;
+                if (((op >> 25) & 7) == 5)               ctx.done = true;
+                if ((op & 0x0FFFFFF0) == 0x012FFF10)     ctx.done = true;
+            }
+        }
+    </script>
+  </section>
+
+  <!-- BUG 9 -->
+  <section class="card p-6 mb-8" id="bug9">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-med">MEDIUM</span><h2 class="text-xl font-semibold text-white">9. dispARM — the MRS/MSR test swallows BX, CLZ, QADD, SWP, SMUL*</h2></div>
+    <p class="text-slate-300 mb-3">
+      <code>(op & 0x0F900000) == 0x01000000</code> matches the whole misc space, including <code>BX</code> (<code>0x012FFF10</code>). Every BX therefore falls back
+      and <code>emitBX</code> is dead code (which also hid any bugs in it). Tighten the mask to require bits 7-4 == 0 — but only together with the
+      <code>isTest && !s</code> guard from #6, otherwise CLZ/QADD would flow into <code>emitDP</code>.
+    </p>
+    <script type="text/plain" class="snippet" data-title="Edit: dispARM">
+    // MRS / MSR (register forms) only: bits 27-23 = 00010, bit 20 = 0, bits 7-4 = 0000
+    if ((op & 0x0F9000F0) == 0x01000000)
+        return emitMrsMsr(ctx, op, curPC);
+    // BX (0x012FFF10) now reaches case 0 -> emitBranch -> emitBX as intended.
+    // SWP (0x01000090) reaches emitLSExtra and is rejected by sh == 0.
+    // CLZ / QADD / SMUL* reach emitDP and are rejected by (isTest && !s).
+    </script>
+  </section>
+
+  <!-- BUG 10 -->
+  <section class="card p-6 mb-8" id="bug10">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-med">MEDIUM</span><h2 class="text-xl font-semibold text-white">10. Helper semantics that diverge from the interpreter</h2></div>
+    <ul class="list-disc pl-6 text-slate-300 space-y-1 mb-3">
+      <li><b>PC alignment:</b> <code>emitBX_SCR0</code> only clears bit 0; align in <code>JitHelp_commit</code> according to the T bit.</li>
+      <li><b>ARM7 never interworks on LDM/POP pc</b> (ARMv4T). Only the ARM9 does.</li>
+      <li><b>Unaligned LDR</b> rotates the loaded word on ARM; NooDS does this in <code>ldrOf</code>. Add a dedicated helper for single-word loads.</li>
+      <li><b>Thumb LSL/LSR/ASR/ROR by register</b> update C; the JIT doesn't. Fall back until implemented.</li>
+    </ul>
+    <script type="text/plain" class="snippet" data-title="Edits: JitHelp_commit / JitHelp_armBlock / JitHelp_thumbPushPop / JitHelp_ldr32 / emitT_alu">
+// ---- JitHelp_commit: align PC to the mode we're committing ----
+    pc &= (cpsr & (1u << 5)) ? ~1u : ~3u;
+    g_exitPC[cpu] = pc;  ... (rest unchanged)
+
+// ---- JitHelp_armBlock, LDM with r15 in list ----
+            if (i == 15) {
+                if (!arm7 && (val & 1u)) { *cpsrInOut |= 1u << 5; *pcOut = val & ~1u; }  // ARM9 interworks
+                else                     { *pcOut = val & ~3u; }                        // ARM7 stays ARM
+                wrotePC = 1;
+            }
+
+// ---- JitHelp_thumbPushPop, POP with pc ----
+        if (!arm7 && !(val & 1u)) { *cpsrInOut &= ~(1u << 5); *pcOut = val & ~3u; }   // ARM9 -> ARM
+        else                      { *pcOut = val & ~1u; }                              // stay Thumb
+        wrotePC = 1;
+
+// ---- new helper for single-word LDR (emitLS word loads, Thumb LDR reg/imm/SP) ----
+uint32_t JitHelp_ldr32(Core* c, int a, uint32_t ad) {
+    uint32_t v = c->memory.read<uint32_t>((bool)a, ad);
+    if (ad & 3u) { unsigned sh = (ad & 3u) * 8u; v = (v >> sh) | (v << (32u - sh)); }
+    return v;
+}
+// use JitHelp_ldr32 instead of JitHelp_r32 in: emitLS (ld && !by), emitT_memReg k==4,
+// emitT_memImm (word load), emitT_spLoad (load). Keep JitHelp_r32 for LDM/PC-relative.
+
+// ---- emitT_alu: shifts by register also set C -> interpreter for now ----
+        case 2: case 3: case 4: case 7: return false;
+    </script>
+  </section>
+
+  <!-- BUG 11 -->
+  <section class="card p-6 mb-8" id="bug11">
+    <div class="flex items-center gap-3 mb-3"><span class="px-2 py-0.5 rounded text-xs font-bold sev-perf">PERF / SAFETY</span><h2 class="text-xl font-semibold text-white">11. Block cache is not tagged by CPU; ARM9:ARM7 run at 1:1</h2></div>
+    <p class="text-slate-300 mb-3">
+      Blocks bake in <code>ctx.interp</code>, <code>cpuIdx</code> and <code>arm7</code>, but the cache key is only the PC. If ARM7 and ARM9 ever run code at the same
+      address the wrong core's block executes. Also run the ARM9 twice per ARM7 step so the timing ratio is at least in the right ballpark.
+    </p>
+    <script type="text/plain" class="snippet" data-title="Edits: JitBlock / hashPC / compile / runJitNds">
+struct JitBlock {
+    uint32_t  armPC;
+    uint32_t* code;
+    uint32_t  nW;
+    uint32_t  gen;
+    bool      thumb;
+    bool      valid;
+    uint8_t   cpu;                 // NEW
+};
+static size_t hashPC(uint32_t pc, int cpu) { return ((pc >> 1) ^ ((uint32_t)cpu << 11)) & (CSIZ - 1); }
+
+// compile(): 
+    size_t bkt = hashPC(armPC, cpuIdx);
+    if (s.valid && s.armPC == armPC && s.thumb == thumb && s.cpu == cpuIdx && s.gen == cacheGen && ...)
+    ...
+    slot.cpu = (uint8_t)cpuIdx;
+
+void runJitNds(Core& core) {
+    if (!g_jitLive || !codeBuf) { Interpreter::runCoreNds(core); return; }
+    for (int i = 0; i < 8; i++) {
+        runCpu(core, 0, false);
+        runCpu(core, 0, false);      // ARM9 runs at 2x the ARM7 clock
+        runCpu(core, 1, false);
+    }
+    JitHelp_tick(&core, CYCLES_PER_SLICE);
+}
+    </script>
+  </section>
+
+  <!-- Verify -->
+  <section class="card p-6 mb-8" id="verify">
+    <h2 class="text-xl font-semibold text-white mb-3">Two things to verify on your side</h2>
+    <ol class="list-decimal pl-6 text-slate-300 space-y-3">
+      <li>
+        <b><code>getActualPC()</code> after an interpreter step.</b> The whole runner assumes that after <code>jitRunOpcode()</code> executes the instruction at
+        <code>A</code>, <code>getActualPC()</code> returns <code>A+4</code> (ARM) / <code>A+2</code> (Thumb). In stock NooDS, <code>flushPipeline()</code> leaves
+        <code>r15 = target + 4</code> and <code>runOpcode()</code> bumps it to <code>+8</code> <em>before</em> executing, so between instructions <code>r15 - 8</code>
+        points at the instruction that was <em>just executed</em> — that would make every FALLBACK instruction run twice. Add a one-off check:
+        <pre class="mt-2"><code>uint32_t a = interp.getActualPC(); interp.jitRunOpcode();
+if (interp.getActualPC() == a) printf("BUG: PC did not advance after interpreter step\n");</code></pre>
+        (use a plain ALU instruction, not a branch). If it fires, compute the next PC from the interpreter's pipeline position instead of <code>r15 - 8</code>.
+      </li>
+      <li>
+        <b>Keep <code>BLK_ARMS = 1</code> until a game boots</b>, then raise it. Once multi-instruction blocks are on, remember that a mid-block
+        <code>setPC()</code> is no longer sufficient for FALLBACK: you also need the guest PC of the failing instruction, which you already pass as
+        <code>curPC</code> — so that part is fine.
+      </li>
+    </ol>
+  </section>
+
+  <section class="card p-6 mb-8">
+    <h2 class="text-xl font-semibold text-white mb-3">Suggested order of work</h2>
+    <ol class="list-decimal pl-6 text-slate-300 space-y-1">
+      <li>Apply #1, #2, #3, #4 (they're the ones producing the hangs and the 0x8000 fetch stream).</li>
+      <li>Apply #5 and remove the trace <code>printf</code> — FPS should jump immediately.</li>
+      <li>Apply #6/#7 together (the two flag bugs currently cancel each other out; fixing only the rotate exposes the clobber).</li>
+      <li>Apply #8/#9/#10/#11, then run the <code>getActualPC()</code> check above.</li>
+      <li>Only then raise <code>BLK_ARMS</code>.</li>
+    </ol>
+  </section>
+
+  <footer class="text-xs text-slate-500 mt-10">Encoding checks done against the PowerPC ISA (rlwinm/rlwimi bit numbering: PPC bit n = LSB bit 31-n; BO=12 branch-if-true, BO=4 branch-if-false).</footer>
+</div>
+
+<script>
+  // Render each <script type="text/plain" class="snippet"> as a code block with a copy button.
+  document.querySelectorAll('script.snippet').forEach(function (s) {
+    var wrap = document.createElement('div');
+    wrap.className = 'mt-3';
+    var bar = document.createElement('div');
+    bar.className = 'flex items-center justify-between mb-1';
+    var title = document.createElement('span');
+    title.className = 'text-xs text-slate-400';
+    title.textContent = s.dataset.title || 'code';
+    var btn = document.createElement('button');
+    btn.className = 'copy-btn px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 text-slate-100';
+    btn.textContent = 'Copy';
+    var code = s.textContent.replace(/^\n+/, '').replace(/\s+$/, '');
+    btn.addEventListener('click', function () {
+      navigator.clipboard.writeText(code).then(function () {
+        btn.textContent = 'Copied'; setTimeout(function () { btn.textContent = 'Copy'; }, 1200);
+      });
+    });
+    bar.appendChild(title); bar.appendChild(btn);
+    var pre = document.createElement('pre');
+    var c = document.createElement('code');
+    c.textContent = code;
+    pre.appendChild(c);
+    wrap.appendChild(bar); wrap.appendChild(pre);
+    s.parentNode.insertBefore(wrap, s.nextSibling);
+  });
+</script>
+</body>
+</html>
