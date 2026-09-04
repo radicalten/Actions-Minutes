@@ -1,4 +1,4 @@
-Can you implemment this code review plan into my jit_ppc.cpp file?
+Can you implement this code review plan into my jit_ppc.cpp file?
 
 Fix plan, in order of payoff ÷ effort
 P0 = an afternoon each, no architectural change. P1 = emitter work. P2 = the structural change that actually gets you to full speed. Click to expand.
