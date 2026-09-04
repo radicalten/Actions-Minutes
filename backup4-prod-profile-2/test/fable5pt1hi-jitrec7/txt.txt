@@ -12,3 +12,4 @@ This also failed 60 lines in sadly
 procedure 3: 
 fix-ppc-dynarec13-opus to fable-5.1-high on lm arena ai in <code> mode
 created index.html with a fix
+This actually works and runs. Even runs 3D NDS games and GBA games even with its jit. very impressive. runs slower than regular version though as dolphin internal fps drops to 11fps from 60. but wolveslayer nds stays 50fps with nds fps at 8fps. pretty neat that claude fable 5.1 correctly did it. 
