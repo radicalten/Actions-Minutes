@@ -8,3 +8,7 @@ This failed as the prompt self terminated 60 lines in on lm arena ai.
 procedure 2:
 fix-ppc-dynarec13-opus to fable-5.1-high on lm arena ai
 This also failed 60 lines in sadly
+
+procedure 3: 
+fix-ppc-dynarec13-opus to fable-5.1-high on lm arena ai in <code> mode
+created index.html with a fix
