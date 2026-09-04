@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NooDS-Wii JIT — Performance Audit &amp; Fix Plan</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  body { background:#0b0f14; color:#d7dee7; font-family: ui-sans-serif, system-ui, sans-serif; }
+  pre.snip { background:#05080c; border:1px solid #1e2a36; border-radius:.5rem; padding:1rem; overflow:auto;
+             font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:.78rem; line-height:1.45; color:#c9d7e4; }
+  code.k { font-family: ui-monospace, Menlo, Consolas, monospace; background:#141c26; padding:.1rem .35rem; border-radius:.3rem; color:#9ad1ff; font-size:.85em; }
+  .card { background:#0f151d; border:1px solid #1e2a36; border-radius:.75rem; }
+  .tag { font-size:.68rem; letter-spacing:.06em; text-transform:uppercase; padding:.15rem .5rem; border-radius:999px; font-weight:600; }
+  .tag-p0 { background:#3b0d0d; color:#ff8a8a; border:1px solid #6b1a1a; }
+  .tag-p1 { background:#3a2a06; color:#ffcf66; border:1px solid #6b4f10; }
+  .tag-p2 { background:#0a2f3a; color:#6fe3ff; border:1px solid #145b6e; }
+  .tag-bug { background:#2a0f3a; color:#d9a3ff; border:1px solid #4e1e6e; }
+  details > summary { cursor:pointer; list-style:none; }
+  details > summary::-webkit-details-marker { display:none; }
+  details[open] .chev { transform: rotate(90deg); }
+  .chev { transition: transform .15s; display:inline-block; }
+  input[type=range] { accent-color:#4fc3f7; }
+  .bar { height:14px; border-radius:4px; background:linear-gradient(90deg,#4fc3f7,#1e88e5); }
+  .snipwrap { position:relative; }
+  .copybtn { position:absolute; top:.5rem; right:.5rem; font-size:.7rem; background:#1b2532; color:#9ad1ff; border:1px solid #2a3a4c; padding:.15rem .5rem; border-radius:.3rem; }
+  .copybtn:hover { background:#24334a; }
+  table.t { border-collapse:collapse; width:100%; font-size:.82rem; }
+  table.t th, table.t td { border-bottom:1px solid #1e2a36; padding:.45rem .5rem; text-align:left; vertical-align:top; }
+  table.t th { color:#8fb3d9; font-weight:600; }
+  .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
+</style>
+</head>
+<body class="min-h-screen">
+
+<!-- ═══════════════════ HEADER ═══════════════════ -->
+<header class="border-b border-[#1e2a36] bg-[#0d1219]">
+  <div class="max-w-6xl mx-auto px-6 py-8">
+    <div class="text-xs uppercase tracking-widest text-sky-400 mb-2">ARM9/ARM7 → Broadway (PPC750CL) dynamic recompiler</div>
+    <h1 class="text-3xl md:text-4xl font-bold text-white">NooDS-Wii JIT — Performance Audit &amp; Fix Plan</h1>
+    <p class="mt-3 text-slate-300 max-w-3xl">Games boot and run, so correctness of the emitted code is mostly good. The low FPS comes from
+      <span class="text-white font-semibold">per-block overhead that dwarfs the work done per block</span>, a code cache that
+      thrashes, and C helper calls on the hottest paths (conditions, memory, flags). Below is where the cycles go and,
+      in priority order, what to change — with drop-in PPC encoders where it matters.</p>
+    <nav class="mt-6 flex flex-wrap gap-2 text-sm">
+      <a href="#tldr" class="px-3 py-1 rounded-full bg-[#141c26] border border-[#1e2a36] hover:border-sky-500">TL;DR</a>
+      <a href="#cost" class="px-3 py-1 rounded-full bg-[#141c26] border border-[#1e2a36] hover:border-sky-500">Cost model</a>
+      <a href="#estimator" class="px-3 py-1 rounded-full bg-[#141c26] border border-[#1e2a36] hover:border-sky-500">Estimator</a>
+      <a href="#log" class="px-3 py-1 rounded-full bg-[#141c26] border border-[#1e2a36] hover:border-sky-500">Your log, decoded</a>
+      <a href="#plan" class="px-3 py-1 rounded-full bg-[#141c26] border border-[#1e2a36] hover:border-sky-500">Fix plan + code</a>
+      <a href="#bugs" class="px-3 py-1 rounded-full bg-[#141c26] border border-[#1e2a36] hover:border-sky-500">Correctness nits</a>
+      <a href="#measure" class="px-3 py-1 rounded-full bg-[#141c26] border border-[#1e2a36] hover:border-sky-500">Measure first</a>
+    </nav>
+  </div>
+</header>
+
+<main class="max-w-6xl mx-auto px-6 py-10 space-y-16">
+
+<!-- ═══════════════════ TL;DR ═══════════════════ -->
+<section id="tldr">
+  <h2 class="text-2xl font-bold text-white mb-6">TL;DR — the five things holding FPS down</h2>
+  <div class="grid md:grid-cols-2 gap-4">
+    <div class="card p-5">
+      <div class="flex items-center gap-2 mb-2"><span class="tag tag-p0">Biggest</span><h3 class="font-semibold text-white">Every block pays ~300–400 host cycles of fixed overhead</h3></div>
+      <p class="text-sm text-slate-300">Prologue saves r14–r31 (18 stores), <code class="k">JitHelp_syncFrom</code> C call (15 double-indirect loads + null checks),
+      then on exit <code class="k">emitSpill</code> (16 stores) + <code class="k">JitHelp_commit</code> (15 pointer stores + <code class="k">setPC()</code> → <code class="k">flushPipeline()</code> = emulated fetch), then a 22-instruction epilogue,
+      then <code class="k">runCpu()</code> → <code class="k">compile()</code> hash lookup → <code class="k">executeBlock_asm</code> again. With <code class="k">BLK_ARMS=8</code> and blocks ending at <em>every</em> branch,
+      average block length is ~4–6 instructions, so overhead alone is ≈ 60–80 host cycles per guest instruction. The interpreter costs about that much in total.</p>
+    </div>
+    <div class="card p-5">
+      <div class="flex items-center gap-2 mb-2"><span class="tag tag-p0">Biggest</span><h3 class="font-semibold text-white">The 2 MB code buffer holds ~1,500 blocks → constant <code class="k">flushJitCache()</code></h3></div>
+      <p class="text-sm text-slate-300">A typical block emits 300–400 PPC words (prologue 29 + sync ≈55 + per-insn 10–30 + <em>one full 50-word commit/epilogue copy per exit</em>, two for conditional branches).
+      That is 1.2–1.6 KB per block, so 2 MB is exhausted after ~1,500 blocks. A DS game's hot set across two CPUs is 5k–20k block starts. If your STATUS line's <code class="k">gen=</code> climbs every few seconds, you are recompiling in a loop.
+      The direct-mapped 4096-entry cache also leaks evicted blocks' code until the next flush.</p>
+    </div>
+    <div class="card p-5">
+      <div class="flex items-center gap-2 mb-2"><span class="tag tag-p1">Large</span><h3 class="font-semibold text-white">A C function call per conditional instruction and per memory access</h3></div>
+      <p class="text-sm text-slate-300"><code class="k">emitCondSkip</code> calls <code class="k">JitHelp_testCond</code> for every predicated ARM instruction (≈30–50 cycles, trashes r3–r12).
+      One <code class="k">mtcrf 0x80,r29</code> plus a <code class="k">bc</code> does it in 2–4 instructions. Every LDR/STR goes through <code class="k">memory.read()</code> via a helper with frame scratch spills;
+      a 10-instruction inline page-map fast path with <code class="k">lwbrx</code>/<code class="k">stwbrx</code> handles ~95 % of accesses.</p>
+    </div>
+    <div class="card p-5">
+      <div class="flex items-center gap-2 mb-2"><span class="tag tag-p1">Large</span><h3 class="font-semibold text-white">Flags are always computed; in Thumb they are almost always dead</h3></div>
+      <p class="text-sm text-slate-300">Every Thumb ALU op sets NZ(CV) — 4 to 15 extra PPC instructions each (<code class="k">setNZ</code> alone is 6, including <code class="k">mfcr</code>, which is slow on the 750).
+      A one-pass liveness scan over the block removes most of them. PUSH/POP (every function!) currently spill all 16 registers, call C, do per-word <code class="k">memory.write()</code>, and reload all 16.</p>
+    </div>
+    <div class="card p-5 md:col-span-2">
+      <div class="flex items-center gap-2 mb-2"><span class="tag tag-p0">Free win</span><h3 class="font-semibold text-white">Logging to SD on the hot path</h3></div>
+      <p class="text-sm text-slate-300">Your log shows the same <code class="k">[EXC] vector=08 pc=02000086</code> line dozens of times in a short window: the game busy-waits with <code class="k">swi 3</code> (WaitByLoop). If <code class="k">DebugLog</code> writes/flushes to FAT on each call,
+      that is a multi-millisecond SD write per SWI. Buffer logs in RAM, rate-limit the <code class="k">[EXC]</code> line (or log only the first N per vector) and flush on exit. Check this one first — it can single-handedly halve FPS.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ COST MODEL ═══════════════════ -->
+<section id="cost">
+  <h2 class="text-2xl font-bold text-white mb-2">Where the cycles go (per executed block, current design)</h2>
+  <p class="text-slate-300 text-sm mb-6">Instruction counts from the emitters in <code class="k">jit_ppc.cpp</code>; cycle estimates are rough Broadway figures (calls, pointer chasing and <code class="k">mfcr</code>/<code class="k">mtctr</code> stalls dominate, not instruction count).</p>
+  <div class="card p-6">
+    <div id="costbars" class="space-y-3"></div>
+    <div class="mt-6 grid md:grid-cols-3 gap-4 text-sm">
+      <div class="bg-[#0b1017] rounded-lg p-4 border border-[#1e2a36]">
+        <div class="text-slate-400 text-xs uppercase tracking-wide">Fixed cost / block</div>
+        <div class="text-2xl font-bold text-white mt-1">≈ 300–400 <span class="text-sm font-normal text-slate-400">host cycles</span></div>
+        <div class="text-slate-400 mt-1">≈ 130 PPC instructions + 2 C calls + pipeline refill + <code class="k">runCpu</code> bookkeeping</div>
+      </div>
+      <div class="bg-[#0b1017] rounded-lg p-4 border border-[#1e2a36]">
+        <div class="text-slate-400 text-xs uppercase tracking-wide">Average block length</div>
+        <div class="text-2xl font-bold text-white mt-1">≈ 4–6 <span class="text-sm font-normal text-slate-400">guest insns</span></div>
+        <div class="text-slate-400 mt-1"><code class="k">BLK_ARMS=8</code>, and blocks end at every B/BL/BX/conditional branch/POP&nbsp;pc/fallback</div>
+      </div>
+      <div class="bg-[#0b1017] rounded-lg p-4 border border-[#1e2a36]">
+        <div class="text-slate-400 text-xs uppercase tracking-wide">Budget for full speed</div>
+        <div class="text-2xl font-bold text-white mt-1">≈ 6–7 <span class="text-sm font-normal text-slate-400">host cycles / guest insn</span></div>
+        <div class="text-slate-400 mt-1">729 MHz ÷ (~45M ARM9 + ~20M ARM7 insns/s), leaving half the CPU for GPU/SPU/scheduler. Halted frames give some slack.</div>
+      </div>
+    </div>
+    <p class="text-sm text-slate-300 mt-5">Conclusion: the design must reach an average of <strong class="text-white">dozens of guest instructions per block</strong> and a per-block cost of
+      <strong class="text-white">~10–20 cycles</strong> (a hash lookup and a <code class="k">bctr</code>, or a direct <code class="k">b</code> to a linked block). Everything else is incremental on top of that.</p>
+  </div>
+</section>
+
+<!-- ═══════════════════ ESTIMATOR ═══════════════════ -->
+<section id="estimator">
+  <h2 class="text-2xl font-bold text-white mb-2">Speedup estimator</h2>
+  <p class="text-slate-300 text-sm mb-6">A simple model: <span class="mono">cost/insn = overhead ÷ block length + body cost</span>. Use the presets to see why block length and per-block overhead matter more than any single emitter.</p>
+  <div class="card p-6 grid lg:grid-cols-2 gap-8">
+    <div class="space-y-5">
+      <div class="flex flex-wrap gap-2 text-xs">
+        <button data-preset="cur" class="preset px-3 py-1 rounded bg-[#1b2532] border border-[#2a3a4c] hover:border-sky-500">Current design</button>
+        <button data-preset="p0" class="preset px-3 py-1 rounded bg-[#1b2532] border border-[#2a3a4c] hover:border-sky-500">After P0 quick wins</button>
+        <button data-preset="p1" class="preset px-3 py-1 rounded bg-[#1b2532] border border-[#2a3a4c] hover:border-sky-500">After P1 emitters</button>
+        <button data-preset="p2" class="preset px-3 py-1 rounded bg-[#1b2532] border border-[#2a3a4c] hover:border-sky-500">After dispatcher + linking</button>
+      </div>
+      <label class="block text-sm"><div class="flex justify-between"><span>Average block length (guest instructions)</span><span id="vL" class="mono text-sky-300"></span></div>
+        <input id="L" type="range" min="1" max="64" value="5" class="w-full"></label>
+      <label class="block text-sm"><div class="flex justify-between"><span>Fixed overhead per block (host cycles)</span><span id="vO" class="mono text-sky-300"></span></div>
+        <input id="O" type="range" min="4" max="500" value="350" class="w-full"></label>
+      <label class="block text-sm"><div class="flex justify-between"><span>Body cost per guest instruction (host cycles)</span><span id="vB" class="mono text-sky-300"></span></div>
+        <input id="B" type="range" min="2" max="60" value="16" class="w-full"></label>
+      <label class="block text-sm"><div class="flex justify-between"><span>Interpreter cost per guest instruction (host cycles)</span><span id="vI" class="mono text-sky-300"></span></div>
+        <input id="I" type="range" min="30" max="200" value="90" class="w-full"></label>
+    </div>
+    <div class="space-y-4">
+      <div class="grid grid-cols-2 gap-3">
+        <div class="bg-[#0b1017] rounded-lg p-4 border border-[#1e2a36]"><div class="text-xs text-slate-400 uppercase">JIT cost / insn</div><div id="rCost" class="text-3xl font-bold text-white"></div></div>
+        <div class="bg-[#0b1017] rounded-lg p-4 border border-[#1e2a36]"><div class="text-xs text-slate-400 uppercase">Speedup vs interpreter</div><div id="rSpeed" class="text-3xl font-bold text-white"></div></div>
+        <div class="bg-[#0b1017] rounded-lg p-4 border border-[#1e2a36]"><div class="text-xs text-slate-400 uppercase">Overhead share</div><div id="rShare" class="text-3xl font-bold text-white"></div></div>
+        <div class="bg-[#0b1017] rounded-lg p-4 border border-[#1e2a36]"><div class="text-xs text-slate-400 uppercase">vs ~7-cycle budget</div><div id="rBudget" class="text-3xl font-bold"></div></div>
+      </div>
+      <div>
+        <div class="text-xs text-slate-400 mb-1">Host cycles per guest instruction (log scale, budget marker at 7)</div>
+        <div class="relative h-6 bg-[#0b1017] rounded border border-[#1e2a36]">
+          <div id="barCost" class="bar absolute left-0 top-1 h-4 rounded"></div>
+          <div id="budgetMark" class="absolute top-0 h-6 w-0.5 bg-emerald-400"></div>
+        </div>
+        <div class="flex justify-between text-[10px] text-slate-500 mt-1 mono"><span>1</span><span>10</span><span>100</span><span>1000</span></div>
+      </div>
+      <p id="rNote" class="text-sm text-slate-300"></p>
+    </div>
+  </div>
+</section>
+
+<!-- ═══════════════════ LOG DECODER ═══════════════════ -->
+<section id="log">
+  <h2 class="text-2xl font-bold text-white mb-2">Your log, decoded</h2>
+  <p class="text-slate-300 text-sm mb-6">Every <code class="k">FB</code> line is an instruction the JIT refused and handed to the interpreter — which costs a full block exit + <code class="k">jitRunOpcode</code> + a fresh block entry. Some of these are the most common instructions on the ARM7.</p>
+  <div class="card p-2 overflow-x-auto">
+    <table class="t">
+      <thead><tr><th>Log line</th><th>Instruction</th><th>What it is</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td class="mono text-xs">cpu0 02000A5C EE110F10</td><td class="mono text-xs">mrc p15,0,r0,c1,c0,0</td><td>Read CP15 control register</td><td class="text-slate-400">Boot only. Ignore.</td></tr>
+        <tr><td class="mono text-xs">cpu0 02000A68…78 EE010F10 / EE070F15 / EE070F16 / EE070F9A</td><td class="mono text-xs">mcr p15 (ctrl, inv. ICache, inv. DCache, drain WB)</td><td>Cache/control setup</td><td class="text-slate-400">Boot only. Ignore.</td></tr>
+        <tr><td class="mono text-xs">cpu1 00002DD0 E510F004</td><td class="mono text-xs">ldr pc,[r0,#-4]</td><td>ARM7 BIOS IRQ dispatcher jumping to the user handler — runs on <em>every</em> ARM7 interrupt</td><td><span class="tag tag-p1">Compile</span> LDR with Rd=PC (ARM9: interwork on bit 0; ARM7: stay ARM)</td></tr>
+        <tr><td class="mono text-xs">cpu0 021400F8 FAFAFFE2</td><td class="mono text-xs">blx #imm</td><td>ARM→Thumb call. Very common in games.</td><td><span class="tag tag-p1">Compile</span> target = PC+8+off*4+(H&lt;&lt;1), LR=PC+4, set T</td></tr>
+        <tr><td class="mono text-xs">cpu0 02000088 DF03 + [EXC] vector=08 storm</td><td class="mono text-xs">swi 3 (WaitByLoop)</td><td>Game busy-waits calling the BIOS delay. Normal behaviour, not a JIT fault. (The [EXC] pc is 2 low because it prints r15−4 in Thumb.)</td><td><span class="tag tag-p0">Stop logging it</span>; optionally compile SWI as a direct call to the exception path instead of a fallback round-trip</td></tr>
+        <tr><td class="mono text-xs">cpu1 037FE960 E1A0E00F</td><td class="mono text-xs">mov lr,pc</td><td><code class="k">mov lr,pc ; bx rN</code> is the ARMv4 indirect-call idiom — nearly every indirect call on ARM7 hits this</td><td><span class="tag tag-p1">Compile</span> allow Rm=15 in the immediate shifter (value = PC+8)</td></tr>
+        <tr><td class="mono text-xs">cpu1 037FB9A4 049DF004</td><td class="mono text-xs">ldreq pc,[sp],#4</td><td>Conditional return via pop</td><td><span class="tag tag-p1">Compile</span> same as LDR PC above</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ═══════════════════ FIX PLAN ═══════════════════ -->
+<section id="plan">
+  <h2 class="text-2xl font-bold text-white mb-2">Fix plan, in order of payoff ÷ effort</h2>
+  <p class="text-slate-300 text-sm mb-6">P0 = an afternoon each, no architectural change. P1 = emitter work. P2 = the structural change that actually gets you to full speed. Click to expand.</p>
+  <div class="space-y-4" id="fixes">
+
+    <!-- P0.1 -->
+    <details class="card" open>
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p0 mt-1">P0</span>
+        <div><div class="font-semibold text-white">Stop refilling the pipeline on every block exit; sync registers inline</div>
+        <div class="text-sm text-slate-400">Removes one C call, the emulated fetch in <code class="k">flushPipeline()</code>, and ~30 checks per block.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <p><code class="k">JitHelp_commit</code> calls <code class="k">interp-&gt;setPC(pc)</code>, which refills the pipeline through the memory map even though the next thing that runs is almost always another JIT block that never reads the pipeline.
+        Only the interpreter needs it. Keep <code class="k">*registers[15]</code> = pc+8 (ARM) / pc+4 (Thumb), because <code class="k">getActualPC()</code>, <code class="k">exception()</code> and <code class="k">interrupt()</code> derive LR from it; refill lazily.</p>
+        <div class="snipwrap"><script type="text/x-snippet">// interpreter.h — add
+bool pipelineDirty = false;              // set by the JIT on normal exits
+// interpreter.cpp — at the top of runOpcode() / jitRunOpcode():
+if (pipelineDirty) { pipelineDirty = false; flushPipeline(); }
+
+// jit_ppc.cpp — normal exits no longer flush
+int JitHelp_commit(Interpreter* interp,int cpu,uint32_t* regs,uint32_t cpsr,uint32_t pc,int reason){
+    uint32_t** p=interp->getRegisters();
+    for(int i=0;i<15;i++)*p[i]=regs[i];
+    interp->getCpsrRef()=cpsr;
+    *p[15]=pc+((cpsr&(1u<<5))?4u:8u);      // what the interpreter expects r15 to hold
+    interp->pipelineDirty=true;            // refill only if the interpreter runs next
+    g_exitReason[cpu]=reason; g_exitPC[cpu]=pc;
+    return 0;
+}
+// runCpu(): the FALLBACK path already calls interpStep(), which now flushes lazily.
+
+// emitSyncFrom(): replace the C call with 30 loads (pointer, then value).
+// Add to Interpreter:  static size_t offset_registers(){...&p->registers...}
+static void emitSyncFrom(Ctx& ctx){
+    ctx.li(TB,(uint32_t)(uintptr_t)ctx.interp+(uint32_t)Interpreter::offset_registers());
+    for(int i=0;i<15;i++){ ctx.E(ppc_lwz(TA,i*4,TB)); ctx.E(ppc_lwz(RA[i],0,TA)); }
+    ctx.li(TA,(uint32_t)(uintptr_t)ctx.interp+(uint32_t)Interpreter::offset_cpsr());
+    ctx.E(ppc_lwz(RCPSR,0,TA));
+}</script></div>
+        <p class="text-slate-400">The <code class="k">isReady()</code>/null checks in <code class="k">JitHelp_syncFrom</code> are redundant: <code class="k">runCpu()</code> already refuses to compile before <code class="k">isReady()</code>.</p>
+      </div>
+    </details>
+
+    <!-- P0.2 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p0 mt-1">P0</span>
+        <div><div class="font-semibold text-white">One shared exit stub instead of a 50-word spill/call/epilogue copy per exit</div>
+        <div class="text-sm text-slate-400">Halves emitted code size (conditional branches emit two exits today) → 2× more blocks fit before a flush.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <p>Emit the spill + commit call + epilogue <em>once</em> at JIT init into the code buffer (it depends only on the frame layout). Blocks exit with <code class="k">li TE,pc ; li TF,reason ; b exitStub</code>. The PPC <code class="k">b</code> reaches ±32 MB, so any buffer up to 32 MB works.
+        Likewise, move the prologue + register sync into <code class="k">executeBlock_asm</code> (one copy) and have it <code class="k">bctr</code> into the block body.</p>
+        <div class="snipwrap"><script type="text/x-snippet">static inline uint32_t ppc_b(int32_t byteOff,bool lk=false){
+    return (18u<<26)|((uint32_t)byteOff&0x03FFFFFCu)|(lk?1u:0u);
+}
+static uint32_t* g_exitStub=nullptr;   // emitted once by initJit()
+
+static void emitExitStub(Ctx& ctx){    // expects TE=pc, TF=reason
+    emitSpill(ctx);
+    ctx.ldInterp(); ctx.ldCpu();
+    ctx.E(ppc_addi(TC,1,(int16_t)FRAME_REGSYNC));
+    ctx.E(ppc_mr(TD,RCPSR));
+    ctx.call((void*)JitHelp_commit);
+    emitEpilogue(ctx);
+}
+static void emitCommitExit(Ctx& ctx,uint32_t nextPC,int reason){
+    ctx.li(TE,nextPC);
+    ctx.E(ppc_addi(TF,0,(int16_t)reason));
+    int32_t d=(int32_t)((uintptr_t)g_exitStub-(uintptr_t)ctx.cur);
+    ctx.E(ppc_b(d));
+}
+static void emitCommitExitDyn(Ctx& ctx,int reason){
+    ctx.E(ppc_lwz(TE,FRAME_PC,1));
+    ctx.E(ppc_addi(TF,0,(int16_t)reason));
+    int32_t d=(int32_t)((uintptr_t)g_exitStub-(uintptr_t)ctx.cur);
+    ctx.E(ppc_b(d));
+}
+// compile(): the "last word must be blr" sanity check must go (blocks now end in 'b').</script></div>
+      </div>
+    </details>
+
+    <!-- P0.3 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p0 mt-1">P0</span>
+        <div><div class="font-semibold text-white">Longer blocks: keep compiling after a not-taken conditional branch; raise BLK_ARMS</div>
+        <div class="text-sm text-slate-400">Loop bodies like <code class="k">cmp ; beq exit ; …</code> stop being split at the exit check.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <p>Today a conditional B/BX/LDM-pc/POP-pc/Thumb <code class="k">Bcc</code> emits a taken exit <em>and</em> a not-taken exit and ends the block. Only the taken path needs to leave; the fall-through can continue in the same block.
+        Then raise <code class="k">BLK_ARMS</code> to 32–64 and <code class="k">BLK_WDS</code>/<code class="k">BLK_MARGIN</code> accordingly. (melonDS's JIT defaults to 32-instruction blocks and interleaves ARM9/ARM7 per block — games tolerate it.)</p>
+        <div class="snipwrap"><script type="text/x-snippet">// emitBranch(): conditional B/BL
+size_t si=emitCondSkip(ctx,cond);
+if(lk)ctx.li(RA[14],curPC+4);
+emitCommitExit(ctx,tgt,EXIT_NORMAL);          // taken: leave the block
+if(si==SIZE_MAX){ctx.done=true;return true;}  // unconditional: block ends
+patchSkip(ctx,si);                            // not taken: keep going
+return true;
+// Same pattern in emitBX(), emitBlockXfer() (loadPC), emitT_branch() (h==0xD).
+// compile(): delete these two lines — emitters now decide when a block ends:
+//   if(((op>>25)&7)==5)ctx.done=true;
+//   if((op&0x0FFFFFF0)==0x012FFF10)ctx.done=true;
+static const size_t BLK_ARMS  = 48;
+static const size_t BLK_WDS   = 4096;
+static const size_t BLK_MARGIN= 96;   // exits are ~4 words now (P0.2)</script></div>
+      </div>
+    </details>
+
+    <!-- P0.4 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p0 mt-1">P0</span>
+        <div><div class="font-semibold text-white">Move the code buffer to MEM2 and make it 16–32 MB; drop the MEM1 address checks</div>
+        <div class="text-sm text-slate-400">Cache flushes become rare instead of continuous.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <p>Code executes fine from cached MEM2 (0x90000000–0x93FFFFFF); Wii64/Not64 keep their recompiled code there. <code class="k">emit_li32</code> already encodes any 32-bit address, so the <code class="k">a&lt;0x80000000||a&gt;=0x81800000</code> guard in <code class="k">Ctx::call()</code> and the MEM1 range test in <code class="k">initJit()</code> are just restrictions. You already have <code class="k">Noods_MEM2_Alloc</code>. Keep <code class="k">DCFlushRange</code> + <code class="k">ICInvalidateRange</code> after each compile (they work on MEM2 too).</p>
+        <p>While there, replace the direct-mapped <code class="k">cache[4096]</code> with a lookup that does not evict: a two-level table <code class="k">blockTable[cpu][pc&gt;&gt;12]</code> → array of <code class="k">(pc &amp; 0xFFF) &gt;&gt; 1</code> pointers, allocated on first use per page. Lookup is two loads, invalidation is "free the page's array", and it is what the P2 dispatcher wants anyway. Use <code class="k">key = pc | thumb</code> as the block identity (ARM PCs are 4-aligned, Thumb 2-aligned).</p>
+      </div>
+    </details>
+
+    <!-- P0.5 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p0 mt-1">P0</span>
+        <div><div class="font-semibold text-white">Compile the four hot fallbacks: <code class="k">mov lr,pc</code>, <code class="k">blx #imm</code>, <code class="k">ldr pc,[…]</code>, <code class="k">swi</code></div>
+        <div class="text-sm text-slate-400">Each one currently costs exit + interpreter + re-entry, on every call/return/IRQ.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <div class="snipwrap"><script type="text/x-snippet">// 1) Rm = PC in the immediate shifter (mov lr,pc / add rX,pc,rY / ldr rX,[rY,pc]...)
+//    emitShifter(ctx,op,dst,sc,curPC): value of r15 is curPC+8 for immediate shifts.
+uint8_t rm=op&0xF; uint8_t src;
+if(rm==15){ ctx.li(TB,curPC+8u); src=TB; } else src=RA[rm];
+// ...then shift 'src' instead of RA[rm]. Still refuse rm==15 with register shifts (PC+12 quirk).
+// emitDP(): remove 'if((op&0xF)==15)return false;' and pass curPC to emitShifter.
+
+// 2) BLX #imm (cond==15, bits 27..25 == 101): ARM9 only
+static bool emitBlxImm(Ctx& ctx,uint32_t op,uint32_t curPC){
+    if(ctx.arm7)return false;
+    int32_t off=((int32_t)(op<<8)>>6)|(int32_t)(((op>>24)&1u)<<1);
+    uint32_t tgt=(curPC+8u+(uint32_t)off)&~1u;
+    ctx.li(RA[14],curPC+4);
+    ctx.E(ppc_oris(RCPSR,RCPSR,0x0000)); // no-op placeholder; use: ori RCPSR,RCPSR,0x20 (set T)
+    ctx.E(ppc_ori(RCPSR,RCPSR,0x20));
+    emitCommitExit(ctx,tgt,EXIT_NORMAL); ctx.done=true; return true;
+}
+// dispARM(): before the cond==15 rejection:  if((op&0xFE000000)==0xFA000000)return emitBlxImm(ctx,op,curPC);
+
+// 3) LDR with Rd=PC: do the normal load into TA, then reuse emitBX_target()
+//    (ARM9 interworks on bit 0; ARM7 must stay in ARM: force bit0 clear first).
+if(ld&&rd==15){
+    if(ctx.arm7)ctx.E(ppc_rlwinm(TA,TA,0,0,29));       // ARM7: align to 4, stay ARM
+    ctx.E(ppc_stw(TA,FRAME_SCR0,1));
+    /* writeback of rn first, if any */
+    emitBX_target(ctx);                                  // exits the block
+    if(si!=SIZE_MAX){patchSkip(ctx,si);}                 // conditional: fall through
+    else ctx.done=true;
+    return true;
+}
+
+// 4) SWI: instead of falling back, call a helper that performs the exception.
+//    Add to Interpreter:  int jitException(uint8_t vector){ return exception(vector); }  (public)
+//    Emit: spill regs -> commit at curPC (r15 = curPC+8/+4 as usual) -> call jitException(8)
+//    -> exit with EXIT_NORMAL (registers/PC were changed by exception(), so re-sync on entry).
+//    With HLE BIOS, exception() already routes to HleBios; nothing else to do.</script></div>
+        <p class="text-slate-400">Drop the placeholder <code class="k">oris</code> line in (2) — it is only there to show where the T-bit set goes; <code class="k">ori RCPSR,RCPSR,0x20</code> is the real instruction.</p>
+      </div>
+    </details>
+
+    <!-- P1.1 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p1 mt-1">P1</span>
+        <div><div class="font-semibold text-white">Inline condition codes with <code class="k">mtcrf</code> — replaces <code class="k">JitHelp_testCond</code></div>
+        <div class="text-sm text-slate-400">2–4 instructions instead of a C call. ARM's NZCV are the top nibble of CPSR, which is exactly one CR field.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <p><code class="k">mtcrf 0x80,r29</code> copies CPSR bits 31..28 into CR0, so <span class="mono">cr0.LT=N, cr0.GT=Z, cr0.EQ=C, cr0.SO=V</span>. Simple conditions are one <code class="k">bc</code>; compound ones need one or two CR-logical ops into cr1. The branch is taken when the condition is <em>false</em> (skip the instruction).</p>
+        <div class="snipwrap"><script type="text/x-snippet">static inline uint32_t ppc_mtcrf(uint8_t fxm,uint8_t rs){           // XFX form, XO=144
+    return (31u<<26)|((uint32_t)rs<<21)|((uint32_t)fxm<<12)|(144u<<1);
+}
+static inline uint32_t ppc_crop(uint32_t xo,uint8_t bt,uint8_t ba,uint8_t bb){ // XL form
+    return (19u<<26)|((uint32_t)bt<<21)|((uint32_t)ba<<16)|((uint32_t)bb<<11)|(xo<<1);
+}
+#define CRANDC(bt,ba,bb) ppc_crop(129,bt,ba,bb)
+#define CREQV(bt,ba,bb)  ppc_crop(289,bt,ba,bb)
+
+// After mtcrf: cr0 bit0=N  bit1=Z  bit2=C  bit3=V.   cr1 bit4 is scratch.
+static size_t emitCondSkip(Ctx& ctx,uint8_t cond){
+    if(cond>=14)return SIZE_MAX;
+    ctx.E(ppc_mtcrf(0x80,RCPSR));
+    uint8_t bi; bool skipIfTrue;
+    switch(cond){
+        case 0: bi=1; skipIfTrue=false; break;                         // EQ : skip if !Z
+        case 1: bi=1; skipIfTrue=true;  break;                         // NE
+        case 2: bi=2; skipIfTrue=false; break;                         // CS
+        case 3: bi=2; skipIfTrue=true;  break;                         // CC
+        case 4: bi=0; skipIfTrue=false; break;                         // MI
+        case 5: bi=0; skipIfTrue=true;  break;                         // PL
+        case 6: bi=3; skipIfTrue=false; break;                         // VS
+        case 7: bi=3; skipIfTrue=true;  break;                         // VC
+        case 8: ctx.E(CRANDC(4,2,1)); bi=4; skipIfTrue=false; break;   // HI : C && !Z
+        case 9: ctx.E(CRANDC(4,2,1)); bi=4; skipIfTrue=true;  break;   // LS
+        case 10:ctx.E(CREQV (4,0,3)); bi=4; skipIfTrue=false; break;   // GE : N == V
+        case 11:ctx.E(CREQV (4,0,3)); bi=4; skipIfTrue=true;  break;   // LT
+        case 12:ctx.E(CREQV (4,0,3)); ctx.E(CRANDC(4,4,1)); bi=4; skipIfTrue=false; break; // GT
+        default:ctx.E(CREQV (4,0,3)); ctx.E(CRANDC(4,4,1)); bi=4; skipIfTrue=true;  break; // LE
+    }
+    size_t idx=ctx.sz();
+    ctx.E(ppc_bc(skipIfTrue?12:4,bi,0));          // BO=12: branch if bit true, BO=4: if false
+    return idx;
+}
+// patchSkip() must keep BO/BI instead of rewriting bc 12,2:
+static void patchSkip(Ctx& ctx,size_t idx){
+    if(idx==SIZE_MAX)return;
+    int32_t off=(int32_t)((ctx.sz()-idx)*4);
+    if(off<-32768||off>32764){ctx.overflow=true;return;}
+    ctx.base[idx]=(ctx.base[idx]&0xFFFF0003u)|((uint32_t)off&0xFFFCu);
+}</script></div>
+        <p class="text-slate-400">Same trick for Thumb <code class="k">Bcc</code>. Once flags live in CR0 you can also cheapen <code class="k">setNZ</code>: use record-form ops (<code class="k">and.</code>, <code class="k">add.</code>, <code class="k">subfc.</code> — set <code class="k">rc=true</code> in <code class="k">Xf/XOf</code>), then <code class="k">mfcr TS ; rlwinm RCPSR,RCPSR,0,2,31 ; rlwimi RCPSR,TS,0,0,0 ; rlwimi RCPSR,TS,1,1,1</code> — 4 instructions, no <code class="k">cmpi</code>. Better still: don't compute them at all (next item).</p>
+      </div>
+    </details>
+
+    <!-- P1.2 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p1 mt-1">P1</span>
+        <div><div class="font-semibold text-white">Dead-flag elimination (one forward scan per block)</div>
+        <div class="text-sm text-slate-400">Removes most <code class="k">setNZ/setC/setV</code> sequences — in Thumb, the majority of all emitted instructions.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <p>Pre-decode the block's opcodes into an array (you already read them one at a time; read them all first). For each flag-setting instruction compute which of N/Z/C/V is read before being overwritten by a later <em>unconditional</em> writer in the same block. Anything unknown at block end is live. Pass the live mask to the emitters and skip the dead updates.</p>
+        <div class="snipwrap"><script type="text/x-snippet">enum { F_N=1, F_Z=2, F_C=4, F_V=8, F_ALL=15 };
+static const uint8_t kCondReads[16]={F_Z,F_Z,F_C,F_C,F_N,F_N,F_V,F_V,
+                                     F_C|F_Z,F_C|F_Z,F_N|F_V,F_N|F_V,F_Z|F_N|F_V,F_Z|F_N|F_V,0,0};
+
+static uint8_t armReads(uint32_t op){
+    uint8_t r=kCondReads[op>>28];
+    if((op&0x0C000000)==0){                                   // data processing
+        uint8_t dop=(op>>21)&15;
+        if(dop==5||dop==6||dop==7)r|=F_C;                     // ADC/SBC/RSC
+        if(!((op>>25)&1)&&((op>>4)&7)==6&&!((op>>7)&31))r|=F_C; // RRX
+    }
+    if((op&0x0FBF0FFF)==0x010F0000)r|=F_ALL;                 // MRS
+    if((op&0x0F000000)==0x0F000000)r|=F_ALL;                 // SWI: CPSR saved to SPSR
+    return r;
+}
+// Flags definitely written by an unconditional instruction (0 for conditional ones).
+static uint8_t armWrites(uint32_t op){
+    if((op>>28)!=14)return 0;
+    if((op&0x0C000000)==0&&((op>>20)&1)&&(op&0x0F900000)!=0x01000000){
+        uint8_t dop=(op>>21)&15;
+        bool arith=(dop>=2&&dop<=7)||dop==10||dop==11;
+        if(arith)return F_ALL;
+        // logical: N,Z always; C only if the shifter produces a carry
+        bool imm=(op>>25)&1;
+        bool carry = imm ? (((op>>8)&15)!=0) : (((op>>4)&1)||((op>>7)&31)||((op>>5)&3)); 
+        return (uint8_t)(F_N|F_Z|(carry?F_C:0));
+    }
+    if((op&0x0FB0F000)==0x0320F000||(op&0x0FB0FFF0)==0x0120F000)
+        return ((op>>16)&8)?F_ALL:0;                          // MSR with flags field
+    return 0;
+}
+static bool armEndsBlock(uint32_t op){
+    if(((op>>25)&7)==5)return true;                           // B/BL/BLX
+    if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)return true;
+    if((op&0x0C000000)==0x04000000&&((op>>12)&15)==15&&((op>>20)&1))return true; // LDR pc
+    if((op&0x0E100000)==0x08100000&&(op&0x8000))return true;  // LDM {..pc}
+    if((op&0x0C000000)==0&&((op>>12)&15)==15&&(op&0x0F900000)!=0x01000000)return true; // ALU pc
+    return (op&0x0F000000)==0x0F000000;                       // SWI
+}
+// Which flags written by ops[i] are needed?
+static uint8_t liveAfter(const uint32_t* ops,int i,int n){
+    uint8_t live=0,dead=0;
+    for(int j=i+1;j<n;j++){
+        live|=armReads(ops[j])&~dead;
+        dead|=armWrites(ops[j])&~live;
+        if(armEndsBlock(ops[j]))break;                        // successor unknown -> rest live
+        if((live|dead)==F_ALL)break;
+    }
+    return (uint8_t)(live|(F_ALL&~dead));
+}
+// emitDP(..., uint8_t liveMask): 
+//   if(liveMask&(F_N|F_Z)) setNZ(...);   if(liveMask&F_C) setC_xer/setC_bit0(...);   if(liveMask&F_V) setV_*(...);
+// Thumb: identical idea; formats 1-4 write NZ(C)(V), ADC/SBC read C, Bcc reads per kCondReads.</script></div>
+        <p class="text-slate-400">Conservative by construction: conditional writers never count as kills, block-ending instructions stop the scan, and a fallback instruction (unknown to the JIT) should be treated as reading everything.</p>
+      </div>
+    </details>
+
+    <!-- P1.3 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p1 mt-1">P1</span>
+        <div><div class="font-semibold text-white">Inline memory fast path through the 4 KB page map (<code class="k">lwbrx</code>/<code class="k">stwbrx</code>)</div>
+        <div class="text-sm text-slate-400">10 instructions for RAM hits; the helper only for I/O, unmapped pages, misaligned words and pages containing compiled code.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <p>Your <code class="k">Memory</code> already maintains 4 KB page pointer tables (<code class="k">updateMap9/updateMap7</code>). Give the JIT its own copies: <code class="k">jitReadMap[cpu]</code> = the read map plus the ARM9 TCM regions (the stack lives in DTCM — <code class="k">sp=027C3B2C</code> in your log — so it must be in the fast path), and <code class="k">jitWriteMap[cpu]</code> = the write map with <em>every page that contains a compiled block set to null</em> for both CPUs. Stores to code pages then take the slow path, which is where <code class="k">invalidateJitPage()</code> lives — no per-store check needed. Rebuild the JIT maps whenever the memory map or TCM config changes (hook <code class="k">updateMap*</code> and the CP15 TCM writes).
+        Guest data is little-endian in memory, hence the byte-reversed loads. Keep a dedicated register for the map base (e.g. r31; the prologue loads it once).</p>
+        <div class="snipwrap"><script type="text/x-snippet">static inline uint32_t ppc_lwzx  (uint8_t rt,uint8_t ra,uint8_t rb){return Xf(rt,ra,rb,23);}
+static inline uint32_t ppc_lwbrx (uint8_t rt,uint8_t ra,uint8_t rb){return Xf(rt,ra,rb,534);}
+static inline uint32_t ppc_lhbrx (uint8_t rt,uint8_t ra,uint8_t rb){return Xf(rt,ra,rb,790);}
+static inline uint32_t ppc_lbzx  (uint8_t rt,uint8_t ra,uint8_t rb){return Xf(rt,ra,rb,87);}
+static inline uint32_t ppc_stwbrx(uint8_t rs,uint8_t ra,uint8_t rb){return Xf(rs,ra,rb,662);}
+static inline uint32_t ppc_sthbrx(uint8_t rs,uint8_t ra,uint8_t rb){return Xf(rs,ra,rb,918);}
+static inline uint32_t ppc_stbx  (uint8_t rs,uint8_t ra,uint8_t rb){return Xf(rs,ra,rb,215);}
+static inline uint32_t ppc_cmpwi7(uint8_t ra,int16_t i){return ppc_cmpi(7,ra,i);}
+static const uint8_t RMAP=31;      // jitReadMap[cpu] (prologue: li RMAP,map)  – use r30 for the write map
+
+// Word load: address in TB -> result in rd. Falls back to JitHelp_ldr32 (rotated unaligned load).
+static void emitLoad32(Ctx& ctx,uint8_t rd){
+    ctx.E(ppc_rlwinm(TC,TB,22,10,29));        // TC = (addr>>12)*4
+    ctx.E(ppc_lwzx(TC,RMAP,TC));              // page base pointer, 0 = slow
+    ctx.E(ppc_rlwinm(TD,TB,0,30,31,true));    // TD = addr&3 ; cr0.EQ if aligned
+    ctx.E(ppc_cmpwi7(TC,0));
+    size_t b1=ctx.sz(); ctx.E(ppc_bc(4,2,0)); // bne cr0 -> slow   (misaligned)
+    size_t b2=ctx.sz(); ctx.E(ppc_bc(12,30,0));// beq cr7 -> slow  (unmapped)  bit 30 = cr7.EQ
+    ctx.E(ppc_rlwinm(TD,TB,0,20,31));         // addr & 0xFFF
+    ctx.E(ppc_lwbrx(rd,TC,TD));               // little-endian load
+    size_t bDone=ctx.sz(); ctx.E(ppc_b(0));
+    // slow path
+    size_t slow=ctx.sz();
+    ctx.base[b1]=(ctx.base[b1]&0xFFFF0003u)|(((slow-b1)*4)&0xFFFCu);
+    ctx.base[b2]=(ctx.base[b2]&0xFFFF0003u)|(((slow-b2)*4)&0xFFFCu);
+    ctx.E(ppc_stw(TB,FRAME_SCR1,1));
+    ctx.ldCore(); ctx.E(ppc_addi(TB,0,ctx.arm7?1:0)); ctx.E(ppc_lwz(TC,FRAME_SCR1,1));
+    ctx.call((void*)JitHelp_ldr32);
+    if(rd!=TA)ctx.E(ppc_mr(rd,TA));
+    ctx.base[bDone]=ppc_b((int32_t)((ctx.sz()-bDone)*4));
+}
+// Halfword: lhbrx, alignment mask 1 (ARM7 rotates odd LDRH: send odd to slow path).
+// Byte: lbzx, no alignment check.   Stores: same shape with jitWriteMap in r30 and stwbrx/sthbrx/stbx.
+// LDM/STM/PUSH/POP: look the page up once, check (addr&0xFFF) <= 0x1000 - n*4, then n×lwbrx/stwbrx.</script></div>
+        <p class="text-slate-400">If <code class="k">memory.read()</code> checks ITCM/DTCM <em>before</em> the map (as upstream NooDS does), reproduce that ordering when building <code class="k">jitReadMap</code>, or the JIT will read main RAM where the CPU would read DTCM.</p>
+      </div>
+    </details>
+
+    <!-- P1.4 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p1 mt-1">P1</span>
+        <div><div class="font-semibold text-white">Inline PUSH/POP, LDM/STM, and register-specified shifts</div>
+        <div class="text-sm text-slate-400">PUSH/POP is 16 spills + C call + per-word memory.write() + 16 reloads today, on every function entry/exit.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-3">
+        <ul class="list-disc pl-5 space-y-2">
+          <li><strong class="text-white">PUSH/POP/LDM/STM without PC:</strong> with the page map in a register, emit one page lookup + one "fits in page" check, then a straight run of <code class="k">stwbrx</code>/<code class="k">lwbrx</code> from/to the mapped ARM registers. No spill/reload. Lists with PC: do the loads inline, then go through <code class="k">emitBX_target</code>. Fall back to the helper only on the slow path.</li>
+          <li><strong class="text-white">LSL/LSR/ASR/ROR by register (Thumb ALU 2/3/4/7, ARM <code class="k">*Llr</code> forms):</strong> <code class="k">emitShiftCall</code> spills CPSR and calls C. Inline: <code class="k">rlwinm amt,amt,0,24,31</code> (low 8 bits), <code class="k">cmplwi amt,32</code>; for amounts under 32 use <code class="k">slw/srw/sraw/rlwnm</code>, and handle 32 / over-32 on a short branch. Only compute the carry if it is live (dead-flag mask).</li>
+          <li><strong class="text-white">Thumb <code class="k">ldr rd,[pc,#imm]</code>:</strong> address is a compile-time constant; use the fast path (or, if the page is ROM/RAM that cannot change, read the constant at compile time and emit <code class="k">li</code> — but then the block must be invalidated if that page is written, which your page tracking already gives you if you register the literal's page).</li>
+        </ul>
+      </div>
+    </details>
+
+    <!-- P2 -->
+    <details class="card">
+      <summary class="p-5 flex items-start gap-3"><span class="chev text-sky-400 mt-1">▶</span><span class="tag tag-p2 mt-1">P2</span>
+        <div><div class="font-semibold text-white">Dispatcher loop + block linking + cycle down-counter (the change that reaches full speed)</div>
+        <div class="text-sm text-slate-400">Registers stay in r14–r29 across blocks; block-to-block transfer costs a <code class="k">b</code> or a 6-instruction hash lookup instead of 300+ cycles.</div></div></summary>
+      <div class="px-5 pb-5 text-sm text-slate-300 space-y-4">
+        <p><strong class="text-white">Model.</strong> C calls <code class="k">jitEnter(cpu, budget)</code> once per time-slice. One prologue saves non-volatiles, loads ARM regs, puts the map base in r31 and the cycle budget in r30, then jumps to the first block. Blocks never return to C on their own; they jump to one another. The generated code returns to C only when: the down-counter goes ≤ 0, a fallback/SWI/halt/CP15 instruction is reached, or a lookup misses and compilation is needed. The runner then does <code class="k">globalCycles += used</code> and runs due tasks.</p>
+        <div class="snipwrap"><script type="text/x-snippet">; ---- block epilogue for a static successor T (B / BL / fall-through into next block) ----
+        addi    r30, r30, -CYCLES_OF_BLOCK
+        cmpwi   r30, 0
+        ble     slice_end_T          ; li r7,T ; b exitStub   (returns to C with pc=T)
+link_T: b       resolve_T            ; PATCHED to 'b <code of T>' after the first execution
+
+resolve_T:                           ; tiny per-exit stub
+        lis/ori r7, T                ; pc
+        lis/ori r8, link_T           ; address of the branch to patch
+        b       resolveStub          ; shared: spill, call C JitResolve(pc, patchSite), reload, bctr
+
+; ---- dynamic successor (bx, ldr pc, pop {pc}, mov pc) : pc in r3, T bit already in r29 ----
+        addi    r30, r30, -CYCLES
+        cmpwi   r30, 0
+        ble     slice_end_dyn
+        ; key = pc | thumb ; idx = (key >> 1) & (N-1) ; table entries {key, code}
+        rlwinm  r4, r29, 27, 31, 31  ; T bit -> bit 0
+        or      r4, r3, r4           ; key
+        rlwinm  r5, r4, 2, 32-LOG2N-3, 28  ; (key>>1)*8 masked   (compute the mb once, constant)
+        lwzx    r6, rTAB, r5         ; entry.key
+        cmpw    r6, r4
+        bne     dispatch_miss        ; -> C lookup/compile, then bctr
+        addi    r5, r5, 4
+        lwzx    r6, rTAB, r5         ; entry.code
+        mtctr   r6
+        bctr</script></div>
+        <p><strong class="text-white">Details that matter.</strong></p>
+        <ul class="list-disc pl-5 space-y-2">
+          <li>Patching a <code class="k">b</code>: write the word, <code class="k">DCFlushRange</code>/<code class="k">ICInvalidateRange</code> the 32-byte line. When a block is invalidated, unlink everything pointing at it (keep a small back-reference list per block) by restoring <code class="k">b resolve_T</code>.</li>
+          <li>Two CPUs: give each a slice of ~128–512 ARM9 cycles (a setting), alternate, and clamp the slice to the next scheduler event. This is the same granularity melonDS's JIT uses; IPC-heavy titles may need the smaller value.</li>
+          <li>Interrupts: <code class="k">ARM9_INTERRUPT/ARM7_INTERRUPT</code> are scheduler tasks, so they run between slices — set the pending IRQ to also zero r30's budget in the runner so latency stays bounded (e.g. <code class="k">interrupt()</code> sets a flag the runner checks before each slice; end the current slice early by exposing a "cycles left" location the C side can clear).</li>
+          <li>Keep <code class="k">EXIT_FALLBACK</code> semantics: the exit stub commits at the faulting PC, C runs <code class="k">jitRunOpcode()</code> once, then re-enters.</li>
+          <li>Halt (<code class="k">swi 6</code>, <code class="k">mcr p15,0,rX,c7,c0,4</code>): fallback → interpreter sets <code class="k">halted</code> → <code class="k">updateRun()</code> → your runner already exits on <code class="k">running==0</code>.</li>
+        </ul>
+        <p class="text-slate-400">Once this is in, P0.1/P0.2 become moot (there is one prologue/epilogue in the whole system) — but doing them first is still worth it: they are small, they let you measure, and every piece of emitted code carries over.</p>
+      </div>
+    </details>
+  </div>
+</section>
+
+<!-- ═══════════════════ BUGS ═══════════════════ -->
+<section id="bugs">
+  <h2 class="text-2xl font-bold text-white mb-2">Correctness nits found while reading</h2>
+  <p class="text-slate-300 text-sm mb-6">None of these explain the FPS, but a few will bite as coverage grows. The flag/carry logic (<code class="k">subfc</code> CA = NOT borrow, <code class="k">primeCarry</code> via <code class="k">addic r0,TS,-1</code>, V from xor of operands) checked out.</p>
+  <div class="card divide-y divide-[#1e2a36]">
+    <div class="p-4 flex gap-3"><span class="tag tag-bug shrink-0 mt-0.5">bug</span><div class="text-sm text-slate-300"><strong class="text-white"><code class="k">emitMrsMsr</code> returns false after emitting code.</strong> The <code class="k">rm==15</code> check for the register form happens after <code class="k">emitCondSkip</code>; the dangling cond-test is harmless but wasted. Test <code class="k">rm</code> before emitting.</div></div>
+    <div class="p-4 flex gap-3"><span class="tag tag-bug shrink-0 mt-0.5">bug</span><div class="text-sm text-slate-300"><strong class="text-white">Direct-mapped cache eviction leaks code.</strong> <code class="k">compile()</code> invalidates the colliding slot but its code stays in <code class="k">codeBuf</code> until the next full flush; ARM9 and ARM7 blocks collide with each other via <code class="k">cpu&lt;&lt;11</code>. Symptom: <code class="k">gen=</code> increments faster than the working set justifies. Fixed by the page-table lookup in P0.4.</div></div>
+    <div class="p-4 flex gap-3"><span class="tag tag-bug shrink-0 mt-0.5">bug</span><div class="text-sm text-slate-300"><strong class="text-white"><code class="k">[EXC]</code> log prints the wrong PC in Thumb</strong> (02000086 for the SWI at 02000088) — it uses r15−4 regardless of mode. Cosmetic, but it will mislead you when debugging Thumb faults.</div></div>
+    <div class="p-4 flex gap-3"><span class="tag tag-bug shrink-0 mt-0.5">perf</span><div class="text-sm text-slate-300"><strong class="text-white"><code class="k">executeBlock_asm</code> saves r30/r31 that the block prologue saves again</strong>; and <code class="k">runCpu()</code> calls <code class="k">compile()</code> (validPC + hash + 5 compares) on every block execution even when it is a hit. Split into <code class="k">lookup()</code> and <code class="k">compile()</code>.</div></div>
+    <div class="p-4 flex gap-3"><span class="tag tag-bug shrink-0 mt-0.5">perf</span><div class="text-sm text-slate-300"><strong class="text-white"><code class="k">runDueTasks</code> erases from the front of a vector</strong> (O(n) shift per event; fine now with ~10 events, keep an eye on it). <code class="k">fbLogOnce</code> does a linear scan of up to 512 entries on every fallback — cheap relative to the fallback itself, but it is on the hot path when a hot fallback exists.</div></div>
+    <div class="p-4 flex gap-3"><span class="tag tag-bug shrink-0 mt-0.5">note</span><div class="text-sm text-slate-300"><strong class="text-white">Timing:</strong> <code class="k">armCycles/thumbCycles</code> are constants while the interpreter charges real memory waitstates. Expect games to run slightly "fast" in emulated time compared with the interpreter; if a title becomes unstable after longer blocks, that is the first knob to look at (charge 1 extra for loads from main RAM, 3–4 for ROM/VRAM).</div></div>
+    <div class="p-4 flex gap-3"><span class="tag tag-bug shrink-0 mt-0.5">note</span><div class="text-sm text-slate-300"><strong class="text-white">CPSR writes from generated code bypass <code class="k">setCpsr()</code>.</strong> Correct today because the JIT only touches NZCV and T. Keep it that way: mode/I/F changes must stay on the interpreter (they are — <code class="k">emitMrsMsr</code> only accepts the flags field).</div></div>
+  </div>
+</section>
+
+<!-- ═══════════════════ MEASURE ═══════════════════ -->
+<section id="measure">
+  <h2 class="text-2xl font-bold text-white mb-2">Measure before and after each step</h2>
+  <div class="grid md:grid-cols-2 gap-4">
+    <div class="card p-5 text-sm text-slate-300 space-y-3">
+      <h3 class="font-semibold text-white">Add these counters to the STATUS line</h3>
+      <ul class="list-disc pl-5 space-y-1">
+        <li><code class="k">gen</code> — flushes per minute. Anything above ~0 in steady state means the code cache is too small or leaking.</li>
+        <li>Guest instructions executed by JIT vs by interpreter (sum <code class="k">b-&gt;insnCount</code> per execution vs <code class="k">interpStep</code> calls). Target: over 98 % JIT.</li>
+        <li>Blocks executed per second and average <code class="k">insnCount</code> per executed block. Target: 20+.</li>
+        <li>Top fallback PCs by <em>count</em>, not just first occurrence — a fallback in a hot loop matters 1000× more than one at boot.</li>
+        <li>Time split with <code class="k">PPCGetTickCount()</code>: JIT blocks / interpreter / scheduler tasks (GPU scanlines, SPU) / frame end. If GPU tasks are already 50 % of the frame, no CPU work will double FPS — test with a 2D-only title to isolate CPU cost.</li>
+      </ul>
+    </div>
+    <div class="card p-5 text-sm text-slate-300 space-y-3">
+      <h3 class="font-semibold text-white">Suggested order</h3>
+      <ol class="list-decimal pl-5 space-y-1">
+        <li>Log buffering + rate limits (minutes). Re-measure.</li>
+        <li>P0.1 + P0.2 + P0.3 + P0.4 together — they are all "less code per block, fewer C calls, bigger buffer". Expect blocks/s to drop and insns/block to climb 3–5×.</li>
+        <li>P0.5 hot fallbacks — watch the fallback counters go to ~0 for ARM7.</li>
+        <li>P1.1 conditions, P1.2 dead flags, P1.3 memory, P1.4 PUSH/POP — each is independently measurable.</li>
+        <li>P2 dispatcher — do it last, with the emitters already proven; it is mostly runner/stub work by then.</li>
+      </ol>
+      <p class="text-slate-400">Rule of thumb for Broadway: a taken <code class="k">bctrl</code> to a C helper plus its prologue costs about as much as 25–40 straight-line integer instructions. Every helper you remove from a hot path is worth more than any micro-optimisation inside one.</p>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer class="border-t border-[#1e2a36] py-6 text-center text-xs text-slate-500">Audit of jit_ppc.cpp rev 9 · estimates are approximate; measure on hardware.</footer>
+
+<script>
+// ── Render code snippets (kept in text/x-snippet blocks so raw < > survive) ──
+document.querySelectorAll('script[type="text/x-snippet"]').forEach(s => {
+  const pre = document.createElement('pre'); pre.className = 'snip';
+  const code = document.createElement('code'); code.textContent = s.textContent.replace(/^\n+|\s+$/g,'');
+  pre.appendChild(code);
+  const btn = document.createElement('button'); btn.className='copybtn'; btn.textContent='copy';
+  btn.onclick = () => { navigator.clipboard.writeText(code.textContent).then(()=>{btn.textContent='copied';setTimeout(()=>btn.textContent='copy',1200);}); };
+  const wrap = s.parentElement; wrap.appendChild(pre); wrap.appendChild(btn);
+});
+
+// ── Cost bars ──
+const costs = [
+  ['runCpu(): getActualPC, validPC, compile() lookup, executeBlock_asm', 40],
+  ['Block prologue: mflr/stwu + 18× stw + core/interp/cpu stores', 35],
+  ['emitSyncFrom: C call, 15× double-indirect loads, checks, 16× lwz reload', 90],
+  ['Per conditional instruction: JitHelp_testCond C call', 35],
+  ['Per load/store: scratch spills + C helper + memory.read() template', 60],
+  ['Exit: 16× stw spill + JitHelp_commit (15 stores + setPC/flushPipeline)', 110],
+  ['Epilogue: 18× lwz + mtlr + blr', 30],
+];
+const max = Math.max(...costs.map(c=>c[1]));
+document.getElementById('costbars').innerHTML = costs.map(([n,v])=>`
+  <div><div class="flex justify-between text-xs text-slate-300 mb-1"><span>${n}</span><span class="mono text-sky-300">~${v} cyc</span></div>
+  <div class="bar" style="width:${(v/max*100).toFixed(1)}%"></div></div>`).join('');
+
+// ── Estimator ──
+const presets = {
+  cur:{L:5,O:350,B:16,I:90,note:'Current: overhead dominates. Roughly interpreter speed — and worse whenever the 2 MB cache flushes and blocks are recompiled.'},
+  p0: {L:14,O:150,B:14,I:90,note:'After P0: shared stubs, no pipeline refill, blocks continue past not-taken branches, hot fallbacks compiled. Overhead per instruction falls ~5×.'},
+  p1: {L:14,O:150,B:6,I:90,note:'After P1: inline conditions, dead flags, inline memory and PUSH/POP shrink the body cost. Now the fixed per-block cost is the only thing left.'},
+  p2: {L:14,O:10,B:5,I:90,note:'After P2: dispatcher + linking makes per-block cost a branch. This is inside the ~6–7 cycle budget with headroom for the GPU.'},
+};
+const $ = id => document.getElementById(id);
+function upd(){
+  const L=+$('L').value,O=+$('O').value,B=+$('B').value,I=+$('I').value;
+  $('vL').textContent=L; $('vO').textContent=O; $('vB').textContent=B; $('vI').textContent=I;
+  const cost=O/L+B, speed=I/cost, share=(O/L)/cost*100;
+  $('rCost').textContent=cost.toFixed(1); $('rSpeed').textContent=speed.toFixed(2)+'×'; $('rShare').textContent=share.toFixed(0)+'%';
+  const ok=cost<=7; $('rBudget').textContent=ok?'within':(cost/7).toFixed(1)+'× over';
+  $('rBudget').className='text-3xl font-bold '+(ok?'text-emerald-400':cost<=20?'text-amber-300':'text-rose-400');
+  const lg=v=>Math.min(100,Math.max(0,Math.log10(v)/3*100));
+  $('barCost').style.width=lg(cost)+'%'; $('budgetMark').style.left=lg(7)+'%';
+}
+['L','O','B','I'].forEach(id=>$(id).addEventListener('input',()=>{ $('rNote').textContent=''; upd(); }));
+document.querySelectorAll('.preset').forEach(b=>b.addEventListener('click',()=>{
+  const p=presets[b.dataset.preset]; $('L').value=p.L;$('O').value=p.O;$('B').value=p.B;$('I').value=p.I; $('rNote').textContent=p.note; upd();
+  document.querySelectorAll('.preset').forEach(x=>x.classList.remove('border-sky-500')); b.classList.add('border-sky-500');
+}));
+$('rNote').textContent=presets.cur.note; upd();
+</script>
+</body>
+</html>
