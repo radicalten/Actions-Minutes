@@ -1,6 +1,6 @@
 Can you help me improve my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the situation, followed by my code:
 
-Most nds and gba game boot and run, but at a low fps (5-8 fps). Here is a snippet of my debug log:
+Most nds and gba game boot and run, but at a low fps. Here is a snippet of my debug log:
 === NooDS-Wii JIT/CPU trace log ===
 FAT mounted, logging started
 [JIT] init buf=0x805712e0 tramp=0x8009fc00 BLK_ARMS=8 rev=9
