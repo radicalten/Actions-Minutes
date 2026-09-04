@@ -21,3 +21,5 @@ I asked it to implement them and it hit the token limit.
 
 perhaps it is possible to implement them, will send OG file and list of fixes to gemini 3.7 flash and ask it to implement it
 instead I simply saved the index text to the fbl5pg1-index-jit7-suggestions file, copied the exact jit7 dynarect jit_ppc.cpp then fed that prompt to a new instance of fable5.1-high under <code> and it implemented it for me
+
+Interestingly enough fable does not actually get dynarec7 to a workable state. it gets 5fps rockwrestler, and no other game boots nds or gba. meanwhile using dynarec13-opus it literally was able to boot into nds or gba games at will (albeit at low framerates). very interesting indeed. using claude opus 4.8 to prepare dynarec13 did indeed payoff then. next is to make dynarec14-fable5pt1 as that may hold the key to success. 
