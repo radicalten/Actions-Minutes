@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>jit_ppc.cpp — review plan status</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  body { font-family: ui-sans-serif, system-ui, sans-serif; }
+  code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .tag { font-size: .68rem; letter-spacing: .04em; text-transform: uppercase; padding: .15rem .5rem; border-radius: 9999px; font-weight: 600; }
+  details summary::-webkit-details-marker { display: none; }
+  details[open] .chev { transform: rotate(90deg); }
+</style>
+</head>
+<body class="bg-zinc-950 text-zinc-200 min-h-screen">
+<div class="max-w-5xl mx-auto px-5 py-10">
+  <header class="mb-8">
+    <p class="text-xs text-emerald-400 font-semibold tracking-widest uppercase">ARM7/ARM9 → Broadway JIT</p>
+    <h1 class="text-3xl font-bold text-white mt-1">jit_ppc.cpp — fix plan applied</h1>
+    <p class="text-zinc-400 mt-2 text-sm">Status board for the review plan. <span class="text-emerald-300">Done</span> = implemented as written,
+      <span class="text-amber-300">Adapted</span> = implemented with a deliberate deviation (explained),
+      <span class="text-zinc-400">Open</span> = not yet done.</p>
+    <div class="mt-4 flex gap-2 flex-wrap text-xs">
+      <span class="bg-zinc-800 px-3 py-1 rounded-full">Filter:</span>
+      <button data-f="all"  class="fbtn bg-emerald-600 text-white px-3 py-1 rounded-full">All</button>
+      <button data-f="done" class="fbtn bg-zinc-800 px-3 py-1 rounded-full hover:bg-zinc-700">Done</button>
+      <button data-f="adapted" class="fbtn bg-zinc-800 px-3 py-1 rounded-full hover:bg-zinc-700">Adapted</button>
+      <button data-f="open" class="fbtn bg-zinc-800 px-3 py-1 rounded-full hover:bg-zinc-700">Open</button>
+    </div>
+  </header>
+
+  <div id="list" class="space-y-3"></div>
+
+  <section class="mt-10 bg-zinc-900 border border-zinc-800 rounded-xl p-5">
+    <h2 class="text-lg font-semibold text-white">Build / bring-up checklist</h2>
+    <ol class="list-decimal ml-5 mt-3 space-y-2 text-sm text-zinc-300">
+      <li>No interpreter changes are <em>required</em>. The file only uses what the old one used: <code>getRegisters()</code>, <code>getCpsrRef()</code>, <code>setPC()</code>, <code>getActualPC()</code>, <code>isThumb()</code>, <code>isReady()</code>, <code>jitRunOpcode()</code>, <code>bios</code>, <code>halted</code>.</li>
+      <li>Wii build must define <code>HW_RVL</code> (libogc does) so <code>SYS_AllocArena2MemLo</code> is available; otherwise it silently falls back to a 2 MB MEM1 buffer.</li>
+      <li>Expected boot log: <code>[JIT] ready buf=0x9xxxxxxx (16384KB MEM2) pages=256 BLK_ARMS=48</code>. If it says MEM1, your Noods_MEM2 arena already claimed Arena2 — carve the 18 MB from that allocator instead.</li>
+      <li><code>executeBlock_asm</code> is now called with the per-CPU <strong>entry stub</strong>, never with block code. The entry stub reads the block pointer from <code>g_nextBlock</code>, so the asm trampoline needs no changes.</li>
+      <li>First normal exit per CPU/mode calls <code>setPC()</code> once to learn the r15 offset; every exit after that just stores <code>pc + off</code>. If a fork's <code>setPC</code> has side effects beyond r15 + pipeline, add them to <code>JitHelp_commit</code>.</li>
+      <li>Timing knob: <code>armCycles()/thumbCycles()</code> (1 per insn, +1 memory, +1 per LDM/STM register). If a title becomes unstable, charge more for loads.</li>
+    </ol>
+  </section>
+</div>
+
+<script>
+const items = [
+ {id:'P0.1', s:'adapted', t:'No pipeline refill on block exit; inline register sync',
+  d:`<p><code>JitHelp_commit</code> writes r0–r14 + CPSR, sets r15 and marks the pipeline dirty; the runner refills lazily (<code>ensurePipeline()</code>) only before an interpreter step. Block entry syncs with 30 inline loads (pointer, then value) in the per-CPU entry stub — <code>JitHelp_syncFrom</code> and its isReady()/null checks are gone from the hot path.</p>
+      <p class="mt-2 text-amber-200"><b>Deviation:</b> instead of hard-coding <code>pc+8 / pc+4</code> and adding <code>pipelineDirty</code> to Interpreter, the r15 offset is self-calibrated from <code>setPC()</code> once per CPU/mode, and the dirty flag lives JIT-side. Same effect, zero interpreter edits, immune to the fork's r15 convention (the [EXC] log nit suggests it isn't the textbook one).</p>`},
+ {id:'P0.2', s:'done', t:'One shared exit stub + one entry stub per CPU',
+  d:`<p>Exit stub (spill → commit → epilogue) is emitted once by <code>initJit()</code>. Blocks exit with <code>li TE,pc ; li TF,reason ; li TG,cycles ; b exitStub</code> (4–5 words instead of ~50). The prologue + register sync live in a per-CPU entry stub that <code>bctr</code>s into the block. The "last word must be blr" check is gone.</p>`},
+ {id:'P0.3', s:'done', t:'Longer blocks; keep compiling after a not-taken conditional',
+  d:`<p>Conditional B/BL, BX, LDM {..pc}, LDR pc, ALU→pc and Thumb Bcc emit only the taken exit and fall through in the same block. <code>BLK_ARMS=48</code>, <code>BLK_WDS=4096</code>, <code>BLK_MARGIN=192</code>. The two <code>ctx.done</code> lines in the compile loop were removed; emitters decide when a block ends. Blocks stop at 4 KB page boundaries so page invalidation stays exact.</p>`},
+ {id:'P0.4', s:'done', t:'Code buffer in MEM2 (16 MB) + two-level page table',
+  d:`<p><code>SYS_AllocArena2MemLo(16 MB + 2 MB)</code>, MEM1 fallback. Address guards removed from <code>Ctx::call()</code> and <code>initJit()</code>. Lookup: <code>pageTab[cpu][pc>>12]</code> → 2048-slot array indexed by <code>(pc&0xFFF)>>1</code>, entry = <code>code | thumb</code>. No eviction (fixes the leaked-code / ARM9-vs-ARM7 collision bug); invalidation zeroes one page array; whole-cache flush only when the 16 MB or the 256 page arrays run out. A PC whose first instruction is not JIT-able gets a sentinel entry so the runner steps the interpreter without entering generated code.</p>`},
+ {id:'P0.5', s:'adapted', t:'Compile the hot fallbacks',
+  d:`<ul class="list-disc ml-5 space-y-1">
+      <li><b>Rm = PC in immediate shifter</b> (<code>mov lr,pc</code>, <code>add rX,pc,rY</code>): value = PC+8; register-specified shifts with PC still fall back.</li>
+      <li><b>BLX #imm</b> (ARM9): sets LR, T bit, exits to target.</li>
+      <li><b>LDR pc,[…]</b>: normal load, writeback, then <code>emitBX_TA</code> (ARM7 forced to stay ARM). Also added <b>ARM literal loads</b> <code>ldr/ldrh rX,[pc,#imm]</code> and <b>ALU writes to PC</b> (<code>mov pc,lr</code>) — both very hot in ARMv4 code.</li>
+      <li class="text-amber-200"><b>SWI — kept as fallback.</b> Performing <code>exception()</code> from the runner needs to reproduce the interpreter's "r15 while executing" state; the +8/+4 vs resting-state convention differs between forks and I couldn't verify yours. The fallback is correct by construction. Once you add <code>int jitException(uint8_t v){return exception(v);}</code>, set <code>JIT_INLINE_SWI 1</code>; the exit reason and runner branch are already there.</li></ul>`},
+ {id:'P1.a', s:'done', t:'Inline condition codes with mtcrf',
+  d:`<p><code>mtcrf 0x80,RCPSR</code> puts NZCV into CR0; simple conditions are one <code>bc</code>, HI/LS/GE/LT/GT/LE use one or two CR-logical ops into cr1. <code>patchSkip()</code> preserves BO/BI. <code>JitHelp_testCond</code> deleted. Used for ARM conditions and Thumb Bcc.</p>`},
+ {id:'P1.b', s:'open', t:'Dead-flag elimination',
+  d:`<p>Not started. The <code>armReads/armWrites/liveAfter</code> scan from the review drops straight in: pre-decode the block into an array in <code>compileBlock()</code>, pass a live mask to <code>emitDP()</code>/Thumb emitters, and gate <code>setNZ/setC_*/setV_*</code> on it.</p>`},
+ {id:'P1.c', s:'open', t:'Inline memory fast path (lwbrx/stwbrx through the page map)',
+  d:`<p>Not started. Needs <code>jitReadMap/jitWriteMap</code> from Memory (with TCM ordering and code pages nulled in the write map). All memory emitters still go through <code>JitHelp_*</code>; they are the natural insertion points.</p>`},
+ {id:'P1.d', s:'open', t:'Inline PUSH/POP/LDM/STM and register shifts',
+  d:`<p>Not started; depends on P1.c for the page map register. Thumb ALU 2/3/4/7 still fall back.</p>`},
+ {id:'P2', s:'open', t:'Dispatcher loop + block linking + cycle down-counter',
+  d:`<p>Not started. Groundwork is in place: per-exit cycle counts already reach C (<code>TG</code>), blocks are keyed by <code>pc|thumb</code> in a table the dispatcher can walk, and there is exactly one prologue/epilogue in the system.</p>`},
+ {id:'nits', s:'adapted', t:'Correctness nits',
+  d:`<ul class="list-disc ml-5 space-y-1">
+      <li><b>emitMrsMsr</b>: every operand is tested before anything is emitted. ✔</li>
+      <li><b>Direct-mapped eviction leak</b>: gone with the page table. ✔</li>
+      <li><b>runCpu</b> split into <code>lookupBlock()</code> / <code>compileBlock()</code>; no per-block sanity dance. ✔</li>
+      <li><b>Timing</b>: fixed 64 cycles / 24 blocks replaced by per-exit cycle estimates and a NooDS-style two-timeline runner (ARM9 ×2, ARM7 ×4). ✔</li>
+      <li><b>Bonus</b>: RRX used <code>TA</code> as a temp while <code>TA</code> was also the shifter destination in <code>emitDP</code> → carry lost. Now uses <code>TG</code>. Thumb BLX suffix rejected on ARM7.</li>
+      <li class="text-zinc-400"><b>[EXC] log PC in Thumb</b> and <b>executeBlock_asm r30/r31</b>: live in interpreter.cpp / the .S file, not touched here.</li></ul>`},
+];
+const S = { done:['Done','bg-emerald-500/15 text-emerald-300 border-emerald-500/30'],
+            adapted:['Adapted','bg-amber-500/15 text-amber-300 border-amber-500/30'],
+            open:['Open','bg-zinc-700/40 text-zinc-300 border-zinc-600/50'] };
+const list = document.getElementById('list');
+function render(f){
+  list.innerHTML = '';
+  items.filter(i => f==='all' || i.s===f).forEach(i => {
+    const [label, cls] = S[i.s];
+    const el = document.createElement('details');
+    el.className = 'group bg-zinc-900 border border-zinc-800 rounded-xl overflow-hidden';
+    if (i.s!=='done') el.open = true;
+    el.innerHTML = `
+      <summary class="cursor-pointer select-none flex items-center gap-3 px-5 py-4 hover:bg-zinc-800/60">
+        <span class="chev text-zinc-500 transition-transform">▶</span>
+        <span class="text-xs font-mono text-zinc-500 w-10">${i.id}</span>
+        <span class="flex-1 font-medium text-white">${i.t}</span>
+        <span class="tag border ${cls}">${label}</span>
+      </summary>
+      <div class="px-5 pb-5 pt-1 text-sm text-zinc-300 leading-relaxed border-t border-zinc-800">${i.d}</div>`;
+    list.appendChild(el);
+  });
+}
+document.querySelectorAll('.fbtn').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('.fbtn').forEach(x => x.className = 'fbtn bg-zinc-800 px-3 py-1 rounded-full hover:bg-zinc-700');
+  b.className = 'fbtn bg-emerald-600 text-white px-3 py-1 rounded-full';
+  render(b.dataset.f);
+}));
+render('all');
+</script>
+</body>
+</html>
