@@ -20,3 +20,4 @@ created index.html with a list of 10 unimplemented fixes
 I asked it to implement them and it hit the token limit. 
 
 perhaps it is possible to implement them, will send OG file and list of fixes to gemini 3.7 flash and ask it to implement it
+instead I simply saved the index text to the fbl5pg1-index-jit7-suggestions file, copied the exact jit7 dynarect jit_ppc.cpp then fed that prompt to a new instance of fable5.1-high under <code> and it implemented it for me
