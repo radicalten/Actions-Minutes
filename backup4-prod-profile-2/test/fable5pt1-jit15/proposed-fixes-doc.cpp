@@ -1,4 +1,499 @@
-Can implement the fixes from this code review contained in the attached proposed-fixes.html?
+Can implement the fixes from this code review to jit_ppc.cpp?
+    
+1 · Why nothing boots
+S0 1.1 The Thumb dispatcher is shifted by one nibble
+
+Thumb formats by the top nibble h = op >> 12: 0,1 = shifts/add-sub (format 1/2), 2,3 = MOV/CMP/ADD/SUB imm8 (format 3), 4 = ALU / hi-reg+BX / LDR literal (formats 4–6), 5 = register-offset loads/stores (formats 7/8). Your switch has case 0x1 → emitT_imm8, case 0x2 → ALU/hiReg/ldrPc, case 0x3,0x4 → emitT_memReg. The emitters themselves decode correctly for the format they were written for — only the routing is wrong. Symptoms you would see: ASR becomes ADD Rd,#imm8; MOV r0,#0 becomes AND r0,r0; CMP r0,#x becomes an LDR from the literal pool; every BX lr becomes a store. The thumbCycles() table has the same shift.
+jit_ppc.cpp — replace dispThumb() and thumbCycles()
+
+static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    switch ((op >> 12) & 0xF) {
+        case 0x0: case 0x1:                              // 000 op imm5 Rs Rd  |  00011 I op Rn/imm3 Rs Rd
+            if (((op >> 11) & 3) < 3) return emitT_shifts(ctx, op);   // LSL / LSR / ASR #imm
+            return emitT_addSub3(ctx, op);                            // ADD / SUB Rd, Rs, Rn|#imm3
+        case 0x2: case 0x3:                              // 001 op Rd imm8 : MOV / CMP / ADD / SUB
+            return emitT_imm8(ctx, op);
+        case 0x4: {                                      // 0100 00 = ALU, 0100 01 = hi-reg/BX, 0100 1x = LDR literal
+            uint8_t b = (op >> 10) & 3;
+            if (b == 0) return emitT_alu(ctx, op);
+            if (b == 1) return emitT_hiReg(ctx, op, curPC);
+            return emitT_ldrPc(ctx, op, curPC);
+        }
+        case 0x5:                                        // 0101 : LDR/STR{B,H,SB,SH} Rd,[Rb,Ro]
+            return emitT_memReg(ctx, op);
+        case 0x6: case 0x7: case 0x8:                    // 011 B L imm5 | 1000 L imm5 : imm offset
+            return emitT_memImm(ctx, op);
+        case 0x9:  return emitT_spLoad(ctx, op, curPC);  // 1001 : SP-relative
+        case 0xA:  return emitT_addSpPc(ctx, op, curPC); // 1010 : ADD Rd, PC/SP, #imm
+        case 0xB:                                        // 1011 : ADD SP / PUSH / POP
+            if (((op >> 8) & 0xF) == 0) return emitT_addSpPc(ctx, op, curPC);
+            if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6) return emitT_pushPop(ctx, op, curPC);
+            return false;                                // BKPT, SETEND, CPS... -> interpreter
+        case 0xC:  return emitT_ldmStm(ctx, op);         // 1100 : LDMIA/STMIA
+        case 0xD: case 0xE: return emitT_branch(ctx, op, curPC);
+        default:   return false;                         // 0xF : BL halves are paired in compileBlock
+    }
+}
+
+static uint32_t thumbCycles(uint16_t op) {
+    uint8_t h = (op >> 12) & 0xF;
+    if ((h >= 5 && h <= 9) || (h == 4 && ((op >> 11) & 1))) return 2;   // loads/stores (+ LDR literal)
+    if (h == 0xB && (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6))
+        return 1u + (uint32_t)__builtin_popcount(op & 0x1FFu);
+    if (h == 0xC) return 1u + (uint32_t)__builtin_popcount(op & 0xFFu);
+    return 1;
+}
+
+Verified against the emitters: emitT_shifts reads ty=(op>>11)&3 (0..2 with h=0/1), emitT_imm8 reads ty=(op>>11)&3 (MOV/CMP/ADD/SUB with h=2/3), emitT_alu reads (op>>6)&0xF and emitT_hiReg reads (op>>8)&3 / H1 / H2 — all consistent with the corrected routing above. Nothing in the emitters needs to change for this fix.
+S0 1.2
+validPC()
+excludes the memory the ARM7 actually executes from
+
+NDS memory map: shared WRAM is 0x03000000–0x037FFFFF (from the ARM7's view), ARM7 IWRAM is 0x03800000–0x0380FFFF (mirrored to 0x03FFFFFF). Almost every commercial ARM7 binary and every libnds ARM7 binary executes from IWRAM, and your range check is pc < 0x03800000. Every ARM7 instruction therefore goes through runCpu → interpStep (pipeline refill check + jitRunOpcode + fixed 2-cycle charge). On the ARM9 side, libnds links ITCM code to 0x01FF8000 (a mirror of 0x00000000), also rejected. The function also needs to know which CPU it is checking.
+jit_ppc.cpp — validPC() with a cpu parameter (update the 4 call sites: runCpu ×2, compileBlock ×2)
+
+// arm7 == true for the NDS ARM7 and for GBA mode (both run on interpreter[1]).
+static bool validPC(uint32_t pc, bool gba, bool arm7) {
+    pc &= ~1u;
+    if (gba) {
+        return (pc < 0x4000u) ||                               // BIOS
+               (pc >= 0x02000000u && pc < 0x02040000u) ||      // EWRAM
+               (pc >= 0x03000000u && pc < 0x03008000u) ||      // IWRAM
+               (pc >= 0x06000000u && pc < 0x06018000u) ||      // VRAM (rare)
+               (pc >= 0x08000000u && pc < 0x0E000000u);        // ROM + mirrors
+    }
+    if (arm7) {
+        return (pc < 0x4000u) ||                               // ARM7 BIOS
+               (pc >= 0x02000000u && pc < 0x02400000u) ||      // main RAM
+               (pc >= 0x03000000u && pc < 0x04000000u);        // shared WRAM + IWRAM @ 0x03800000 (+ mirrors)
+    }
+    return (pc < 0x02000000u) ||                               // ITCM, 32 KB mirrored (libnds: 0x01FF8000)
+           (pc >= 0x02000000u && pc < 0x02400000u) ||          // main RAM  (use 0x03000000 in dsiMode)
+           (pc >= 0x03000000u && pc < 0x04000000u) ||          // shared WRAM (ARM9 view, mirrored)
+           (pc >= 0xFFFF0000u);                                // ARM9 BIOS
+}
+
+Mirror caveat: blocks are keyed by the alias the CPU executes from. If a game writes code through one alias (e.g. 0x03810000) and runs it through another (0x03800000) invalidation misses. If you ever see that, canonicalise in one place — canonPC() = 0x03800000|(pc&0xFFFF) for IWRAM, pc&0x7FFF for ITCM — and use it for both pageIndex() and invalidateJitWrite(). Not needed to boot.
+2 · Correctness fixes
+S1 2.1 MRS/MSR masks let SPSR forms through as CPSR
+
+0x0FBF0FFF has bits 23..20 = 1011: bit 22 is not tested. Bit 22 is the R bit (0 = CPSR, 1 = SPSR). So MRS r0, SPSR (0x014F0000) compiles to "copy CPSR" and MSR SPSR_f, r0 (0x0168F000) compiles to "write CPSR flags". Both are used by IRQ wrappers (nested-IRQ save/restore) — after the first interrupt the flags/mode state of the interrupted code is trashed. Same fix for the immediate form, which today never even reaches emitMrsMsr because it has it == 1 and goes to emitDP (harmless fallback, but wasted).
+jit_ppc.cpp — emitMrsMsr() masks + routing of MSR #imm from dispARM()
+
+// --- emitMrsMsr(): require R == 0 (bit 22) in every pattern ---
+    // MRS Rd, CPSR            cond 0001 0 0 00 1111 Rd 0000 0000 0000
+    if ((op & 0x0FFF0FFF) == 0x010F0000) { ... }
+
+    // MSR CPSR_f, #imm        cond 0011 0 0 10 1000 1111 rot imm8
+    if ((op & 0x0FF0F000) == 0x0320F000) { ... }
+
+    // MSR CPSR_f, Rm          cond 0001 0 0 10 1000 1111 0000 0000 Rm
+    if ((op & 0x0FF0FFF0) == 0x0120F000) { ... }
+
+// --- dispARM(): route the immediate form (it == 1) before emitDP ---
+        case 1:
+            if ((op & 0x0FB00000) == 0x03200000)          // MSR{ CPSR|SPSR }_x, #imm
+                return emitMrsMsr(ctx, op, curPC);
+            return emitDP(ctx, op, curPC);
+
+S1 2.2 Base writeback vs. loaded value when Rd == Rn
+
+In emitLS the load result is moved into RA[rd], then the post-index writeback does RA[rn] += offset. For LDR r0,[r0],#4 that overwrites the loaded value with base+4 (architecturally the load wins). Conversely for pre-indexed stores the code skips writeback whenever rn == rd, but STR r0,[r0,#4]! must still update r0. Identical logic in emitLSExtra.
+jit_ppc.cpp — writeback tail of emitLS() and emitLSExtra()
+
+    // Writeback. When a LOAD targets the base register the loaded value wins (UNPREDICTABLE on
+    // real ARM for Pr+wb, but "load wins" is what ARM7TDMI/ARM946E-S do and what noods does).
+    if (rn != 15 && !(ld && rn == rd)) {
+        ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));               // offset
+        if (!pre) {                                      // post-index: always write back
+            if (up) ctx.E(ppc_add (RA[rn], RA[rn], TA));
+            else    ctx.E(ppc_subf(RA[rn], TA, RA[rn]));
+        } else if (wb) {                                 // pre-index with '!': also for STR Rn,[Rn,#x]!
+            ctx.E(ppc_lwz(RA[rn], FRAME_SCR1, 1));       // effective address
+        }
+    }
+
+S1 2.3 Sub-word helper arguments
+
+The PowerPC SysV/EABI convention is that the caller zero/sign-extends char/short arguments, and GCC relies on it in the callee. JitHelp_w16(…, uint16_t v) receives the untruncated guest register in r6; anything downstream that does value << 16, compares, or forwards value as a wider type (I/O handlers such as DISPCNT/BLDALPHA/IPC registers do) sees the high garbage. Make the helpers word-sized and truncate inside.
+jit_ppc.cpp — memory helpers (also update the prototypes used by ctx.call)
+
+uint32_t JitHelp_r16(Core* c, int a, uint32_t ad) { return c->memory.read<uint16_t>((bool)a, ad); }
+uint32_t JitHelp_r8 (Core* c, int a, uint32_t ad) { return c->memory.read<uint8_t >((bool)a, ad); }
+void JitHelp_w16(Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint16_t>((bool)a, ad, (uint16_t)v); }
+void JitHelp_w8 (Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint8_t >((bool)a, ad, (uint8_t )v); }
+
+S1 2.4
+g_cpuTime
+is not rebased on RESET_CYCLES
+
+Core::resetCycles() subtracts globalCycles from every event and from interpreter[i].cycles, then zeroes globalCycles. The JIT keeps its own per-CPU timelines in g_cpuTime[] and they are never rebased, so after the first reset (0x7FFFFFFF global cycles ≈ 32 s of emulated time) (int32_t)(g − g_cpuTime) flips negative and the runner jumps time forward by ~32 s in one JitHelp_tick. Games that survive boot die later.
+jit_ppc.h / jit_ppc.cpp / core.cpp
+
+// jit_ppc.h
+namespace JitPpc { void rebaseCycles(uint32_t globalCycles); }
+
+// jit_ppc.cpp
+void rebaseCycles(uint32_t g) { g_cpuTime[0] -= g; g_cpuTime[1] -= g; }
+
+// core.cpp — Core::resetCycles(), before `globalCycles = 0;`
+    if (jitAvailable) JitPpc::rebaseCycles(globalCycles);
+
+S2 2.5
+subfic
+destroys XER[CA] before ADC/SBC/RSC
+
+emitDP loads the ARM carry into XER (mtxer) before calling emitShifter. The register-ROR path then emits subfic TB, TD, 32, which writes CA. ADC r0, r1, r2, ROR r3 therefore adds a wrong carry. neg computes the same rotate amount without touching CA (rlwnm only uses the low 5 bits).
+jit_ppc.cpp — encoder + emitShifter() register-ROR case
+
+static inline uint32_t ppc_neg(uint8_t d, uint8_t a) { return XOf(d, a, 0, false, 104); }
+
+        default:                                        // ROR Rm, Rs
+            ctx.E(ppc_neg(TB, TD));                     // (-n) & 31 == (32-n) & 31 ; does not touch CA
+            ctx.E(ppc_rlwnm(dst, TA, TB, 0, 31));
+            break;
+
+S2 2.6 A halt inside a block does not stop the block
+
+STRB to HALTCNT (real BIOS Halt/IntrWait) or an IME/IE write goes through memory.write → halt() → updateRun(), but the generated code simply continues with the next guest instruction until the block ends. The CPU then resumes after the interrupt at a PC that is a few instructions "too late". Usually benign (the BIOS wait loops re-check flags) but it is the kind of thing that makes one game in twenty hang in a vblank wait. halted lives at a fixed address, so a 5-instruction inline test after each store fixes it without touching the helpers. Emit it after the writeback code, and for STM/PUSH/STMIA after emitReload.
+jit_ppc.cpp — emitHaltCheck(); call after every store emitter with nextPC = curPC + (thumb ? 2 : 4)
+
+static inline uint32_t ppc_lbz(uint8_t rt, int16_t d, uint8_t ra) {
+    return (34u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+
+// If the store we just performed halted this CPU, commit state with PC = next instruction and leave.
+static void emitHaltCheck(Ctx& ctx, uint32_t nextPC) {
+    ctx.li(TA, (uint32_t)(uintptr_t)&ctx.interp->halted);   // uint8_t, public
+    ctx.E(ppc_lbz(TA, 0, TA));
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t b = ctx.sz();
+    ctx.E(ppc_bc(12, 2, 0));                                  // beq continue
+    emitCommitExit(ctx, nextPC, EXIT_NORMAL);                 // (phase 2: force the non-chaining exit here)
+    patchBc(ctx, b, 12, 2);
+}
+
+// e.g. in emitLS(), just before the final patchSkip(ctx, si):
+    if (!ld) emitHaltCheck(ctx, curPC + 4);
+
+S2 2.7 Smaller items
+
+    interpStep() charges a flat 2 cycles. jitRunOpcode() already returns the interpreter's cycle count — return it: static inline int interpStep(...) { ensurePipeline(...); return interp.jitRunOpcode(); } and use the value in runCpu. Timer-driven boot sequences (and the ARM7 audio/RTC loops) are sensitive to this while the ARM7 is still mostly interpreted.
+    DSi mode: Core::updateRun() picks the JIT before checking dsiMode, but runJitNds hard-codes the NDS 2×/4× scaling. Either exclude dsiMode from the JIT path or make the shifts dsiMode ? 1 : 2 style parameters.
+    running = 0 in updateRun(): the JIT run functions never set running = 1. If your frame loop is running = 1; while (running) runCore(); every halt/unhalt (thousands per frame on the ARM7) ends the loop early. Check what your frontend does with it; the interpreter's runCore* functions in noods re-arm it themselves.
+    Fallback double-charge: on EXIT_FALLBACK the block already added the failing instruction's cycles to ctx.cycles, then runCpu adds the interpreter's cost again. Subtract armCycles/thumbCycles of the failing instruction before emitting the fallback exit (you already keep cycMark).
+    emitT_hiReg ADD pc,pc: harmless, but o==0 && rd==15 && rs==15 should be rejected rather than doubled.
+
+3 · Why it's slow
+PERF 3.1 The code cache never lands in MEM2
+
+allocArena() sets raw = nullptr and immediately takes the "MEM2 unavailable" branch, so you always run with 2 MB of code space in MEM1 and print a misleading message. With ~12 PPC words per guest memory access and 15+15 register spills around every LDM/STM, 2 MB fills within seconds of gameplay and every fill is a full flushJitCache(): all pages dropped, everything recompiled, repeat. You already export Noods_MEM2_Alloc. Cached MEM2 (0x9xxxxxxx) is executable on the Wii; keep the allocation 32-byte aligned so DCFlushRange/ICInvalidateRange cover whole lines.
+jit_ppc.cpp — allocArena()
+
+extern void* Noods_MEM2_Alloc(size_t size);
+
+static bool allocArena() {
+    if (g_arena) return true;
+    size_t codeBytes = JIT_BYTES_MEM2;                                   // 16 MB
+    void*  raw = Noods_MEM2_Alloc(codeBytes + PAGE_ARENA_BYTES + 32);
+    if (raw) {
+        raw = (void*)(((uintptr_t)raw + 31) & ~(uintptr_t)31);           // 32-byte align for cache ops
+    } else {
+        codeBytes = JIT_BYTES_MEM1;
+        raw = memalign(32, codeBytes + PAGE_ARENA_BYTES);
+        if (!raw) { printf("[JIT] arena alloc failed\n"); return false; }
+        printf("[JIT] MEM2 unavailable, using %zuKB in MEM1\n", codeBytes >> 10);
+    }
+    g_arena      = raw;
+    g_arenaBytes = codeBytes + PAGE_ARENA_BYTES;
+    codeBuf      = (uint32_t*)raw;
+    g_jitWords   = codeBytes / 4;
+    g_pageArena  = (uint32_t*)((uint8_t*)raw + codeBytes);
+    return true;
+}
+
+Relative b to the exit stub reaches ±32 MB, so a 16 MB buffer is safe; helper calls already use absolute mtctr/bctrl.
+PERF 3.2 Invalidation: O(1) lookup + 64-byte coverage bitmap
+
+Today every guest write (if Memory::write calls Core::invalidateJitPage) walks g_livePages (up to 256 entries) and, on a hit, memsets the entire 8 KB slot array for the page. ARM7 IWRAM is 64 KB of code and data and stack; any variable that shares a 4 K page with code makes each write throw away all blocks in that page, which are recompiled on the next branch. That loop alone can eat the whole frame budget. Fix both halves: index the page table directly, and track which 64-byte chunks of a page actually contain compiled code.
+jit_ppc.cpp — coverage bitmap + invalidateJitWrite()
+
+static uint64_t g_pageCover[PAGE_ARENA_CNT];        // bit c set => bytes [c*64, c*64+64) of that page hold compiled code
+uint8_t g_jitCodePage[0x10000];                     // exported: 1 => some CPU has code in this 4K page (pc < 0x10000000)
+
+static inline size_t pageSlotIdx(uint32_t* pg) { return (size_t)(pg - g_pageArena) / PAGE_SLOTS; }
+
+// compileBlock(): call right after `pg[slot] = (uint32_t)(uintptr_t)ctx.base | tbit;`
+static void markCover(uint32_t* pg, uint32_t startPC, uint32_t endPC) {
+    size_t   k  = pageSlotIdx(pg);
+    unsigned c0 = (startPC & 0xFFFu) >> 6, c1 = ((endPC - 1) & 0xFFFu) >> 6;
+    for (unsigned c = c0; c <= c1; c++) g_pageCover[k] |= 1ull << c;
+    if (startPC < 0x10000000u) g_jitCodePage[startPC >> 12] = 1;
+}
+
+// One guest write of `size` bytes at `addr`. O(1). Safe to call from inside a running block.
+void invalidateJitWrite(uint32_t addr, uint32_t size) {
+    int32_t pi = pageIndex(addr);
+    if (pi < 0) return;
+    unsigned c0 = (addr & 0xFFFu) >> 6, c1 = ((addr + size - 1) & 0xFFFu) >> 6;
+    uint64_t m = 0;
+    for (unsigned c = c0; c <= c1; c++) m |= 1ull << c;
+
+    bool still = false;
+    for (int cpu = 0; cpu < 2; cpu++) {
+        uint32_t* pg = g_pageTab[cpu][pi];
+        if (!pg) continue;
+        size_t k = pageSlotIdx(pg);
+        if (g_pageCover[k] & m) { memset(pg, 0, PAGE_SLOTS * 4); g_pageCover[k] = 0; }
+        if (g_pageCover[k]) still = true;
+    }
+    if (!still && addr < 0x10000000u) g_jitCodePage[addr >> 12] = 0;
+}
+
+// flushJitCache(): add
+    memset(g_pageCover, 0, sizeof g_pageCover);
+    memset(g_jitCodePage, 0, sizeof g_jitCodePage);
+
+memory.cpp — hook in the RAM fast path of Memory::write<T>() (and any DMA memcpy path)
+
+extern uint8_t g_jitCodePage[0x10000];
+namespace JitPpc { void invalidateJitWrite(uint32_t addr, uint32_t size); }
+
+    // ... after the value has been stored:
+    if (address < 0x10000000u && g_jitCodePage[address >> 12])       // 2 loads + 1 branch in the common case
+        JitPpc::invalidateJitWrite(address, sizeof(T));
+
+Delete Core::invalidateJitPage (it widened every write to a full page) and invalidateJitRange's linear scan. If NDS overlays / GBA multiboot payloads are copied with a raw memcpy in your cartridge or DMA code, call invalidateJitWrite(dst, len) once for the whole range there — otherwise stale blocks execute old overlay code, which is another classic "boots to a black screen after the logo" cause.
+PERF 3.3 Thumb LSL/LSR/ASR/ROR by register
+
+These are in every fixed-point routine and every GBA game's inner loops; each occurrence currently ends the block, commits 16 registers, steps the interpreter and re-enters. ARM semantics (n = Rs & 0xFF): n = 0 → value and C unchanged, only N/Z updated; LSL/LSR: n = 32 → result 0, C = bit 0 / bit 31; n > 32 → result 0, C = 0; ASR: n ≥ 32 → sign fill, C = bit 31; ROR: rotate by n & 31, C = result bit 31. Clamping n to 33 (LSL/LSR) or 32 (ASR) makes the tail cases fall out of PowerPC's 6-bit shift behaviour.
+jit_ppc.cpp — emitT_aluShiftReg(); in emitT_alu(): case 2: case 3: case 4: case 7: return emitT_aluShiftReg(ctx, o, d, s);
+
+static inline uint32_t ppc_cmpli(uint8_t cr, uint8_t ra, uint16_t i) {
+    return (10u << 26) | ((cr & 7u) << 23) | ((uint32_t)ra << 16) | i;          // cmplwi
+}
+
+// Thumb format 4: LSL(2) LSR(3) ASR(4) ROR(7) Rd, Rs.  N,Z always; C only when n != 0.
+static bool emitT_aluShiftReg(Ctx& ctx, uint8_t o, uint8_t d, uint8_t s) {
+    ctx.E(ppc_rlwinm(TD, s, 0, 24, 31));                 // n = Rs & 0xFF
+    ctx.E(ppc_cmpi(0, TD, 0));
+    size_t bZero = ctx.sz();
+    ctx.E(ppc_bc(12, 2, 0));                             // beq -> only N,Z
+
+    if (o == 7) {                                        // ROR
+        ctx.E(ppc_neg(TB, TD));
+        ctx.E(ppc_rlwnm(d, d, TB, 0, 31));               // rotate right by n & 31
+        ctx.E(ppc_rlwinm(TC, d, 1, 31, 31));             // C = result bit 31 (also right when n & 31 == 0)
+    } else {
+        const int clamp = (o == 4) ? 32 : 33;            // behaviour is constant beyond this
+        ctx.E(ppc_cmpli(0, TD, (uint16_t)clamp));
+        size_t bOk = ctx.sz();
+        ctx.E(ppc_bc(4, 1, 0));                          // ble ok
+        ctx.E(ppc_addi(TD, 0, (int16_t)clamp));
+        patchBc(ctx, bOk, 4, 1);
+        if (o == 2) {                                    // LSL : C = bit(32-n)
+            ctx.E(ppc_subfic(TB, TD, 32));               // n=32 -> 0 (bit0) ; n=33 -> -1 -> srw gives 0
+            ctx.E(ppc_srw(TC, d, TB));
+            ctx.E(ppc_slw(d, d, TD));                    // n>=32 -> 0
+        } else {                                         // LSR / ASR : C = bit(n-1)
+            ctx.E(ppc_addi(TB, TD, -1));
+            ctx.E(ppc_srw(TC, d, TB));                   // n=32 -> bit31 ; n=33 -> 0
+            ctx.E(o == 3 ? ppc_srw(d, d, TD) : ppc_sraw(d, d, TD));
+        }
+        ctx.E(ppc_rlwinm(TC, TC, 0, 31, 31));
+    }
+    setC_bit0(ctx, TC);
+    patchBc(ctx, bZero, 12, 2);
+    setNZ(ctx, d);
+    return true;
+}
+
+The same helper, parameterised on the carry-required flag, lets you lift the s && regShift && logical rejection in emitDP later (ARM MOVS r0, r1, LSL r2).
+PERF 3.4 What a block costs today
+Per block, current design
+
+    runCpu: validPC, hleBiosAddr, page lookup~40
+    executeBlock_asm + entry stub (18 saves, 30 loads)~65
+    exit stub spill + JitHelp_commit (15 indirect stores)~70
+    epilogue (18 restores)~22
+    overhead≈ 200 PPC insns
+    useful work for a typical 5-insn block30–80
+
+After phase 2 (chaining)
+
+    dispatch stub: budget, flag, 2-level lookup, T check~22
+    C round-trip only on budget expiry / miss / fallbackamortised
+    overhead≈ 25 PPC insns
+    Registers stay in r14–r29 across blocks; the interpreter's register file is only touched when the JIT actually returns to C.
+
+4 · Block chaining without leaving the JIT frame (phase 2)
+
+Do this only after sections 1–3 are in and a few games boot. The idea: keep your existing frame, entry stub and exit stub, but route EXIT_NORMAL exits through a dispatch stub that looks up the next block in generated code and bctrs to it. Two spare non-volatile registers are already saved by the entry stub: use r30 as a cycle budget countdown and r31 as &g_pageTab[cpu][0].
+
+    Protocol. Every block exit sets r7 = next PC, r8 = reason, r9 = cycles of the block that just ran. The exit stub folds r9 into r30 and passes r30 (remaining budget) to JitHelp_commit instead of r9; C computes consumed = budget − remaining (may be negative → overrun, that's fine).
+    Entry stub additionally loads r30 ← g_budget and r31 ← &g_pageTab[cpu][0].
+    emitCommitExit jumps to the dispatch stub when reason == EXIT_NORMAL, else to the exit stub. emitHaltCheck and fallbacks always take the exit stub.
+    g_exitRequest (a uint8_t) is set by Core::updateRun() and by Core::schedule() for ARM9_INTERRUPT/ARM7_INTERRUPT, cleared by runCpu before entering. The dispatch stub tests it, so an IRQ or halt raised by a store never waits longer than the end of the current block.
+    Sentinel. g_fbSentinel must become executable code (the dispatcher may bctr into it): a 3-instruction stub in the stub area — li r8,EXIT_FALLBACK; li r9,0; b exitStub. runCpu's pointer compare keeps working.
+    Budget. In runJitNds: budget = max(1, (min(nextEventCycles, otherCpuTime) − myTime) / scale) in CPU cycles. This gives you exactly noods' interleaving with no per-block C round-trip.
+
+jit_ppc.cpp — encoders + dispatch stub (built once in buildExitStub(), after the exit stub)
+
+static inline uint32_t ppc_andi_(uint8_t a, uint8_t s, uint16_t i) { return (28u << 26) | ((uint32_t)s << 21) | ((uint32_t)a << 16) | i; }
+static inline uint32_t ppc_lwzx (uint8_t rt, uint8_t ra, uint8_t rb) { return Xf(rt, ra, rb, 23); }
+
+static uint32_t* g_dispatchStub = nullptr;
+static volatile uint8_t  g_exitRequest = 0;     // set by Core::updateRun() and interrupt scheduling
+static uint32_t          g_budget      = 1;     // read by the entry stub into r30
+
+// In : r7 = next PC (bit 0 clear), r9 = cycles of the finished block, guest regs + RCPSR live,
+//      r30 = remaining budget, r31 = &g_pageTab[cpu][0]
+static void emitDispatchStubBody(Ctx& ctx) {
+    ctx.E(ppc_subf(30, TG, 30));                          // budget -= cycles
+    ctx.E(ppc_cmpi(0, 30, 0));
+    size_t b1 = ctx.sz(); ctx.E(ppc_bc(4, 1, 0));         // ble  exit   (budget exhausted)
+
+    ctx.li(TA, (uint32_t)(uintptr_t)&g_exitRequest);
+    ctx.E(ppc_lbz(TA, 0, TA));
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t b2 = ctx.sz(); ctx.E(ppc_bc(4, 2, 0));         // bne  exit   (halt / IRQ / mode change pending)
+
+    ctx.E(ppc_rlwinm(TC, TE, 20, 12, 31));                // pc >> 12
+    ctx.E(ppc_cmpli(0, TC, 0xFFFF));
+    size_t b3 = ctx.sz(); ctx.E(ppc_bc(12, 1, 0));        // bgt  exit   (BIOS @ 0xFFFF0000: let C handle it)
+    ctx.E(ppc_rlwinm(TC, TC, 2, 0, 29));                  // * 4
+    ctx.E(ppc_lwzx(TD, 31, TC));                          // slot array for the page
+    ctx.E(ppc_cmpi(0, TD, 0));
+    size_t b4 = ctx.sz(); ctx.E(ppc_bc(12, 2, 0));        // beq  exit   (no page yet)
+    ctx.E(ppc_rlwinm(TC, TE, 1, 19, 29));                 // ((pc & 0xFFF) >> 1) * 4
+    ctx.E(ppc_lwzx(TD, TD, TC));                          // entry | tbit
+    ctx.E(ppc_cmpi(0, TD, 0));
+    size_t b5 = ctx.sz(); ctx.E(ppc_bc(12, 2, 0));        // beq  exit   (not compiled yet)
+
+    ctx.E(ppc_rlwinm(TB, RCPSR, 27, 31, 31));             // CPSR.T -> bit 0
+    ctx.E(ppc_xor(TB, TB, TD));
+    ctx.E(ppc_andi_(TB, TB, 1));                          // sets CR0
+    size_t b6 = ctx.sz(); ctx.E(ppc_bc(4, 2, 0));         // bne  exit   (block compiled for the other ISA)
+
+    ctx.E(ppc_rlwinm(TD, TD, 0, 0, 30));                  // strip tbit
+    ctx.E(ppc_mtctr(TD));
+    ctx.E(ppc_bctr(false));                               // ---- chained ----
+
+    // exit: r7 still holds the PC; cycles already folded into r30
+    patchBc(ctx, b1, 4, 1);  patchBc(ctx, b2, 4, 2);  patchBc(ctx, b3, 12, 1);
+    patchBc(ctx, b4, 12, 2); patchBc(ctx, b5, 12, 2); patchBc(ctx, b6, 4, 2);
+    ctx.E(ppc_addi(TF, 0, EXIT_NORMAL));
+    ctx.E(ppc_addi(TG, 0, 0));
+    emitJumpExitStub(ctx);
+}
+
+// Exit stub body: pass the remaining budget instead of the block's cycles.
+static void emitExitStubBody(Ctx& ctx) {
+    emitSpill(ctx);
+    ctx.ldInterp();                                       // r3
+    ctx.ldCpu();                                          // r4
+    ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_REGSYNC));       // r5
+    ctx.E(ppc_mr(TD, RCPSR));                             // r6      (r7 = pc, r8 = reason already set)
+    ctx.E(ppc_subf(30, TG, 30));                          // r30 -= cycles of the exiting block
+    ctx.E(ppc_mr(TG, 30));                                // r9 = remaining budget (signed)
+    ctx.call((void*)JitHelp_commit);                      // stores it in g_exitRemaining[cpu]
+    emitEpilogue(ctx);
+}
+
+// Entry stub additions (before the final mtctr/bctr):
+    ctx.li(TA, (uint32_t)(uintptr_t)&g_budget);            ctx.E(ppc_lwz(30, 0, TA));
+    ctx.li(31, (uint32_t)(uintptr_t)&g_pageTab[cpu][0]);
+
+// emitCommitExit / emitCommitExitDyn: choose the target stub
+static void emitJumpStub(Ctx& ctx, uint32_t* stub) {
+    if (!stub || ctx.rem() == 0) { ctx.overflow = true; return; }
+    ctx.E(ppc_b((int32_t)((intptr_t)stub - (intptr_t)ctx.cur)));
+}
+static void emitCommitExit(Ctx& ctx, uint32_t nextPC, int reason, bool chain = true) {
+    ctx.li(TE, nextPC);
+    ctx.E(ppc_addi(TF, 0, (int16_t)reason));
+    ctx.li(TG, ctx.cycles);
+    emitJumpStub(ctx, (chain && reason == EXIT_NORMAL) ? g_dispatchStub : g_exitStub);
+}
+
+jit_ppc.cpp — runCpu()/runJitNds() with budgets (sketch)
+
+static int32_t g_exitRemaining[2];
+
+// JitHelp_commit(): last parameter is now the remaining budget
+    g_exitRemaining[cpu] = (int32_t)cycles;
+
+// Runs this CPU for up to `budget` CPU cycles (chained blocks). Returns cycles consumed.
+static uint32_t runCpu(Core& core, int cpu, bool gba, uint32_t budget) {
+    Interpreter& interp = core.interpreter[cpu];
+    const bool arm7 = (cpu == 1) || gba;
+    if (!interp.isReady()) return (uint32_t)interpStep(interp, cpu);
+
+    const uint32_t pc = interp.getActualPC();
+    if (!validPC(pc, gba, arm7) || hleBiosAddr(interp, cpu, pc))
+        return (uint32_t)interpStep(interp, cpu);
+
+    const bool thumb = interp.isThumb();
+    uint32_t* code = lookupBlock(cpu, pc, thumb);
+    if (!code) code = compileBlock(&interp, &core, pc, thumb, arm7, cpu);
+    if (!code || code == g_fbSentinel) return (uint32_t)interpStep(interp, cpu);
+
+    g_exitReason[cpu] = EXIT_FALLBACK;
+    g_exitPC[cpu]     = pc;
+    g_budget          = budget ? budget : 1;
+    g_exitRequest     = 0;
+    g_nextBlock       = code;
+    executeBlock_asm(g_entryStub[cpu]);
+
+    uint32_t cyc = (uint32_t)((int32_t)g_budget - g_exitRemaining[cpu]);
+    if (g_exitReason[cpu] == EXIT_FALLBACK) {
+        const uint32_t expc = g_exitPC[cpu];
+        if (validPC(expc, gba, arm7)) { interp.setPC(expc); g_pipeDirty[cpu] = false; }
+        else ensurePipeline(interp, cpu);
+        cyc += (uint32_t)interp.jitRunOpcode();
+    }
+    return cyc ? cyc : 1;
+}
+
+// runJitNds(): budget = distance to the earlier of (next event, other CPU) in this CPU's cycles
+static inline uint32_t budgetFor(Core& core, int cpu, int shift) {
+    const uint32_t g     = core.globalCycles;
+    uint32_t limit = core.events.empty() ? g + 512 : core.events.front().cycles;
+    const int other = cpu ^ 1;
+    if (!core.interpreter[other].halted && (int32_t)(g_cpuTime[other] - limit) < 0)
+        limit = g_cpuTime[other];
+    int32_t d = (int32_t)(limit - g_cpuTime[cpu]);
+    return d > 0 ? ((uint32_t)d + (1u << shift) - 1) >> shift : 1;
+}
+//  ... in the loop:
+//  if (!a9.halted && (int32_t)(g - g_cpuTime[0]) >= 0) g_cpuTime[0] = g + (runCpu(core, 0, false, budgetFor(core, 0, 1)) << 1);
+//  if (!a7.halted && (int32_t)(g - g_cpuTime[1]) >= 0) g_cpuTime[1] = g + (runCpu(core, 1, false, budgetFor(core, 1, 2)) << 2);
+
+Two invariants to keep: (1) nothing that changes CPU mode or the register bank may be chained — that is already true because MSR-c, SWI, LDM^, SUBS pc and MRC/MCR fall back; (2) the dispatcher must never bctr into a slot whose page was just cleared — invalidateJitWrite only zeroes slots, never reuses code memory, so a stale in-flight block finishes and the next lookup misses. Full reuse only happens in flushJitCache, which runs from compileBlock (outside generated code).
+5 · Debug tooling & test plan
+
+Your [JIT] … FB print stops after 32 lines and tells you nothing about frequency. Two cheap additions make JIT bugs bisectable on real hardware without a debugger:
+jit_ppc.cpp — per-class kill switch + fallback histogram (dump every 600 frames or from a debug menu)
+
+// Bit mask of emitter classes that are allowed to compile. Flip bits from your frontend's debug
+// menu; when a game starts working after clearing a bit you have found the broken emitter.
+enum JitClass { JC_DP = 1, JC_LS = 2, JC_LSX = 4, JC_MUL = 8, JC_BLOCK = 16, JC_BRANCH = 32, JC_PSR = 64,
+                JC_T_ALU = 128, JC_T_MEM = 256, JC_T_STACK = 512, JC_T_BR = 1024 };
+uint32_t g_jitEnable = 0xFFFFFFFFu;
+#define JC_ON(c) ((g_jitEnable & (c)) != 0)
+// e.g. in dispARM():   case 2: case 3: return JC_ON(JC_LS) && emitLS(ctx, op, curPC);
+
+static uint32_t g_fbHist[2][256];        // [thumb][class key]
+static inline void noteFallback(bool thumb, uint32_t op) {
+    g_fbHist[thumb][thumb ? (op >> 8) & 0xFF : (op >> 20) & 0xFF]++;
+}
+void dumpFallbacks() {
+    for (int t = 0; t < 2; t++)
+        for (int k = 0; k < 256; k++)
+            if (g_fbHist[t][k] > 1000)
+                printf("[JIT] %s key %02X : %u fallbacks\n", t ? "thumb" : "arm", k, g_fbHist[t][k]);
+}
+    
 
 // jit_ppc.cpp — ARM → PPC JIT (Wii/Broadway)
 #include "jit_ppc.h"
