@@ -602,9 +602,9 @@ enum SchedTask {
 };
 
 struct SchedCallback {
-    void (*fn)(void* obj, int arg);  // trampoline function
-    void*  obj;                      // receiver object
-    int    arg;                      // channel / index (0 if unused)
+    void (*fn)(void* obj, int arg);  
+    void*  obj;                      
+    int    arg;                      
 
     SchedCallback() : fn(nullptr), obj(nullptr), arg(0) {}
 
@@ -1129,37 +1129,33 @@ extern "C" {
 #define JIT_INLINE_SWI 0
 #endif
 
-// Provided by the frontend (MEM2 heap). Cached MEM2 (0x9xxxxxxx) is executable on the Wii.
 extern void* Noods_MEM2_Alloc(size_t size);
 
-// Exported: 1 => some CPU has compiled code in this 4K page (pc < 0x10000000).
-// memory.cpp tests this before calling JitPpc::invalidateJitWrite().
 uint8_t g_jitCodePage[0x10000];
 
 static const int EXIT_NORMAL   = 0;
 static const int EXIT_FALLBACK = 1;
-static const int EXIT_SWI      = 2;   // only used when JIT_INLINE_SWI
+static const int EXIT_SWI      = 2;   
 
 static uint32_t g_exitPC[2]      = {};
 static uint32_t g_exitCycles[2]  = {};
 static int      g_exitReason[2]  = {};
-static bool     g_pipeDirty[2]   = {};     // interpreter pipeline stale after a JIT exit
-static bool     g_r15Calib[2][2] = {};     // [cpu][thumb] : r15 offset learned from setPC()
+static bool     g_pipeDirty[2]   = {};     
+static bool     g_r15Calib[2][2] = {};     
 static uint32_t g_r15Off[2][2]   = {};
-static uint32_t g_cpuTime[2]     = {};     // per-CPU timeline in globalCycles units
-static uint32_t* volatile g_nextBlock = nullptr;   // read by the entry stub
+static uint32_t g_cpuTime[2]     = {};     
+static uint32_t* volatile g_nextBlock = nullptr;   
 
-// Frame (256 B). LR at FRAME_SIZE+4 (EABI).
 static const int FRAME_SIZE    = 256;
 static const int FRAME_LR_OFF  = FRAME_SIZE + 4;
-static const int FRAME_SAVE    = 16;   // r14..r31
+static const int FRAME_SAVE    = 16;   
 static const int FRAME_CORE    = 88;
 static const int FRAME_INTERP  = 92;
 static const int FRAME_CPUIDX  = 96;
 static const int FRAME_SCR0    = 100;
 static const int FRAME_SCR1    = 104;
 static const int FRAME_SCR2    = 108;
-static const int FRAME_REGSYNC = 112;  // r0..r14
+static const int FRAME_REGSYNC = 112;  
 static const int FRAME_CPSR    = 172;
 static const int FRAME_PC      = 176;
 
@@ -1169,15 +1165,12 @@ static_assert(FRAME_REGSYNC + 15 * 4 <= FRAME_CPSR, "regsync");
 
 namespace JitPpc {
 
-// ========================= Debug tooling (section 5) =========================
-// Bit mask of emitter classes that are allowed to compile. Flip bits from the frontend's debug
-// menu; when a game starts working after clearing a bit you have found the broken emitter.
 enum JitClass { JC_DP = 1, JC_LS = 2, JC_LSX = 4, JC_MUL = 8, JC_BLOCK = 16, JC_BRANCH = 32, JC_PSR = 64,
                 JC_T_ALU = 128, JC_T_MEM = 256, JC_T_STACK = 512, JC_T_BR = 1024 };
 uint32_t g_jitEnable = 0xFFFFFFFFu;
 #define JC_ON(c) ((g_jitEnable & (c)) != 0)
 
-static uint32_t g_fbHist[2][256];        // [thumb][class key]
+static uint32_t g_fbHist[2][256];        
 static inline void noteFallback(bool thumb, uint32_t op) {
     g_fbHist[thumb][thumb ? (op >> 8) & 0xFF : (op >> 20) & 0xFF]++;
 }
@@ -1188,7 +1181,6 @@ void dumpFallbacks() {
                 printf("[JIT] %s key %02X : %u fallbacks\n", t ? "thumb" : "arm", k, g_fbHist[t][k]);
 }
 
-// ========================= PPC encoders =========================
 static inline uint32_t ppc_blr() { return 0x4E800020u; }
 static inline uint32_t ppc_bctr(bool lk = false) {
     return (19u << 26) | (20u << 21) | (528u << 1) | (lk ? 1u : 0u);
@@ -1225,7 +1217,7 @@ static inline uint32_t ppc_cmpi(uint8_t cr, uint8_t ra, int16_t i) {
     return (11u << 26) | ((cr & 7u) << 23) | ((uint32_t)ra << 16) | (uint16_t)i;
 }
 static inline uint32_t ppc_cmpli(uint8_t cr, uint8_t ra, uint16_t i) {
-    return (10u << 26) | ((cr & 7u) << 23) | ((uint32_t)ra << 16) | i;          // cmplwi
+    return (10u << 26) | ((cr & 7u) << 23) | ((uint32_t)ra << 16) | i;          
 }
 static inline uint32_t ppc_subfic(uint8_t rt, uint8_t ra, int16_t i) {
     return (8u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)i;
@@ -1292,11 +1284,11 @@ static inline uint32_t ppc_mfxer(uint8_t t) { return ppc_mfspr(t, 1); }
 static inline uint32_t ppc_mfcr (uint8_t t) {
     return (31u << 26) | ((uint32_t)t << 21) | (19u << 1);
 }
-// mtcrf FXM,RS  (XFX form, XO=144). FXM bit 7 (0x80) selects CR0.
+
 static inline uint32_t ppc_mtcrf(uint8_t fxm, uint8_t rs) {
     return (31u << 26) | ((uint32_t)rs << 21) | ((uint32_t)fxm << 12) | (144u << 1);
 }
-// CR-logical ops (XL form)
+
 static inline uint32_t ppc_crop(uint32_t xo, uint8_t bt, uint8_t ba, uint8_t bb) {
     return (19u << 26) | ((uint32_t)bt << 21) | ((uint32_t)ba << 16) | ((uint32_t)bb << 11) | (xo << 1);
 }
@@ -1318,27 +1310,26 @@ static int emit_li32(uint32_t* out, uint8_t rt, uint32_t v) {
     return 2;
 }
 
-// r14-r28 = ARM r0-r14, r29 = CPSR; temps r3-r10; r11 = call; r12 = flag scratch
 static const uint8_t RA[15] = {14,15,16,17,18,19,20,21,22,23,24,25,26,27,28};
 static const uint8_t RCPSR = 29;
 static const uint8_t TA = 3, TB = 4, TC = 5, TD = 6, TE = 7, TF = 8, TG = 9;
-static const uint8_t TH = 10;   // result temp for TST/TEQ/CMP/CMN/ALU-pc (never the shifter carry)
-static const uint8_t TX = 12;   // scratch for flag code ONLY – never holds an operand
+static const uint8_t TH = 10;   
+static const uint8_t TX = 12;   
 static const uint8_t RCALL = 11;
 
 static const size_t JIT_BYTES_MEM2   = 16u * 1024u * 1024u;
-static const size_t JIT_BYTES_MEM1   = 2u * 1024u * 1024u;      // fallback if MEM2 is exhausted
-static const size_t PAGE_SLOTS       = 2048;                    // (pc & 0xFFF) >> 1
-static const size_t PAGE_ARENA_BYTES = 2u * 1024u * 1024u;      // 256 slot arrays
+static const size_t JIT_BYTES_MEM1   = 2u * 1024u * 1024u;      
+static const size_t PAGE_SLOTS       = 2048;                    
+static const size_t PAGE_ARENA_BYTES = 2u * 1024u * 1024u;      
 static const size_t PAGE_ARENA_CNT   = PAGE_ARENA_BYTES / (PAGE_SLOTS * 4);
-static const size_t STUB_WORDS       = 512;                     // reserved at buffer start
-static const size_t TOP_PAGES        = 0x10010;                 // pc < 0x10000000, + 16 BIOS pages
+static const size_t STUB_WORDS       = 512;                     
+static const size_t TOP_PAGES        = 0x10010;                 
 
 static const size_t BLK_ARMS   = 48;
 static const size_t BLK_WDS    = 4096;
-static const size_t BLK_MARGIN = 192;   // largest single emitter + exit
+static const size_t BLK_MARGIN = 192;   
 
-static void*     g_arena     = nullptr;   // raw allocation (code + page arena), never freed
+static void*     g_arena     = nullptr;   
 static size_t    g_arenaBytes= 0;
 static uint32_t* codeBuf     = nullptr;
 static size_t    g_jitWords  = 0;
@@ -1354,10 +1345,8 @@ static size_t    g_pageUsed  = 0;
 static uint32_t* g_pageTab[2][TOP_PAGES];
 static uint32_t  g_livePages[PAGE_ARENA_CNT];
 static size_t    g_nLive     = 0;
-static uint64_t  g_pageCover[PAGE_ARENA_CNT];   // bit c set => bytes [c*64, c*64+64) of that page hold compiled code
+static uint64_t  g_pageCover[PAGE_ARENA_CNT];   
 
-// A block whose first instruction is not JIT-able maps to this sentinel:
-// the runner steps the interpreter directly without entering generated code.
 static uint32_t  g_fbSentinel[4] __attribute__((aligned(16)));
 
 static inline int32_t pageIndex(uint32_t pc) {
@@ -1395,7 +1384,6 @@ static uint32_t* lookupBlock(int cpu, uint32_t pc, bool thumb) {
     return (uint32_t*)(uintptr_t)(e & ~1u);
 }
 
-// Returns (allocating on first use) the slot array for pc's page. May flush the cache.
 static uint32_t* getPage(int cpu, uint32_t pc) {
     int32_t pi = pageIndex(pc);
     if (pi < 0 || !g_pageArena) return nullptr;
@@ -1410,7 +1398,6 @@ static uint32_t* getPage(int cpu, uint32_t pc) {
     return pg;
 }
 
-// Record that [startPC, endPC) of pg's page now holds compiled code.
 static void markCover(uint32_t* pg, uint32_t startPC, uint32_t endPC) {
     size_t   k  = pageSlotIdx(pg);
     unsigned c0 = (startPC & 0xFFFu) >> 6, c1 = ((endPC - 1) & 0xFFFu) >> 6;
@@ -1418,13 +1405,11 @@ static void markCover(uint32_t* pg, uint32_t startPC, uint32_t endPC) {
     if (startPC < 0x10000000u) g_jitCodePage[startPC >> 12] = 1;
 }
 
-// One guest write of `size` bytes at `addr`. O(1). Safe to call from inside a running block:
-// slots are only zeroed, code memory is never reused here.
 void invalidateJitWrite(uint32_t addr, uint32_t size) {
     int32_t pi = pageIndex(addr);
     if (pi < 0 || size == 0) return;
     uint32_t last = addr + size - 1;
-    if ((last ^ addr) & ~0xFFFu) last = addr | 0xFFFu;        // clip to this page
+    if ((last ^ addr) & ~0xFFFu) last = addr | 0xFFFu;
     unsigned c0 = (addr & 0xFFFu) >> 6, c1 = (last & 0xFFFu) >> 6;
     uint64_t m = 0;
     for (unsigned c = c0; c <= c1; c++) m |= 1ull << c;
@@ -1445,7 +1430,7 @@ struct Ctx {
     size_t cap;
     bool thumb, arm7, done, overflow;
     uint32_t blockPC;
-    uint32_t cycles;          // estimated cycles from block start to the current point
+    uint32_t cycles;
     int cpuIdx;
     Interpreter* interp;
     Core* core;
@@ -1463,7 +1448,7 @@ struct Ctx {
         for (int i = 0; i < n; i++) E(t[i]);
     }
 
-    void call(void* fn) {              // any 32-bit address (helpers live in MEM1, code in MEM2)
+    void call(void* fn) { 
         li(RCALL, (uint32_t)(uintptr_t)fn);
         E(ppc_mtctr(RCALL));
         E(ppc_bctr(true));
@@ -1474,12 +1459,8 @@ struct Ctx {
     void ldCpu()    { E(ppc_lwz(TB, FRAME_CPUIDX, 1)); }
 };
 
-// ========================= C helpers =========================
 extern "C" {
 
-// Commit r0-r14 + CPSR. r15 is set to what setPC(pc) would produce (learned once per
-// CPU/mode from setPC itself), but the pipeline is NOT refilled: the next thing to run is
-// almost always another block. The runner refills lazily before any interpreter step.
 int JitHelp_commit(Interpreter* interp, int cpu,
                    uint32_t* regs, uint32_t cpsr,
                    uint32_t pc, int reason, uint32_t cycles) {
@@ -1487,13 +1468,13 @@ int JitHelp_commit(Interpreter* interp, int cpu,
     for (int i = 0; i < 15; i++) *p[i] = regs[i];
     interp->getCpsrRef() = cpsr;
 
-    const int m = (cpsr >> 5) & 1;            // T bit
+    const int m = (cpsr >> 5) & 1;
     pc &= m ? ~1u : ~3u;
 
     if (g_r15Calib[cpu][m]) {
         *p[15] = pc + g_r15Off[cpu][m];
         g_pipeDirty[cpu] = true;
-    } else {                                  // first exit in this mode: learn the offset
+    } else {
         interp->setPC(pc);
         g_r15Off[cpu][m]   = *p[15] - pc;
         g_r15Calib[cpu][m] = true;
@@ -1509,14 +1490,13 @@ int JitHelp_commit(Interpreter* interp, int cpu,
 uint32_t JitHelp_r32(Core* c, int a, uint32_t ad) {
     return c->memory.read<uint32_t>((bool)a, ad);
 }
-// Single-word LDR: ARM rotates an unaligned word load by (addr & 3) * 8.
+
 uint32_t JitHelp_ldr32(Core* c, int a, uint32_t ad) {
     uint32_t v = c->memory.read<uint32_t>((bool)a, ad);
     if (ad & 3u) { unsigned sh = (ad & 3u) * 8u; v = (v >> sh) | (v << (32u - sh)); }
     return v;
 }
-// Sub-word helpers are word-sized on purpose: the PPC ABI expects the *caller* to truncate
-// char/short arguments, and generated code passes the untruncated guest register.
+
 uint32_t JitHelp_r16(Core* c, int a, uint32_t ad) { return c->memory.read<uint16_t>((bool)a, ad); }
 uint32_t JitHelp_r8 (Core* c, int a, uint32_t ad) { return c->memory.read<uint8_t >((bool)a, ad); }
 void JitHelp_w32(Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint32_t>((bool)a, ad, v); }
@@ -1556,10 +1536,10 @@ int JitHelp_armBlock(Core* core, int arm7, uint32_t op,
             uint32_t val = core->memory.read<uint32_t>((bool)arm7, addr);
             addr += 4;
             if (i == 15) {
-                if (!arm7 && (val & 1u)) {              // ARM9 interworks
+                if (!arm7 && (val & 1u)) { 
                     *cpsrInOut |= 1u << 5;
                     *pcOut = val & ~1u;
-                } else {                                // ARM7 (ARMv4T) stays ARM
+                } else {
                     *pcOut = val & ~3u;
                 }
                 wrotePC = 1;
@@ -1672,13 +1652,10 @@ void JitHelp_tick(Core* core, uint32_t cycles) {
     }
 }
 
-} // extern "C"
-
-// Core::resetCycles() subtracts globalCycles from every timeline; the JIT's private
-// per-CPU timelines must follow or the runner jumps ~32 s forward after the first rebase.
+}
 void rebaseCycles(uint32_t g) { g_cpuTime[0] -= g; g_cpuTime[1] -= g; }
 
-static uint32_t armCycles(uint32_t op);   // fwd (used by emitBlockXfer's fallback path)
+static uint32_t armCycles(uint32_t op);
 
 static void emitEpilogue(Ctx& ctx) {
     for (int r = 14; r <= 31; r++)
@@ -1703,10 +1680,10 @@ static void emitReload(Ctx& ctx) {
 
 static void emitExitStubBody(Ctx& ctx) {
     emitSpill(ctx);
-    ctx.ldInterp();                                  // r3
-    ctx.ldCpu();                                     // r4
-    ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_REGSYNC));  // r5
-    ctx.E(ppc_mr(TD, RCPSR));                        // r6  (r7,r8,r9 already set)
+    ctx.ldInterp();
+    ctx.ldCpu();
+    ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_REGSYNC)); 
+    ctx.E(ppc_mr(TD, RCPSR)); 
     ctx.call((void*)JitHelp_commit);
     emitEpilogue(ctx);
 }
@@ -1733,14 +1710,12 @@ static void emitCommitExitDyn(Ctx& ctx, int reason) {
 
 static void patchBc(Ctx& ctx, size_t idx, uint8_t bo, uint8_t bi);
 
-// If the store we just performed halted this CPU (HALTCNT / IME / IE write), commit state
-// with PC = next instruction and leave the block instead of running past the halt.
 static void emitHaltCheck(Ctx& ctx, uint32_t nextPC) {
-    ctx.li(TA, (uint32_t)(uintptr_t)&ctx.interp->halted);   // uint8_t, public
+    ctx.li(TA, (uint32_t)(uintptr_t)&ctx.interp->halted); 
     ctx.E(ppc_lbz(TA, 0, TA));
     ctx.E(ppc_cmpi(0, TA, 0));
     size_t b = ctx.sz();
-    ctx.E(ppc_bc(12, 2, 0));                                  // beq continue
+    ctx.E(ppc_bc(12, 2, 0));
     emitCommitExit(ctx, nextPC, EXIT_NORMAL);
     patchBc(ctx, b, 12, 2);
 }
@@ -1782,7 +1757,6 @@ static bool ensureEntryStub(int cpu, Interpreter* interp, Core* core) {
     ctx.li(TA, (uint32_t)(uintptr_t)interp); ctx.E(ppc_stw(TA, FRAME_INTERP, 1));
     ctx.E(ppc_addi(TA, 0, (int16_t)cpu));    ctx.E(ppc_stw(TA, FRAME_CPUIDX, 1));
 
-    // Inline sync: registers[] is an array of pointers (banked per mode) -> load ptr, then value.
     ctx.li(TB, (uint32_t)(uintptr_t)regs);
     for (int i = 0; i < 15; i++) {
         ctx.E(ppc_lwz(TA, (int16_t)(i * 4), TB));
