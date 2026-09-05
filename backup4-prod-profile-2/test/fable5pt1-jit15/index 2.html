@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NooDS-Wii ARM→PPC JIT — Audit &amp; Fix Plan</title>
+<script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+<style>
+  html { scroll-behavior: smooth; }
+  body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  pre, code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
+  pre { tab-size: 4; }
+  .code-wrap pre { font-size: 12.5px; line-height: 1.5; }
+  .nav-active { color: #fbbf24; }
+  h2 { scroll-margin-top: 1.5rem; }
+  h3 { scroll-margin-top: 1.5rem; }
+  .prose-p { color: #cbd5e1; line-height: 1.7; }
+  .kbd { border: 1px solid #334155; border-bottom-width: 2px; border-radius: 4px; padding: 0 5px; font-size: 11px; }
+</style>
+</head>
+<body class="bg-slate-950 text-slate-200 antialiased">
+
+<div class="flex min-h-screen">
+
+  <!-- Sidebar -->
+  <aside class="hidden lg:block w-72 shrink-0 border-r border-slate-800 bg-slate-950/90 sticky top-0 h-screen overflow-y-auto">
+    <div class="p-6">
+      <div class="text-xs uppercase tracking-widest text-slate-500 mb-1">Audit report</div>
+      <div class="font-semibold text-slate-100 leading-tight">ARM7/ARM9 → Broadway JIT</div>
+      <div class="text-xs text-slate-500 mt-1">jit_ppc.cpp · core.cpp · trampoline</div>
+    </div>
+    <nav id="nav" class="px-3 pb-8 text-sm space-y-0.5">
+      <a href="#triage" class="block px-3 py-1.5 rounded hover:bg-slate-800/60">0 · Triage</a>
+      <a href="#boot" class="block px-3 py-1.5 rounded hover:bg-slate-800/60">1 · Why nothing boots</a>
+      <a href="#s11" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">1.1 Thumb dispatcher</a>
+      <a href="#s12" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">1.2 validPC ranges</a>
+      <a href="#correct" class="block px-3 py-1.5 rounded hover:bg-slate-800/60">2 · Correctness fixes</a>
+      <a href="#s21" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">2.1 MRS/MSR masks</a>
+      <a href="#s22" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">2.2 LDR writeback Rd==Rn</a>
+      <a href="#s23" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">2.3 Helper arg widths</a>
+      <a href="#s24" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">2.4 RESET_CYCLES rebase</a>
+      <a href="#s25" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">2.5 XER[CA] clobber</a>
+      <a href="#s26" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">2.6 Halt inside a block</a>
+      <a href="#s27" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">2.7 Smaller items</a>
+      <a href="#perf" class="block px-3 py-1.5 rounded hover:bg-slate-800/60">3 · Why it's slow</a>
+      <a href="#s31" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">3.1 Code cache in MEM2</a>
+      <a href="#s32" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">3.2 O(1) invalidation</a>
+      <a href="#s33" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">3.3 Thumb shift-by-reg</a>
+      <a href="#s34" class="block pl-7 pr-3 py-1 rounded hover:bg-slate-800/60 text-slate-400">3.4 Per-block overhead</a>
+      <a href="#chain" class="block px-3 py-1.5 rounded hover:bg-slate-800/60">4 · Block chaining (phase 2)</a>
+      <a href="#debug" class="block px-3 py-1.5 rounded hover:bg-slate-800/60">5 · Debug tooling &amp; test plan</a>
+      <a href="#checklist" class="block px-3 py-1.5 rounded hover:bg-slate-800/60">6 · Checklist</a>
+    </nav>
+  </aside>
+
+  <!-- Main -->
+  <main class="flex-1 min-w-0">
+    <div class="max-w-5xl mx-auto px-6 py-10 lg:px-12">
+
+      <header class="mb-12">
+        <div class="inline-flex items-center gap-2 text-xs font-medium text-amber-300 bg-amber-400/10 border border-amber-400/20 rounded-full px-3 py-1 mb-4">
+          <span class="w-1.5 h-1.5 rounded-full bg-amber-300"></span> Code review · dynamic recompiler
+        </div>
+        <h1 class="text-3xl md:text-4xl font-bold text-slate-50 tracking-tight">NooDS-Wii ARM → PowerPC JIT<br><span class="text-slate-400 font-medium">audit, root causes and drop-in fixes</span></h1>
+        <p class="prose-p mt-5 max-w-3xl">
+          I read <code class="text-amber-200">jit_ppc.cpp</code>, <code class="text-amber-200">core.cpp</code>, the trampoline and the interpreter header
+          instruction-by-instruction (encoders, flag maths, frame layout, dispatchers, runner). The good news: the PPC encoders, condition-code mapping,
+          N/Z/C/V generation, shifter carry logic and the ABI/frame handling are all correct. The bad news: two small bugs make almost every Thumb
+          instruction miscompile and force the whole ARM7 into the interpreter, which by itself explains "most games don't boot, the rest are slow".
+        </p>
+        <div class="mt-6 grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
+          <div class="rounded-lg border border-red-500/30 bg-red-500/10 p-3"><div class="text-2xl font-bold text-red-300">2</div><div class="text-red-200/80">boot-blockers</div></div>
+          <div class="rounded-lg border border-orange-500/30 bg-orange-500/10 p-3"><div class="text-2xl font-bold text-orange-300">7</div><div class="text-orange-200/80">correctness bugs</div></div>
+          <div class="rounded-lg border border-sky-500/30 bg-sky-500/10 p-3"><div class="text-2xl font-bold text-sky-300">5</div><div class="text-sky-200/80">perf issues</div></div>
+          <div class="rounded-lg border border-emerald-500/30 bg-emerald-500/10 p-3"><div class="text-2xl font-bold text-emerald-300">✓</div><div class="text-emerald-200/80">flags / encoders OK</div></div>
+        </div>
+      </header>
+
+      <!-- ============ 0 TRIAGE ============ -->
+      <section id="triage" class="mb-16">
+        <h2 class="text-2xl font-semibold text-slate-50 mb-4">0 · Triage</h2>
+        <p class="prose-p mb-5">Ordered by impact. Fix the S0 items first — everything else is noise until Thumb code executes correctly.</p>
+        <div class="overflow-x-auto rounded-xl border border-slate-800">
+          <table class="w-full text-sm">
+            <thead class="bg-slate-900 text-slate-400 text-left text-xs uppercase tracking-wider">
+              <tr><th class="px-4 py-3 w-10">#</th><th class="px-4 py-3 w-16">Sev</th><th class="px-4 py-3">Where</th><th class="px-4 py-3">What breaks</th></tr>
+            </thead>
+            <tbody class="divide-y divide-slate-800/80" id="triageBody">
+              <tr><td class="px-4 py-3 text-slate-500">1</td><td class="px-4 py-3"><span class="sev s0">S0</span></td><td class="px-4 py-3 mono text-amber-200">dispThumb()</td><td class="px-4 py-3">Case labels off by one nibble for h=1..4. ASR, ADD/SUB reg, MOV/CMP/ADD/SUB imm8, all ALU ops, hi-reg ops, BX and LDR-literal are routed to the wrong emitter → garbage code for nearly all Thumb. <a href="#s11" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">2</td><td class="px-4 py-3"><span class="sev s0">S0</span></td><td class="px-4 py-3 mono text-amber-200">validPC()</td><td class="px-4 py-3">ARM7 IWRAM lives at 0x03800000–0x0380FFFF; the check stops at 0x03800000. ITCM mirror 0x01FF8000 (libnds) also rejected. ARM7 runs 100% through <code>interpStep</code>. <a href="#s12" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">3</td><td class="px-4 py-3"><span class="sev s1">S1</span></td><td class="px-4 py-3 mono text-amber-200">emitMrsMsr()</td><td class="px-4 py-3">Masks 0x0FBF0FFF / 0x0DB0FFF0 leave bit 22 (R = SPSR) as don't-care → <code>MRS Rd,SPSR</code> / <code>MSR SPSR_f</code> read/write CPSR. Corrupts IRQ handlers. <a href="#s21" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">4</td><td class="px-4 py-3"><span class="sev s1">S1</span></td><td class="px-4 py-3 mono text-amber-200">emitLS() / emitLSExtra()</td><td class="px-4 py-3"><code>LDR Rn,[Rn],#x</code> — post-index writeback overwrites the loaded value; <code>STR Rn,[Rn,#x]!</code> skips writeback. <a href="#s22" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">5</td><td class="px-4 py-3"><span class="sev s1">S1</span></td><td class="px-4 py-3 mono text-amber-200">JitHelp_w8/w16/r8/r16</td><td class="px-4 py-3">SysV-PPC expects the <em>caller</em> to extend sub-word args; the JIT passes full 32-bit regs → I/O handlers can see garbage in high bits. <a href="#s23" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">6</td><td class="px-4 py-3"><span class="sev s1">S1</span></td><td class="px-4 py-3 mono text-amber-200">g_cpuTime / Core::resetCycles</td><td class="px-4 py-3">Per-CPU timelines never rebased when RESET_CYCLES fires (every 0x7FFFFFFF ≈ 32 s) → a 32-second time warp / stall. <a href="#s24" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">7</td><td class="px-4 py-3"><span class="sev s2">S2</span></td><td class="px-4 py-3 mono text-amber-200">emitShifter() ROR Rs</td><td class="px-4 py-3"><code>subfic</code> writes XER[CA] after ADC/SBC/RSC have loaded the carry into XER. <a href="#s25" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">8</td><td class="px-4 py-3"><span class="sev s2">S2</span></td><td class="px-4 py-3 mono text-amber-200">stores → halt()</td><td class="px-4 py-3">A store to HALTCNT/IME inside a block doesn't stop the block; up to ~47 more guest instructions execute before the halt is honoured. <a href="#s26" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">9</td><td class="px-4 py-3"><span class="sev s2">S2</span></td><td class="px-4 py-3 mono text-amber-200">interpStep(), updateRun()</td><td class="px-4 py-3">Interpreter steps charge a flat 2 cycles; DSi mode uses the NDS 2×/4× scaling; MSR-imm never reaches its emitter. <a href="#s27" class="text-amber-300 underline decoration-dotted">notes</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">10</td><td class="px-4 py-3"><span class="sev p">PERF</span></td><td class="px-4 py-3 mono text-amber-200">allocArena()</td><td class="px-4 py-3"><code>raw</code> is never allocated from MEM2 → always the 2 MB MEM1 fallback → <code>flushJitCache()</code> storms. <a href="#s31" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">11</td><td class="px-4 py-3"><span class="sev p">PERF</span></td><td class="px-4 py-3 mono text-amber-200">invalidateJitRange()</td><td class="px-4 py-3">Linear scan of all live pages on <em>every</em> guest write, then an 8 KB memset of the whole page. Data and code share 4 K pages in IWRAM → invalidation/recompile death spiral. <a href="#s32" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">12</td><td class="px-4 py-3"><span class="sev p">PERF</span></td><td class="px-4 py-3 mono text-amber-200">emitT_alu() 2/3/4/7</td><td class="px-4 py-3">LSL/LSR/ASR/ROR by register fall back → block split + interpreter step for one of the most common Thumb ops. <a href="#s33" class="text-amber-300 underline decoration-dotted">fix</a></td></tr>
+              <tr><td class="px-4 py-3 text-slate-500">13</td><td class="px-4 py-3"><span class="sev p">PERF</span></td><td class="px-4 py-3 mono text-amber-200">runCpu() / stubs</td><td class="px-4 py-3">No block chaining: ~150 PPC instructions + two C calls + a page lookup per (often 4-instruction) block. <a href="#chain" class="text-amber-300 underline decoration-dotted">design</a></td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ============ 1 BOOT ============ -->
+      <section id="boot" class="mb-16">
+        <h2 class="text-2xl font-semibold text-slate-50 mb-2">1 · Why nothing boots</h2>
+
+        <h3 id="s11" class="text-lg font-semibold text-slate-100 mt-8 mb-3 flex items-center gap-2"><span class="sev s0">S0</span> 1.1 The Thumb dispatcher is shifted by one nibble</h3>
+        <p class="prose-p mb-3">
+          Thumb formats by the top nibble <code>h = op &gt;&gt; 12</code>: <span class="mono text-slate-300">0,1</span> = shifts/add-sub (format 1/2),
+          <span class="mono text-slate-300">2,3</span> = MOV/CMP/ADD/SUB imm8 (format 3), <span class="mono text-slate-300">4</span> = ALU / hi-reg+BX / LDR literal (formats 4–6),
+          <span class="mono text-slate-300">5</span> = register-offset loads/stores (formats 7/8). Your switch has
+          <code>case 0x1 → emitT_imm8</code>, <code>case 0x2 → ALU/hiReg/ldrPc</code>, <code>case 0x3,0x4 → emitT_memReg</code>.
+          The emitters themselves decode correctly for the format they were written for — only the routing is wrong. Symptoms you would see:
+          <code>ASR</code> becomes <code>ADD Rd,#imm8</code>; <code>MOV r0,#0</code> becomes <code>AND r0,r0</code>; <code>CMP r0,#x</code> becomes an <code>LDR</code> from the literal pool;
+          every <code>BX lr</code> becomes a store. The <code>thumbCycles()</code> table has the same shift.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — replace dispThumb() and thumbCycles()">
+static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    switch ((op >> 12) & 0xF) {
+        case 0x0: case 0x1:                              // 000 op imm5 Rs Rd  |  00011 I op Rn/imm3 Rs Rd
+            if (((op >> 11) & 3) < 3) return emitT_shifts(ctx, op);   // LSL / LSR / ASR #imm
+            return emitT_addSub3(ctx, op);                            // ADD / SUB Rd, Rs, Rn|#imm3
+        case 0x2: case 0x3:                              // 001 op Rd imm8 : MOV / CMP / ADD / SUB
+            return emitT_imm8(ctx, op);
+        case 0x4: {                                      // 0100 00 = ALU, 0100 01 = hi-reg/BX, 0100 1x = LDR literal
+            uint8_t b = (op >> 10) & 3;
+            if (b == 0) return emitT_alu(ctx, op);
+            if (b == 1) return emitT_hiReg(ctx, op, curPC);
+            return emitT_ldrPc(ctx, op, curPC);
+        }
+        case 0x5:                                        // 0101 : LDR/STR{B,H,SB,SH} Rd,[Rb,Ro]
+            return emitT_memReg(ctx, op);
+        case 0x6: case 0x7: case 0x8:                    // 011 B L imm5 | 1000 L imm5 : imm offset
+            return emitT_memImm(ctx, op);
+        case 0x9:  return emitT_spLoad(ctx, op, curPC);  // 1001 : SP-relative
+        case 0xA:  return emitT_addSpPc(ctx, op, curPC); // 1010 : ADD Rd, PC/SP, #imm
+        case 0xB:                                        // 1011 : ADD SP / PUSH / POP
+            if (((op >> 8) & 0xF) == 0) return emitT_addSpPc(ctx, op, curPC);
+            if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6) return emitT_pushPop(ctx, op, curPC);
+            return false;                                // BKPT, SETEND, CPS... -> interpreter
+        case 0xC:  return emitT_ldmStm(ctx, op);         // 1100 : LDMIA/STMIA
+        case 0xD: case 0xE: return emitT_branch(ctx, op, curPC);
+        default:   return false;                         // 0xF : BL halves are paired in compileBlock
+    }
+}
+
+static uint32_t thumbCycles(uint16_t op) {
+    uint8_t h = (op >> 12) & 0xF;
+    if ((h >= 5 && h <= 9) || (h == 4 && ((op >> 11) & 1))) return 2;   // loads/stores (+ LDR literal)
+    if (h == 0xB && (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6))
+        return 1u + (uint32_t)__builtin_popcount(op & 0x1FFu);
+    if (h == 0xC) return 1u + (uint32_t)__builtin_popcount(op & 0xFFu);
+    return 1;
+}
+        </script>
+        <div class="mt-3 rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-4 text-sm text-emerald-100/90">
+          <strong>Verified against the emitters:</strong> <code>emitT_shifts</code> reads <code>ty=(op&gt;&gt;11)&amp;3</code> (0..2 with h=0/1),
+          <code>emitT_imm8</code> reads <code>ty=(op&gt;&gt;11)&amp;3</code> (MOV/CMP/ADD/SUB with h=2/3), <code>emitT_alu</code> reads <code>(op&gt;&gt;6)&amp;0xF</code> and
+          <code>emitT_hiReg</code> reads <code>(op&gt;&gt;8)&amp;3 / H1 / H2</code> — all consistent with the corrected routing above. Nothing in the emitters needs to change for this fix.
+        </div>
+
+        <h3 id="s12" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev s0">S0</span> 1.2 <code>validPC()</code> excludes the memory the ARM7 actually executes from</h3>
+        <p class="prose-p mb-3">
+          NDS memory map: shared WRAM is 0x03000000–0x037FFFFF (from the ARM7's view), <strong>ARM7 IWRAM is 0x03800000–0x0380FFFF</strong> (mirrored to 0x03FFFFFF).
+          Almost every commercial ARM7 binary and every libnds ARM7 binary executes from IWRAM, and your range check is <code>pc &lt; 0x03800000</code>.
+          Every ARM7 instruction therefore goes through <code>runCpu → interpStep</code> (pipeline refill check + <code>jitRunOpcode</code> + fixed 2-cycle charge).
+          On the ARM9 side, libnds links ITCM code to 0x01FF8000 (a mirror of 0x00000000), also rejected. The function also needs to know which CPU it is checking.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — validPC() with a cpu parameter (update the 4 call sites: runCpu ×2, compileBlock ×2)">
+// arm7 == true for the NDS ARM7 and for GBA mode (both run on interpreter[1]).
+static bool validPC(uint32_t pc, bool gba, bool arm7) {
+    pc &= ~1u;
+    if (gba) {
+        return (pc < 0x4000u) ||                               // BIOS
+               (pc >= 0x02000000u && pc < 0x02040000u) ||      // EWRAM
+               (pc >= 0x03000000u && pc < 0x03008000u) ||      // IWRAM
+               (pc >= 0x06000000u && pc < 0x06018000u) ||      // VRAM (rare)
+               (pc >= 0x08000000u && pc < 0x0E000000u);        // ROM + mirrors
+    }
+    if (arm7) {
+        return (pc < 0x4000u) ||                               // ARM7 BIOS
+               (pc >= 0x02000000u && pc < 0x02400000u) ||      // main RAM
+               (pc >= 0x03000000u && pc < 0x04000000u);        // shared WRAM + IWRAM @ 0x03800000 (+ mirrors)
+    }
+    return (pc < 0x02000000u) ||                               // ITCM, 32 KB mirrored (libnds: 0x01FF8000)
+           (pc >= 0x02000000u && pc < 0x02400000u) ||          // main RAM  (use 0x03000000 in dsiMode)
+           (pc >= 0x03000000u && pc < 0x04000000u) ||          // shared WRAM (ARM9 view, mirrored)
+           (pc >= 0xFFFF0000u);                                // ARM9 BIOS
+}
+        </script>
+        <p class="prose-p mt-3 text-sm">
+          <strong>Mirror caveat:</strong> blocks are keyed by the alias the CPU executes from. If a game writes code through one alias (e.g. 0x03810000) and runs it through another
+          (0x03800000) invalidation misses. If you ever see that, canonicalise in one place — <code>canonPC()</code> = <code>0x03800000|(pc&amp;0xFFFF)</code> for IWRAM, <code>pc&amp;0x7FFF</code> for ITCM — and use it for both
+          <code>pageIndex()</code> and <code>invalidateJitWrite()</code>. Not needed to boot.
+        </p>
+      </section>
+
+      <!-- ============ 2 CORRECTNESS ============ -->
+      <section id="correct" class="mb-16">
+        <h2 class="text-2xl font-semibold text-slate-50 mb-2">2 · Correctness fixes</h2>
+
+        <h3 id="s21" class="text-lg font-semibold text-slate-100 mt-8 mb-3 flex items-center gap-2"><span class="sev s1">S1</span> 2.1 MRS/MSR masks let SPSR forms through as CPSR</h3>
+        <p class="prose-p mb-3">
+          <code>0x0FBF0FFF</code> has bits 23..20 = <code>1011</code>: bit 22 is not tested. Bit 22 is the <em>R</em> bit (0 = CPSR, 1 = SPSR). So <code>MRS r0, SPSR</code> (0x014F0000)
+          compiles to "copy CPSR" and <code>MSR SPSR_f, r0</code> (0x0168F000) compiles to "write CPSR flags". Both are used by IRQ wrappers (nested-IRQ save/restore) — after the first
+          interrupt the flags/mode state of the interrupted code is trashed. Same fix for the immediate form, which today never even reaches <code>emitMrsMsr</code> because it has
+          <code>it == 1</code> and goes to <code>emitDP</code> (harmless fallback, but wasted).
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — emitMrsMsr() masks + routing of MSR #imm from dispARM()">
+// --- emitMrsMsr(): require R == 0 (bit 22) in every pattern ---
+    // MRS Rd, CPSR            cond 0001 0 0 00 1111 Rd 0000 0000 0000
+    if ((op & 0x0FFF0FFF) == 0x010F0000) { ... }
+
+    // MSR CPSR_f, #imm        cond 0011 0 0 10 1000 1111 rot imm8
+    if ((op & 0x0FF0F000) == 0x0320F000) { ... }
+
+    // MSR CPSR_f, Rm          cond 0001 0 0 10 1000 1111 0000 0000 Rm
+    if ((op & 0x0FF0FFF0) == 0x0120F000) { ... }
+
+// --- dispARM(): route the immediate form (it == 1) before emitDP ---
+        case 1:
+            if ((op & 0x0FB00000) == 0x03200000)          // MSR{ CPSR|SPSR }_x, #imm
+                return emitMrsMsr(ctx, op, curPC);
+            return emitDP(ctx, op, curPC);
+        </script>
+
+        <h3 id="s22" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev s1">S1</span> 2.2 Base writeback vs. loaded value when Rd == Rn</h3>
+        <p class="prose-p mb-3">
+          In <code>emitLS</code> the load result is moved into <code>RA[rd]</code>, <em>then</em> the post-index writeback does <code>RA[rn] += offset</code>. For
+          <code>LDR r0,[r0],#4</code> that overwrites the loaded value with <code>base+4</code> (architecturally the load wins). Conversely for pre-indexed <em>stores</em>
+          the code skips writeback whenever <code>rn == rd</code>, but <code>STR r0,[r0,#4]!</code> must still update r0. Identical logic in <code>emitLSExtra</code>.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — writeback tail of emitLS() and emitLSExtra()">
+    // Writeback. When a LOAD targets the base register the loaded value wins (UNPREDICTABLE on
+    // real ARM for Pr+wb, but "load wins" is what ARM7TDMI/ARM946E-S do and what noods does).
+    if (rn != 15 && !(ld && rn == rd)) {
+        ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));               // offset
+        if (!pre) {                                      // post-index: always write back
+            if (up) ctx.E(ppc_add (RA[rn], RA[rn], TA));
+            else    ctx.E(ppc_subf(RA[rn], TA, RA[rn]));
+        } else if (wb) {                                 // pre-index with '!': also for STR Rn,[Rn,#x]!
+            ctx.E(ppc_lwz(RA[rn], FRAME_SCR1, 1));       // effective address
+        }
+    }
+        </script>
+
+        <h3 id="s23" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev s1">S1</span> 2.3 Sub-word helper arguments</h3>
+        <p class="prose-p mb-3">
+          The PowerPC SysV/EABI convention is that the <strong>caller</strong> zero/sign-extends <code>char</code>/<code>short</code> arguments, and GCC relies on it in the callee.
+          <code>JitHelp_w16(…, uint16_t v)</code> receives the untruncated guest register in r6; anything downstream that does <code>value &lt;&lt; 16</code>, compares, or forwards
+          <code>value</code> as a wider type (I/O handlers such as DISPCNT/BLDALPHA/IPC registers do) sees the high garbage. Make the helpers word-sized and truncate inside.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — memory helpers (also update the prototypes used by ctx.call)">
+uint32_t JitHelp_r16(Core* c, int a, uint32_t ad) { return c->memory.read<uint16_t>((bool)a, ad); }
+uint32_t JitHelp_r8 (Core* c, int a, uint32_t ad) { return c->memory.read<uint8_t >((bool)a, ad); }
+void JitHelp_w16(Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint16_t>((bool)a, ad, (uint16_t)v); }
+void JitHelp_w8 (Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint8_t >((bool)a, ad, (uint8_t )v); }
+        </script>
+
+        <h3 id="s24" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev s1">S1</span> 2.4 <code>g_cpuTime</code> is not rebased on RESET_CYCLES</h3>
+        <p class="prose-p mb-3">
+          <code>Core::resetCycles()</code> subtracts <code>globalCycles</code> from every event and from <code>interpreter[i].cycles</code>, then zeroes <code>globalCycles</code>.
+          The JIT keeps its own per-CPU timelines in <code>g_cpuTime[]</code> and they are never rebased, so after the first reset (0x7FFFFFFF global cycles ≈ 32 s of emulated time)
+          <code>(int32_t)(g − g_cpuTime)</code> flips negative and the runner jumps time forward by ~32 s in one <code>JitHelp_tick</code>. Games that survive boot die later.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.h / jit_ppc.cpp / core.cpp">
+// jit_ppc.h
+namespace JitPpc { void rebaseCycles(uint32_t globalCycles); }
+
+// jit_ppc.cpp
+void rebaseCycles(uint32_t g) { g_cpuTime[0] -= g; g_cpuTime[1] -= g; }
+
+// core.cpp — Core::resetCycles(), before `globalCycles = 0;`
+    if (jitAvailable) JitPpc::rebaseCycles(globalCycles);
+        </script>
+
+        <h3 id="s25" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev s2">S2</span> 2.5 <code>subfic</code> destroys XER[CA] before ADC/SBC/RSC</h3>
+        <p class="prose-p mb-3">
+          <code>emitDP</code> loads the ARM carry into XER (<code>mtxer</code>) <em>before</em> calling <code>emitShifter</code>. The register-ROR path then emits
+          <code>subfic TB, TD, 32</code>, which writes CA. <code>ADC r0, r1, r2, ROR r3</code> therefore adds a wrong carry. <code>neg</code> computes the same rotate amount
+          without touching CA (<code>rlwnm</code> only uses the low 5 bits).
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — encoder + emitShifter() register-ROR case">
+static inline uint32_t ppc_neg(uint8_t d, uint8_t a) { return XOf(d, a, 0, false, 104); }
+
+        default:                                        // ROR Rm, Rs
+            ctx.E(ppc_neg(TB, TD));                     // (-n) & 31 == (32-n) & 31 ; does not touch CA
+            ctx.E(ppc_rlwnm(dst, TA, TB, 0, 31));
+            break;
+        </script>
+
+        <h3 id="s26" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev s2">S2</span> 2.6 A halt inside a block does not stop the block</h3>
+        <p class="prose-p mb-3">
+          <code>STRB</code> to HALTCNT (real BIOS <code>Halt</code>/<code>IntrWait</code>) or an IME/IE write goes through <code>memory.write → halt() → updateRun()</code>, but the generated code
+          simply continues with the next guest instruction until the block ends. The CPU then resumes after the interrupt at a PC that is a few instructions "too late".
+          Usually benign (the BIOS wait loops re-check flags) but it is the kind of thing that makes one game in twenty hang in a vblank wait. <code>halted</code> lives at a fixed
+          address, so a 5-instruction inline test after each store fixes it without touching the helpers. Emit it <em>after</em> the writeback code, and for STM/PUSH/STMIA after
+          <code>emitReload</code>.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — emitHaltCheck(); call after every store emitter with nextPC = curPC + (thumb ? 2 : 4)">
+static inline uint32_t ppc_lbz(uint8_t rt, int16_t d, uint8_t ra) {
+    return (34u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
+
+// If the store we just performed halted this CPU, commit state with PC = next instruction and leave.
+static void emitHaltCheck(Ctx& ctx, uint32_t nextPC) {
+    ctx.li(TA, (uint32_t)(uintptr_t)&ctx.interp->halted);   // uint8_t, public
+    ctx.E(ppc_lbz(TA, 0, TA));
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t b = ctx.sz();
+    ctx.E(ppc_bc(12, 2, 0));                                  // beq continue
+    emitCommitExit(ctx, nextPC, EXIT_NORMAL);                 // (phase 2: force the non-chaining exit here)
+    patchBc(ctx, b, 12, 2);
+}
+
+// e.g. in emitLS(), just before the final patchSkip(ctx, si):
+    if (!ld) emitHaltCheck(ctx, curPC + 4);
+        </script>
+
+        <h3 id="s27" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev s2">S2</span> 2.7 Smaller items</h3>
+        <ul class="space-y-3 text-sm prose-p list-disc pl-5">
+          <li><strong><code>interpStep()</code> charges a flat 2 cycles.</strong> <code>jitRunOpcode()</code> already returns the interpreter's cycle count — return it:
+            <code>static inline int interpStep(...) { ensurePipeline(...); return interp.jitRunOpcode(); }</code> and use the value in <code>runCpu</code>. Timer-driven boot sequences
+            (and the ARM7 audio/RTC loops) are sensitive to this while the ARM7 is still mostly interpreted.</li>
+          <li><strong>DSi mode:</strong> <code>Core::updateRun()</code> picks the JIT before checking <code>dsiMode</code>, but <code>runJitNds</code> hard-codes the NDS 2×/4× scaling. Either exclude
+            <code>dsiMode</code> from the JIT path or make the shifts <code>dsiMode ? 1 : 2</code> style parameters.</li>
+          <li><strong><code>running = 0</code> in <code>updateRun()</code>:</strong> the JIT run functions never set <code>running = 1</code>. If your frame loop is
+            <code>running = 1; while (running) runCore();</code> every halt/unhalt (thousands per frame on the ARM7) ends the loop early. Check what your frontend does with it; the interpreter's
+            <code>runCore*</code> functions in noods re-arm it themselves.</li>
+          <li><strong>Fallback double-charge:</strong> on <code>EXIT_FALLBACK</code> the block already added the failing instruction's cycles to <code>ctx.cycles</code>, then <code>runCpu</code> adds
+            the interpreter's cost again. Subtract <code>armCycles/thumbCycles</code> of the failing instruction before emitting the fallback exit (you already keep <code>cycMark</code>).</li>
+          <li><strong><code>emitT_hiReg</code> ADD pc,pc:</strong> harmless, but <code>o==0 &amp;&amp; rd==15 &amp;&amp; rs==15</code> should be rejected rather than doubled.</li>
+        </ul>
+      </section>
+
+      <!-- ============ 3 PERF ============ -->
+      <section id="perf" class="mb-16">
+        <h2 class="text-2xl font-semibold text-slate-50 mb-2">3 · Why it's slow</h2>
+
+        <h3 id="s31" class="text-lg font-semibold text-slate-100 mt-8 mb-3 flex items-center gap-2"><span class="sev p">PERF</span> 3.1 The code cache never lands in MEM2</h3>
+        <p class="prose-p mb-3">
+          <code>allocArena()</code> sets <code>raw = nullptr</code> and immediately takes the "MEM2 unavailable" branch, so you always run with 2 MB of code space in MEM1 and print a
+          misleading message. With ~12 PPC words per guest memory access and 15+15 register spills around every LDM/STM, 2 MB fills within seconds of gameplay and every fill is a
+          <em>full</em> <code>flushJitCache()</code>: all pages dropped, everything recompiled, repeat. You already export <code>Noods_MEM2_Alloc</code>. Cached MEM2 (0x9xxxxxxx) is executable
+          on the Wii; keep the allocation 32-byte aligned so <code>DCFlushRange/ICInvalidateRange</code> cover whole lines.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — allocArena()">
+extern void* Noods_MEM2_Alloc(size_t size);
+
+static bool allocArena() {
+    if (g_arena) return true;
+    size_t codeBytes = JIT_BYTES_MEM2;                                   // 16 MB
+    void*  raw = Noods_MEM2_Alloc(codeBytes + PAGE_ARENA_BYTES + 32);
+    if (raw) {
+        raw = (void*)(((uintptr_t)raw + 31) & ~(uintptr_t)31);           // 32-byte align for cache ops
+    } else {
+        codeBytes = JIT_BYTES_MEM1;
+        raw = memalign(32, codeBytes + PAGE_ARENA_BYTES);
+        if (!raw) { printf("[JIT] arena alloc failed\n"); return false; }
+        printf("[JIT] MEM2 unavailable, using %zuKB in MEM1\n", codeBytes >> 10);
+    }
+    g_arena      = raw;
+    g_arenaBytes = codeBytes + PAGE_ARENA_BYTES;
+    codeBuf      = (uint32_t*)raw;
+    g_jitWords   = codeBytes / 4;
+    g_pageArena  = (uint32_t*)((uint8_t*)raw + codeBytes);
+    return true;
+}
+        </script>
+        <p class="prose-p mt-3 text-sm">Relative <code>b</code> to the exit stub reaches ±32 MB, so a 16 MB buffer is safe; helper calls already use absolute <code>mtctr/bctrl</code>.</p>
+
+        <h3 id="s32" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev p">PERF</span> 3.2 Invalidation: O(1) lookup + 64-byte coverage bitmap</h3>
+        <p class="prose-p mb-3">
+          Today every guest write (if <code>Memory::write</code> calls <code>Core::invalidateJitPage</code>) walks <code>g_livePages</code> (up to 256 entries) and, on a hit, memsets the
+          entire 8 KB slot array for the page. ARM7 IWRAM is 64 KB of code <em>and</em> data <em>and</em> stack; any variable that shares a 4 K page with code makes each write
+          throw away all blocks in that page, which are recompiled on the next branch. That loop alone can eat the whole frame budget.
+          Fix both halves: index the page table directly, and track which 64-byte chunks of a page actually contain compiled code.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — coverage bitmap + invalidateJitWrite()">
+static uint64_t g_pageCover[PAGE_ARENA_CNT];        // bit c set => bytes [c*64, c*64+64) of that page hold compiled code
+uint8_t g_jitCodePage[0x10000];                     // exported: 1 => some CPU has code in this 4K page (pc < 0x10000000)
+
+static inline size_t pageSlotIdx(uint32_t* pg) { return (size_t)(pg - g_pageArena) / PAGE_SLOTS; }
+
+// compileBlock(): call right after `pg[slot] = (uint32_t)(uintptr_t)ctx.base | tbit;`
+static void markCover(uint32_t* pg, uint32_t startPC, uint32_t endPC) {
+    size_t   k  = pageSlotIdx(pg);
+    unsigned c0 = (startPC & 0xFFFu) >> 6, c1 = ((endPC - 1) & 0xFFFu) >> 6;
+    for (unsigned c = c0; c <= c1; c++) g_pageCover[k] |= 1ull << c;
+    if (startPC < 0x10000000u) g_jitCodePage[startPC >> 12] = 1;
+}
+
+// One guest write of `size` bytes at `addr`. O(1). Safe to call from inside a running block.
+void invalidateJitWrite(uint32_t addr, uint32_t size) {
+    int32_t pi = pageIndex(addr);
+    if (pi < 0) return;
+    unsigned c0 = (addr & 0xFFFu) >> 6, c1 = ((addr + size - 1) & 0xFFFu) >> 6;
+    uint64_t m = 0;
+    for (unsigned c = c0; c <= c1; c++) m |= 1ull << c;
+
+    bool still = false;
+    for (int cpu = 0; cpu < 2; cpu++) {
+        uint32_t* pg = g_pageTab[cpu][pi];
+        if (!pg) continue;
+        size_t k = pageSlotIdx(pg);
+        if (g_pageCover[k] & m) { memset(pg, 0, PAGE_SLOTS * 4); g_pageCover[k] = 0; }
+        if (g_pageCover[k]) still = true;
+    }
+    if (!still && addr < 0x10000000u) g_jitCodePage[addr >> 12] = 0;
+}
+
+// flushJitCache(): add
+    memset(g_pageCover, 0, sizeof g_pageCover);
+    memset(g_jitCodePage, 0, sizeof g_jitCodePage);
+        </script>
+        <script type="text/plain" data-title="memory.cpp — hook in the RAM fast path of Memory::write<T>() (and any DMA memcpy path)">
+extern uint8_t g_jitCodePage[0x10000];
+namespace JitPpc { void invalidateJitWrite(uint32_t addr, uint32_t size); }
+
+    // ... after the value has been stored:
+    if (address < 0x10000000u && g_jitCodePage[address >> 12])       // 2 loads + 1 branch in the common case
+        JitPpc::invalidateJitWrite(address, sizeof(T));
+        </script>
+        <p class="prose-p mt-3 text-sm">
+          Delete <code>Core::invalidateJitPage</code> (it widened every write to a full page) and <code>invalidateJitRange</code>'s linear scan. If NDS overlays / GBA multiboot payloads are copied
+          with a raw <code>memcpy</code> in your cartridge or DMA code, call <code>invalidateJitWrite(dst, len)</code> once for the whole range there — otherwise stale blocks execute old overlay code,
+          which is another classic "boots to a black screen after the logo" cause.
+        </p>
+
+        <h3 id="s33" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev p">PERF</span> 3.3 Thumb LSL/LSR/ASR/ROR by register</h3>
+        <p class="prose-p mb-3">
+          These are in every fixed-point routine and every GBA game's inner loops; each occurrence currently ends the block, commits 16 registers, steps the interpreter and re-enters.
+          ARM semantics (n = Rs &amp; 0xFF): n = 0 → value and C unchanged, only N/Z updated; LSL/LSR: n = 32 → result 0, C = bit 0 / bit 31; n &gt; 32 → result 0, C = 0; ASR: n ≥ 32 → sign fill, C = bit 31;
+          ROR: rotate by n &amp; 31, C = result bit 31. Clamping n to 33 (LSL/LSR) or 32 (ASR) makes the tail cases fall out of PowerPC's 6-bit shift behaviour.
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — emitT_aluShiftReg(); in emitT_alu(): case 2: case 3: case 4: case 7: return emitT_aluShiftReg(ctx, o, d, s);">
+static inline uint32_t ppc_cmpli(uint8_t cr, uint8_t ra, uint16_t i) {
+    return (10u << 26) | ((cr & 7u) << 23) | ((uint32_t)ra << 16) | i;          // cmplwi
+}
+
+// Thumb format 4: LSL(2) LSR(3) ASR(4) ROR(7) Rd, Rs.  N,Z always; C only when n != 0.
+static bool emitT_aluShiftReg(Ctx& ctx, uint8_t o, uint8_t d, uint8_t s) {
+    ctx.E(ppc_rlwinm(TD, s, 0, 24, 31));                 // n = Rs & 0xFF
+    ctx.E(ppc_cmpi(0, TD, 0));
+    size_t bZero = ctx.sz();
+    ctx.E(ppc_bc(12, 2, 0));                             // beq -> only N,Z
+
+    if (o == 7) {                                        // ROR
+        ctx.E(ppc_neg(TB, TD));
+        ctx.E(ppc_rlwnm(d, d, TB, 0, 31));               // rotate right by n & 31
+        ctx.E(ppc_rlwinm(TC, d, 1, 31, 31));             // C = result bit 31 (also right when n & 31 == 0)
+    } else {
+        const int clamp = (o == 4) ? 32 : 33;            // behaviour is constant beyond this
+        ctx.E(ppc_cmpli(0, TD, (uint16_t)clamp));
+        size_t bOk = ctx.sz();
+        ctx.E(ppc_bc(4, 1, 0));                          // ble ok
+        ctx.E(ppc_addi(TD, 0, (int16_t)clamp));
+        patchBc(ctx, bOk, 4, 1);
+        if (o == 2) {                                    // LSL : C = bit(32-n)
+            ctx.E(ppc_subfic(TB, TD, 32));               // n=32 -> 0 (bit0) ; n=33 -> -1 -> srw gives 0
+            ctx.E(ppc_srw(TC, d, TB));
+            ctx.E(ppc_slw(d, d, TD));                    // n>=32 -> 0
+        } else {                                         // LSR / ASR : C = bit(n-1)
+            ctx.E(ppc_addi(TB, TD, -1));
+            ctx.E(ppc_srw(TC, d, TB));                   // n=32 -> bit31 ; n=33 -> 0
+            ctx.E(o == 3 ? ppc_srw(d, d, TD) : ppc_sraw(d, d, TD));
+        }
+        ctx.E(ppc_rlwinm(TC, TC, 0, 31, 31));
+    }
+    setC_bit0(ctx, TC);
+    patchBc(ctx, bZero, 12, 2);
+    setNZ(ctx, d);
+    return true;
+}
+        </script>
+        <p class="prose-p mt-3 text-sm">The same helper, parameterised on the carry-required flag, lets you lift the <code>s &amp;&amp; regShift &amp;&amp; logical</code> rejection in <code>emitDP</code> later (ARM <code>MOVS r0, r1, LSL r2</code>).</p>
+
+        <h3 id="s34" class="text-lg font-semibold text-slate-100 mt-10 mb-3 flex items-center gap-2"><span class="sev p">PERF</span> 3.4 What a block costs today</h3>
+        <div class="grid md:grid-cols-2 gap-4 text-sm">
+          <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
+            <div class="text-slate-400 uppercase text-xs tracking-wider mb-3">Per block, current design</div>
+            <ul class="space-y-1.5 text-slate-300">
+              <li class="flex justify-between"><span>runCpu: validPC, hleBiosAddr, page lookup</span><span class="mono text-slate-400">~40</span></li>
+              <li class="flex justify-between"><span>executeBlock_asm + entry stub (18 saves, 30 loads)</span><span class="mono text-slate-400">~65</span></li>
+              <li class="flex justify-between"><span>exit stub spill + JitHelp_commit (15 indirect stores)</span><span class="mono text-slate-400">~70</span></li>
+              <li class="flex justify-between"><span>epilogue (18 restores)</span><span class="mono text-slate-400">~22</span></li>
+              <li class="flex justify-between border-t border-slate-800 pt-1.5 mt-1.5 font-semibold text-slate-100"><span>overhead</span><span class="mono">≈ 200 PPC insns</span></li>
+              <li class="flex justify-between"><span>useful work for a typical 5-insn block</span><span class="mono text-slate-400">30–80</span></li>
+            </ul>
+          </div>
+          <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
+            <div class="text-slate-400 uppercase text-xs tracking-wider mb-3">After phase 2 (chaining)</div>
+            <ul class="space-y-1.5 text-slate-300">
+              <li class="flex justify-between"><span>dispatch stub: budget, flag, 2-level lookup, T check</span><span class="mono text-slate-400">~22</span></li>
+              <li class="flex justify-between"><span>C round-trip only on budget expiry / miss / fallback</span><span class="mono text-slate-400">amortised</span></li>
+              <li class="flex justify-between border-t border-slate-800 pt-1.5 mt-1.5 font-semibold text-slate-100"><span>overhead</span><span class="mono">≈ 25 PPC insns</span></li>
+              <li class="text-slate-400 pt-2">Registers stay in r14–r29 across blocks; the interpreter's register file is only touched when the JIT actually returns to C.</li>
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 4 CHAINING ============ -->
+      <section id="chain" class="mb-16">
+        <h2 class="text-2xl font-semibold text-slate-50 mb-2">4 · Block chaining without leaving the JIT frame (phase 2)</h2>
+        <p class="prose-p mb-4">
+          Do this only after sections 1–3 are in and a few games boot. The idea: keep your existing frame, entry stub and exit stub, but route <code>EXIT_NORMAL</code> exits
+          through a <em>dispatch stub</em> that looks up the next block in generated code and <code>bctr</code>s to it. Two spare non-volatile registers are already saved by the
+          entry stub: use <strong>r30</strong> as a cycle budget countdown and <strong>r31</strong> as <code>&amp;g_pageTab[cpu][0]</code>.
+        </p>
+        <ol class="list-decimal pl-5 space-y-2 text-sm prose-p mb-5">
+          <li><strong>Protocol.</strong> Every block exit sets r7 = next PC, r8 = reason, r9 = cycles of the block that just ran. The exit stub folds r9 into r30 and passes r30 (remaining budget) to <code>JitHelp_commit</code> instead of r9; C computes <code>consumed = budget − remaining</code> (may be negative → overrun, that's fine).</li>
+          <li><strong>Entry stub</strong> additionally loads <code>r30 ← g_budget</code> and <code>r31 ← &amp;g_pageTab[cpu][0]</code>.</li>
+          <li><strong><code>emitCommitExit</code></strong> jumps to the dispatch stub when <code>reason == EXIT_NORMAL</code>, else to the exit stub. <code>emitHaltCheck</code> and fallbacks always take the exit stub.</li>
+          <li><strong><code>g_exitRequest</code></strong> (a <code>uint8_t</code>) is set by <code>Core::updateRun()</code> and by <code>Core::schedule()</code> for <code>ARM9_INTERRUPT/ARM7_INTERRUPT</code>, cleared by <code>runCpu</code> before entering. The dispatch stub tests it, so an IRQ or halt raised by a store never waits longer than the end of the current block.</li>
+          <li><strong>Sentinel.</strong> <code>g_fbSentinel</code> must become executable code (the dispatcher may <code>bctr</code> into it): a 3-instruction stub in the stub area — <code>li r8,EXIT_FALLBACK; li r9,0; b exitStub</code>. <code>runCpu</code>'s pointer compare keeps working.</li>
+          <li><strong>Budget.</strong> In <code>runJitNds</code>: <code>budget = max(1, (min(nextEventCycles, otherCpuTime) − myTime) / scale)</code> in CPU cycles. This gives you exactly noods' interleaving with no per-block C round-trip.</li>
+        </ol>
+        <script type="text/plain" data-title="jit_ppc.cpp — encoders + dispatch stub (built once in buildExitStub(), after the exit stub)">
+static inline uint32_t ppc_andi_(uint8_t a, uint8_t s, uint16_t i) { return (28u << 26) | ((uint32_t)s << 21) | ((uint32_t)a << 16) | i; }
+static inline uint32_t ppc_lwzx (uint8_t rt, uint8_t ra, uint8_t rb) { return Xf(rt, ra, rb, 23); }
+
+static uint32_t* g_dispatchStub = nullptr;
+static volatile uint8_t  g_exitRequest = 0;     // set by Core::updateRun() and interrupt scheduling
+static uint32_t          g_budget      = 1;     // read by the entry stub into r30
+
+// In : r7 = next PC (bit 0 clear), r9 = cycles of the finished block, guest regs + RCPSR live,
+//      r30 = remaining budget, r31 = &g_pageTab[cpu][0]
+static void emitDispatchStubBody(Ctx& ctx) {
+    ctx.E(ppc_subf(30, TG, 30));                          // budget -= cycles
+    ctx.E(ppc_cmpi(0, 30, 0));
+    size_t b1 = ctx.sz(); ctx.E(ppc_bc(4, 1, 0));         // ble  exit   (budget exhausted)
+
+    ctx.li(TA, (uint32_t)(uintptr_t)&g_exitRequest);
+    ctx.E(ppc_lbz(TA, 0, TA));
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t b2 = ctx.sz(); ctx.E(ppc_bc(4, 2, 0));         // bne  exit   (halt / IRQ / mode change pending)
+
+    ctx.E(ppc_rlwinm(TC, TE, 20, 12, 31));                // pc >> 12
+    ctx.E(ppc_cmpli(0, TC, 0xFFFF));
+    size_t b3 = ctx.sz(); ctx.E(ppc_bc(12, 1, 0));        // bgt  exit   (BIOS @ 0xFFFF0000: let C handle it)
+    ctx.E(ppc_rlwinm(TC, TC, 2, 0, 29));                  // * 4
+    ctx.E(ppc_lwzx(TD, 31, TC));                          // slot array for the page
+    ctx.E(ppc_cmpi(0, TD, 0));
+    size_t b4 = ctx.sz(); ctx.E(ppc_bc(12, 2, 0));        // beq  exit   (no page yet)
+    ctx.E(ppc_rlwinm(TC, TE, 1, 19, 29));                 // ((pc & 0xFFF) >> 1) * 4
+    ctx.E(ppc_lwzx(TD, TD, TC));                          // entry | tbit
+    ctx.E(ppc_cmpi(0, TD, 0));
+    size_t b5 = ctx.sz(); ctx.E(ppc_bc(12, 2, 0));        // beq  exit   (not compiled yet)
+
+    ctx.E(ppc_rlwinm(TB, RCPSR, 27, 31, 31));             // CPSR.T -> bit 0
+    ctx.E(ppc_xor(TB, TB, TD));
+    ctx.E(ppc_andi_(TB, TB, 1));                          // sets CR0
+    size_t b6 = ctx.sz(); ctx.E(ppc_bc(4, 2, 0));         // bne  exit   (block compiled for the other ISA)
+
+    ctx.E(ppc_rlwinm(TD, TD, 0, 0, 30));                  // strip tbit
+    ctx.E(ppc_mtctr(TD));
+    ctx.E(ppc_bctr(false));                               // ---- chained ----
+
+    // exit: r7 still holds the PC; cycles already folded into r30
+    patchBc(ctx, b1, 4, 1);  patchBc(ctx, b2, 4, 2);  patchBc(ctx, b3, 12, 1);
+    patchBc(ctx, b4, 12, 2); patchBc(ctx, b5, 12, 2); patchBc(ctx, b6, 4, 2);
+    ctx.E(ppc_addi(TF, 0, EXIT_NORMAL));
+    ctx.E(ppc_addi(TG, 0, 0));
+    emitJumpExitStub(ctx);
+}
+
+// Exit stub body: pass the remaining budget instead of the block's cycles.
+static void emitExitStubBody(Ctx& ctx) {
+    emitSpill(ctx);
+    ctx.ldInterp();                                       // r3
+    ctx.ldCpu();                                          // r4
+    ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_REGSYNC));       // r5
+    ctx.E(ppc_mr(TD, RCPSR));                             // r6      (r7 = pc, r8 = reason already set)
+    ctx.E(ppc_subf(30, TG, 30));                          // r30 -= cycles of the exiting block
+    ctx.E(ppc_mr(TG, 30));                                // r9 = remaining budget (signed)
+    ctx.call((void*)JitHelp_commit);                      // stores it in g_exitRemaining[cpu]
+    emitEpilogue(ctx);
+}
+
+// Entry stub additions (before the final mtctr/bctr):
+    ctx.li(TA, (uint32_t)(uintptr_t)&g_budget);            ctx.E(ppc_lwz(30, 0, TA));
+    ctx.li(31, (uint32_t)(uintptr_t)&g_pageTab[cpu][0]);
+
+// emitCommitExit / emitCommitExitDyn: choose the target stub
+static void emitJumpStub(Ctx& ctx, uint32_t* stub) {
+    if (!stub || ctx.rem() == 0) { ctx.overflow = true; return; }
+    ctx.E(ppc_b((int32_t)((intptr_t)stub - (intptr_t)ctx.cur)));
+}
+static void emitCommitExit(Ctx& ctx, uint32_t nextPC, int reason, bool chain = true) {
+    ctx.li(TE, nextPC);
+    ctx.E(ppc_addi(TF, 0, (int16_t)reason));
+    ctx.li(TG, ctx.cycles);
+    emitJumpStub(ctx, (chain && reason == EXIT_NORMAL) ? g_dispatchStub : g_exitStub);
+}
+        </script>
+        <script type="text/plain" data-title="jit_ppc.cpp — runCpu()/runJitNds() with budgets (sketch)">
+static int32_t g_exitRemaining[2];
+
+// JitHelp_commit(): last parameter is now the remaining budget
+    g_exitRemaining[cpu] = (int32_t)cycles;
+
+// Runs this CPU for up to `budget` CPU cycles (chained blocks). Returns cycles consumed.
+static uint32_t runCpu(Core& core, int cpu, bool gba, uint32_t budget) {
+    Interpreter& interp = core.interpreter[cpu];
+    const bool arm7 = (cpu == 1) || gba;
+    if (!interp.isReady()) return (uint32_t)interpStep(interp, cpu);
+
+    const uint32_t pc = interp.getActualPC();
+    if (!validPC(pc, gba, arm7) || hleBiosAddr(interp, cpu, pc))
+        return (uint32_t)interpStep(interp, cpu);
+
+    const bool thumb = interp.isThumb();
+    uint32_t* code = lookupBlock(cpu, pc, thumb);
+    if (!code) code = compileBlock(&interp, &core, pc, thumb, arm7, cpu);
+    if (!code || code == g_fbSentinel) return (uint32_t)interpStep(interp, cpu);
+
+    g_exitReason[cpu] = EXIT_FALLBACK;
+    g_exitPC[cpu]     = pc;
+    g_budget          = budget ? budget : 1;
+    g_exitRequest     = 0;
+    g_nextBlock       = code;
+    executeBlock_asm(g_entryStub[cpu]);
+
+    uint32_t cyc = (uint32_t)((int32_t)g_budget - g_exitRemaining[cpu]);
+    if (g_exitReason[cpu] == EXIT_FALLBACK) {
+        const uint32_t expc = g_exitPC[cpu];
+        if (validPC(expc, gba, arm7)) { interp.setPC(expc); g_pipeDirty[cpu] = false; }
+        else ensurePipeline(interp, cpu);
+        cyc += (uint32_t)interp.jitRunOpcode();
+    }
+    return cyc ? cyc : 1;
+}
+
+// runJitNds(): budget = distance to the earlier of (next event, other CPU) in this CPU's cycles
+static inline uint32_t budgetFor(Core& core, int cpu, int shift) {
+    const uint32_t g     = core.globalCycles;
+    uint32_t limit = core.events.empty() ? g + 512 : core.events.front().cycles;
+    const int other = cpu ^ 1;
+    if (!core.interpreter[other].halted && (int32_t)(g_cpuTime[other] - limit) < 0)
+        limit = g_cpuTime[other];
+    int32_t d = (int32_t)(limit - g_cpuTime[cpu]);
+    return d > 0 ? ((uint32_t)d + (1u << shift) - 1) >> shift : 1;
+}
+//  ... in the loop:
+//  if (!a9.halted && (int32_t)(g - g_cpuTime[0]) >= 0) g_cpuTime[0] = g + (runCpu(core, 0, false, budgetFor(core, 0, 1)) << 1);
+//  if (!a7.halted && (int32_t)(g - g_cpuTime[1]) >= 0) g_cpuTime[1] = g + (runCpu(core, 1, false, budgetFor(core, 1, 2)) << 2);
+        </script>
+        <div class="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/5 p-4 text-sm text-amber-100/90">
+          <strong>Two invariants to keep:</strong> (1) nothing that changes CPU mode or the register bank may be chained — that is already true because MSR-c, SWI, LDM^, SUBS pc and
+          <code>MRC/MCR</code> fall back; (2) the dispatcher must never <code>bctr</code> into a slot whose page was just cleared — <code>invalidateJitWrite</code> only zeroes slots, never
+          reuses code memory, so a stale in-flight block finishes and the next lookup misses. Full reuse only happens in <code>flushJitCache</code>, which runs from <code>compileBlock</code> (outside generated code).
+        </div>
+      </section>
+
+      <!-- ============ 5 DEBUG ============ -->
+      <section id="debug" class="mb-16">
+        <h2 class="text-2xl font-semibold text-slate-50 mb-2">5 · Debug tooling &amp; test plan</h2>
+        <p class="prose-p mb-4">
+          Your <code>[JIT] … FB</code> print stops after 32 lines and tells you nothing about frequency. Two cheap additions make JIT bugs bisectable on real hardware without a debugger:
+        </p>
+        <script type="text/plain" data-title="jit_ppc.cpp — per-class kill switch + fallback histogram (dump every 600 frames or from a debug menu)">
+// Bit mask of emitter classes that are allowed to compile. Flip bits from your frontend's debug
+// menu; when a game starts working after clearing a bit you have found the broken emitter.
+enum JitClass { JC_DP = 1, JC_LS = 2, JC_LSX = 4, JC_MUL = 8, JC_BLOCK = 16, JC_BRANCH = 32, JC_PSR = 64,
+                JC_T_ALU = 128, JC_T_MEM = 256, JC_T_STACK = 512, JC_T_BR = 1024 };
+uint32_t g_jitEnable = 0xFFFFFFFFu;
+#define JC_ON(c) ((g_jitEnable & (c)) != 0)
+// e.g. in dispARM():   case 2: case 3: return JC_ON(JC_LS) && emitLS(ctx, op, curPC);
+
+static uint32_t g_fbHist[2][256];        // [thumb][class key]
+static inline void noteFallback(bool thumb, uint32_t op) {
+    g_fbHist[thumb][thumb ? (op >> 8) & 0xFF : (op >> 20) & 0xFF]++;
+}
+void dumpFallbacks() {
+    for (int t = 0; t < 2; t++)
+        for (int k = 0; k < 256; k++)
+            if (g_fbHist[t][k] > 1000)
+                printf("[JIT] %s key %02X : %u fallbacks\n", t ? "thumb" : "arm", k, g_fbHist[t][k]);
+}
+        </script>
+        <div class="grid md:grid-cols-2 gap-4 mt-5 text-sm">
+          <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
+            <div class="text-slate-100 font-semibold mb-2">Test order (cheapest signal first)</div>
+            <ol class="list-decimal pl-5 space-y-1.5 text-slate-300">
+              <li><code>gba-tests</code> (jsmolka): <code>thumb.gba</code>, <code>arm.gba</code>, <code>memory.gba</code>. They stop on the first failing test and show its number — perfect for a JIT. Run with the real BIOS and with HLE.</li>
+              <li><code>ARMWrestler</code> (NDS): exercises the ARMv5 extensions, LDM/STM corner cases and interworking on both CPUs.</li>
+              <li>A libnds demo (any <code>examples/</code> ROM): ITCM code, IRQ wrapper with <code>MRS/MSR SPSR</code>, ARM7 in IWRAM.</li>
+              <li>Commercial: start with GBA games (Thumb-heavy, single CPU), then a 2D NDS title, then 3D.</li>
+            </ol>
+          </div>
+          <div class="rounded-xl border border-slate-800 bg-slate-900/50 p-5">
+            <div class="text-slate-100 font-semibold mb-2">Bisection recipe</div>
+            <ol class="list-decimal pl-5 space-y-1.5 text-slate-300">
+              <li>Set <code>BLK_ARMS = 1</code>. If the game now works, the bug is in cross-instruction state (flags in <code>TC</code>, <code>FRAME_SCR*</code> reuse, cycles). If not, it's inside one emitter.</li>
+              <li>Clear <code>g_jitEnable</code> bits one at a time; the first bit whose removal fixes the game names the emitter.</li>
+              <li>For that class, log (pc, opcode, regs before/after) for the first 200 executions and diff against a pure-interpreter run of the same ROM.</li>
+              <li>Watch <code>dumpFallbacks()</code>: any key above ~1 % of executed instructions is worth an emitter.</li>
+            </ol>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 6 CHECKLIST ============ -->
+      <section id="checklist" class="mb-20">
+        <h2 class="text-2xl font-semibold text-slate-50 mb-4">6 · Checklist</h2>
+        <p class="text-sm text-slate-400 mb-4">Tick items as you land them — state is kept in <code>localStorage</code> so you can come back to this page.</p>
+        <div id="checks" class="space-y-2 text-sm"></div>
+        <div class="mt-6 text-xs text-slate-500">
+          Things I checked and found correct, so you don't need to re-audit them: PPC encoders (rlwinm/rlwimi/rlwnm masks, XO/X forms, mtcrf FXM, cr-logical ops), CR0 mapping of NZCV via
+          <code>mtcrf 0x80</code> and all 14 condition cases, N/Z/C/V generation for add/sub/logical, immediate shifter carries (LSL/LSR/ASR/ROR/RRX incl. #0 / #32 cases), SBC/RSC via
+          <code>subfe</code>, BL/BLX offsets and LR values, Thumb BL pairing, POP/LDM interworking rules (ARM9 only), stack frame/EABI LR slot layout, non-volatile register usage across helper calls, block-level self-modifying-code safety.
+        </div>
+      </section>
+
+    </div>
+  </main>
+</div>
+
+<script>
+  // --- severity badges ---
+  const style = document.createElement('style');
+  style.textContent = `
+    .sev { display:inline-block; font-size:10px; font-weight:700; letter-spacing:.06em; padding:2px 7px; border-radius:9999px; border:1px solid; }
+    .sev.s0 { color:#fecaca; background:rgba(239,68,68,.15); border-color:rgba(239,68,68,.4); }
+    .sev.s1 { color:#fed7aa; background:rgba(249,115,22,.15); border-color:rgba(249,115,22,.4); }
+    .sev.s2 { color:#fef08a; background:rgba(234,179,8,.12); border-color:rgba(234,179,8,.35); }
+    .sev.p  { color:#bae6fd; background:rgba(14,165,233,.15); border-color:rgba(14,165,233,.4); }
+  `;
+  document.head.appendChild(style);
+
+  // --- render <script type="text/plain"> blocks as code panels (keeps raw C++ untouched by the HTML parser) ---
+  const esc = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  function highlight(src) {
+    return src.split('\n').map(line => {
+      if (line.trimStart().startsWith('#')) return '<span class="text-fuchsia-300">' + esc(line) + '</span>';
+      const i = line.indexOf('//');
+      if (i >= 0) return esc(line.slice(0, i)) + '<span class="text-emerald-400/80">' + esc(line.slice(i)) + '</span>';
+      return esc(line);
+    }).join('\n');
+  }
+  document.querySelectorAll('script[type="text/plain"]').forEach(s => {
+    const text = s.textContent.replace(/^\n+/, '').replace(/\s+$/, '');
+    const wrap = document.createElement('div');
+    wrap.className = 'code-wrap rounded-xl border border-slate-800 bg-slate-900 overflow-hidden my-3';
+    const head = document.createElement('div');
+    head.className = 'flex items-center justify-between gap-3 px-4 py-2 border-b border-slate-800 bg-slate-900/80';
+    head.innerHTML = '<div class="mono text-xs text-slate-400 truncate">' + esc(s.dataset.title || 'code') + '</div>' +
+      '<button class="text-xs px-2 py-1 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 shrink-0">Copy</button>';
+    const pre = document.createElement('pre');
+    pre.className = 'p-4 overflow-x-auto text-slate-200';
+    pre.innerHTML = '<code>' + highlight(text) + '</code>';
+    head.querySelector('button').addEventListener('click', async ev => {
+      try { await navigator.clipboard.writeText(text); ev.target.textContent = 'Copied'; setTimeout(() => ev.target.textContent = 'Copy', 1200); }
+      catch (e) { ev.target.textContent = 'Select & copy'; }
+    });
+    wrap.appendChild(head); wrap.appendChild(pre);
+    s.replaceWith(wrap);
+  });
+
+  // --- checklist with persistence ---
+  const items = [
+    ['S0', 'dispThumb(): fix case labels for h = 0..5; fix thumbCycles()'],
+    ['S0', 'validPC(pc, gba, arm7): ARM7 IWRAM 0x03800000+, ITCM mirrors; update 4 call sites'],
+    ['S1', 'emitMrsMsr(): masks 0x0FFF0FFF / 0x0FF0F000 / 0x0FF0FFF0; route MSR #imm from dispARM case 1'],
+    ['S1', 'emitLS()/emitLSExtra(): writeback rule "load into base wins", stores always write back'],
+    ['S1', 'Memory helpers take/return uint32_t and truncate inside'],
+    ['S1', 'JitPpc::rebaseCycles() called from Core::resetCycles()'],
+    ['S2', 'ppc_neg instead of subfic in register-ROR shifter'],
+    ['S2', 'emitHaltCheck() after every store emitter (ARM + Thumb + block transfers)'],
+    ['S2', 'interpStep returns jitRunOpcode() cycles; exclude dsiMode from the JIT (or parametrise scaling)'],
+    ['S2', 'Confirm frontend handling of Core::running vs updateRun() clearing it'],
+    ['PERF', 'allocArena(): Noods_MEM2_Alloc 16 MB, 32-byte aligned'],
+    ['PERF', 'Coverage bitmap + invalidateJitWrite(); hook in Memory::write fast path and overlay/DMA memcpy paths; delete linear scan'],
+    ['PERF', 'emitT_aluShiftReg() for Thumb LSL/LSR/ASR/ROR Rd,Rs'],
+    ['PERF', 'Phase 2: dispatch stub, r30 budget, r31 page table, executable sentinel, g_exitRequest'],
+    ['DBG', 'g_jitEnable class mask + fallback histogram; run gba-tests thumb/arm/memory + ARMWrestler'],
+  ];
+  const box = document.getElementById('checks');
+  const key = 'jit-audit-checks-v1';
+  const saved = JSON.parse(localStorage.getItem(key) || '{}');
+  items.forEach((it, i) => {
+    const id = 'chk' + i;
+    const row = document.createElement('label');
+    row.className = 'flex items-start gap-3 rounded-lg border border-slate-800 bg-slate-900/40 px-4 py-2.5 cursor-pointer hover:bg-slate-900/70';
+    const cls = it[0] === 'S0' ? 's0' : it[0] === 'S1' ? 's1' : it[0] === 'S2' ? 's2' : 'p';
+    row.innerHTML = '<input type="checkbox" id="' + id + '" class="mt-0.5 accent-amber-400"' + (saved[id] ? ' checked' : '') + '>' +
+      '<span class="sev ' + cls + ' mt-0.5">' + it[0] + '</span><span class="text-slate-300' + (saved[id] ? ' line-through text-slate-500' : '') + '">' + esc(it[1]) + '</span>';
+    box.appendChild(row);
+    row.querySelector('input').addEventListener('change', e => {
+      saved[id] = e.target.checked; localStorage.setItem(key, JSON.stringify(saved));
+      const span = row.querySelector('span:last-child');
+      span.classList.toggle('line-through', e.target.checked); span.classList.toggle('text-slate-500', e.target.checked);
+    });
+  });
+
+  // --- scroll spy ---
+  const links = [...document.querySelectorAll('#nav a')];
+  const targets = links.map(a => document.querySelector(a.getAttribute('href'))).filter(Boolean);
+  const io = new IntersectionObserver(entries => {
+    entries.forEach(en => {
+      if (en.isIntersecting) {
+        links.forEach(l => l.classList.remove('nav-active'));
+        const l = links.find(l => l.getAttribute('href') === '#' + en.target.id);
+        if (l) l.classList.add('nav-active');
+      }
+    });
+  }, { rootMargin: '-10% 0px -80% 0px' });
+  targets.forEach(t => io.observe(t));
+</script>
+</body>
+</html>
