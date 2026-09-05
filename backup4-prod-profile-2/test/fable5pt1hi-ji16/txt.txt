@@ -3,3 +3,5 @@ This version = jit_ppc-fixfromjit16.cpp
 
 unfortunately it also breaks compatibility with certain games such as contra 4 nds where the bottom screen does not even display (it is a dual screen 2d graphics game)
 ironically rockwrestler nds is 5fps as well. wonder how much further this can go. 
+
+Reading the debug logs, it looks as if the JIT path is never taken. sad
