@@ -1,6 +1,6 @@
 Can you help me improve my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the situation, followed by my code:
 
-Most gba games boot and run but nds games do not. 
+Most gba games boot and run but nds games do not. Can you make suggestions then implement them in jit_ppc.cpp?
 
 //debug_log.h
 #pragma once
