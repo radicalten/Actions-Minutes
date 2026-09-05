@@ -1,2 +1,4 @@
 Eureka! This version works. Speed up in MKDS from 10 to 21 fps in menus. 5-8 fps in grand prix from 3-4 fps. AMAZING!
 This version = jit_ppc-fixfromjit16.cpp
+
+unfortunately it also breaks compatibility with certain games such as contra 4 nds where the bottom screen does not even display (it is a dual screen 2d graphics game)
