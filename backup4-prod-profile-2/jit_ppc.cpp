@@ -1,43 +1,4 @@
 // jit_ppc.cpp — ARM → PPC JIT (Wii/Broadway)
-//
-// Review fix plan applied ("ARM7/ARM9 → Broadway JIT", payoff ÷ effort order):
-//
-//  P0.1  No pipeline refill on normal exits. JitHelp_commit writes r0-r14 + CPSR and
-//        sets r15 to exactly what setPC() would have produced (self-calibrated once per
-//        CPU/mode, so it does not depend on the interpreter's r15 convention), marks the
-//        pipeline dirty, and the runner refills lazily only when the interpreter must run.
-//        Register sync at block entry is 30 inline loads (pointer, then value) - no C call,
-//        no isReady()/null checks in the hot path (they happen once when the stub is built).
-//  P0.2  One shared exit stub (spill + commit + epilogue) and one per-CPU entry stub
-//        (prologue + register sync + bctr) emitted once. Blocks exit with
-//        li TE,pc ; li TF,reason ; li TG,cycles ; b exitStub  (4-5 words).
-//  P0.3  Conditional B/BL/BX/LDM-pc/LDR-pc/ALU-pc/Thumb Bcc emit only the taken exit and
-//        keep compiling the fall-through. BLK_ARMS=48, BLK_WDS=4096, BLK_MARGIN=192.
-//        Blocks never cross a 4 KB page (keeps page invalidation exact).
-//  P0.4  Code buffer in cached MEM2 (16 MB, SYS_AllocArena2MemLo) with a MEM1 fallback;
-//        MEM1 address restrictions removed from Ctx::call()/initJit(). Direct-mapped
-//        cache replaced by a two-level page table: pageTab[cpu][pc>>12] -> 2048 slots
-//        indexed by (pc & 0xFFF) >> 1, entry = code | thumb. Lookup = 2 loads, no
-//        eviction, invalidation = zero the page's slot array.
-//  P0.5  Hot fallbacks compiled: Rm=PC in immediate shifter (mov lr,pc / add rX,pc,rY),
-//        BLX #imm (ARM9), LDR pc,[..] (+ ARM LDR/LDRH rX,[pc,#imm] literals),
-//        ALU writes to PC (mov pc,lr), Thumb BLX suffix guarded on ARM7.
-//        SWI intentionally stays a fallback: performing exception() from the runner needs
-//        the interpreter's "r15 during execution" convention (+8/+4 vs resting state),
-//        which differs between forks; the fallback is correct by construction. If you add
-//        `int jitException(uint8_t v){return exception(v);}` to Interpreter, flip
-//        JIT_INLINE_SWI to 1 below and set r15 = pc + (thumb ? 4 : 8) there.
-//  P1.a  Condition codes inline: mtcrf 0x80,RCPSR puts NZCV in CR0; simple conditions are
-//        one bc, compound ones one/two CR-logical ops into cr1. JitHelp_testCond removed.
-//  Nits  emitMrsMsr tests all operands before emitting; lookup/compile split; page-table
-//        removes the direct-mapped eviction leak; runner does no per-block sanity dance;
-//        per-block cycle accounting (1 + memory) replaces the fixed 64 cycles per 24 blocks;
-//        RRX temp no longer clobbers the shifter destination when dst == TA.
-//
-// Still open (P1.b/c/d, P2): dead-flag elimination, inline page-map memory fast path,
-// inline PUSH/POP/LDM/STM and register shifts, dispatcher loop + block linking.
-// Every piece of emitted code here carries over to those.
-
 #include "jit_ppc.h"
 #include "core.h"
 #include "interpreter.h"
@@ -58,6 +19,13 @@ extern "C" {
 #ifndef JIT_INLINE_SWI
 #define JIT_INLINE_SWI 0
 #endif
+
+// Provided by the frontend (MEM2 heap). Cached MEM2 (0x9xxxxxxx) is executable on the Wii.
+extern void* Noods_MEM2_Alloc(size_t size);
+
+// Exported: 1 => some CPU has compiled code in this 4K page (pc < 0x10000000).
+// memory.cpp tests this before calling JitPpc::invalidateJitWrite().
+uint8_t g_jitCodePage[0x10000];
 
 static const int EXIT_NORMAL   = 0;
 static const int EXIT_FALLBACK = 1;
@@ -92,6 +60,25 @@ static_assert(FRAME_REGSYNC + 15 * 4 <= FRAME_CPSR, "regsync");
 
 namespace JitPpc {
 
+// ========================= Debug tooling (section 5) =========================
+// Bit mask of emitter classes that are allowed to compile. Flip bits from the frontend's debug
+// menu; when a game starts working after clearing a bit you have found the broken emitter.
+enum JitClass { JC_DP = 1, JC_LS = 2, JC_LSX = 4, JC_MUL = 8, JC_BLOCK = 16, JC_BRANCH = 32, JC_PSR = 64,
+                JC_T_ALU = 128, JC_T_MEM = 256, JC_T_STACK = 512, JC_T_BR = 1024 };
+uint32_t g_jitEnable = 0xFFFFFFFFu;
+#define JC_ON(c) ((g_jitEnable & (c)) != 0)
+
+static uint32_t g_fbHist[2][256];        // [thumb][class key]
+static inline void noteFallback(bool thumb, uint32_t op) {
+    g_fbHist[thumb][thumb ? (op >> 8) & 0xFF : (op >> 20) & 0xFF]++;
+}
+void dumpFallbacks() {
+    for (int t = 0; t < 2; t++)
+        for (int k = 0; k < 256; k++)
+            if (g_fbHist[t][k] > 1000)
+                printf("[JIT] %s key %02X : %u fallbacks\n", t ? "thumb" : "arm", k, g_fbHist[t][k]);
+}
+
 // ========================= PPC encoders =========================
 static inline uint32_t ppc_blr() { return 0x4E800020u; }
 static inline uint32_t ppc_bctr(bool lk = false) {
@@ -122,8 +109,14 @@ static inline uint32_t ppc_stw(uint8_t rs, int16_t d, uint8_t ra) {
 static inline uint32_t ppc_lwz(uint8_t rt, int16_t d, uint8_t ra) {
     return (32u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
 }
+static inline uint32_t ppc_lbz(uint8_t rt, int16_t d, uint8_t ra) {
+    return (34u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)d;
+}
 static inline uint32_t ppc_cmpi(uint8_t cr, uint8_t ra, int16_t i) {
     return (11u << 26) | ((cr & 7u) << 23) | ((uint32_t)ra << 16) | (uint16_t)i;
+}
+static inline uint32_t ppc_cmpli(uint8_t cr, uint8_t ra, uint16_t i) {
+    return (10u << 26) | ((cr & 7u) << 23) | ((uint32_t)ra << 16) | i;          // cmplwi
 }
 static inline uint32_t ppc_subfic(uint8_t rt, uint8_t ra, int16_t i) {
     return (8u << 26) | ((uint32_t)rt << 21) | ((uint32_t)ra << 16) | (uint16_t)i;
@@ -143,6 +136,7 @@ static inline uint32_t ppc_subf (uint8_t d, uint8_t a, uint8_t b) { return XOf(d
 static inline uint32_t ppc_subfc(uint8_t d, uint8_t a, uint8_t b) { return XOf(d, a, b, false, 8); }
 static inline uint32_t ppc_subfe(uint8_t d, uint8_t a, uint8_t b) { return XOf(d, a, b, false, 136); }
 static inline uint32_t ppc_mullw(uint8_t d, uint8_t a, uint8_t b) { return XOf(d, a, b, false, 235); }
+static inline uint32_t ppc_neg  (uint8_t d, uint8_t a)            { return XOf(d, a, 0, false, 104); }
 static inline uint32_t ppc_and  (uint8_t a, uint8_t s, uint8_t b) { return Xf(s, a, b, 28); }
 static inline uint32_t ppc_or   (uint8_t a, uint8_t s, uint8_t b) { return Xf(s, a, b, 444); }
 static inline uint32_t ppc_xor  (uint8_t a, uint8_t s, uint8_t b) { return Xf(s, a, b, 316); }
@@ -223,7 +217,6 @@ static const uint8_t TH = 10;   // result temp for TST/TEQ/CMP/CMN/ALU-pc (never
 static const uint8_t TX = 12;   // scratch for flag code ONLY – never holds an operand
 static const uint8_t RCALL = 11;
 
-// ========================= code buffer / block table =========================
 static const size_t JIT_BYTES_MEM2   = 16u * 1024u * 1024u;
 static const size_t JIT_BYTES_MEM1   = 2u * 1024u * 1024u;      // fallback if MEM2 is exhausted
 static const size_t PAGE_SLOTS       = 2048;                    // (pc & 0xFFF) >> 1
@@ -252,6 +245,7 @@ static size_t    g_pageUsed  = 0;
 static uint32_t* g_pageTab[2][TOP_PAGES];
 static uint32_t  g_livePages[PAGE_ARENA_CNT];
 static size_t    g_nLive     = 0;
+static uint64_t  g_pageCover[PAGE_ARENA_CNT];   // bit c set => bytes [c*64, c*64+64) of that page hold compiled code
 
 // A block whose first instruction is not JIT-able maps to this sentinel:
 // the runner steps the interpreter directly without entering generated code.
@@ -262,6 +256,8 @@ static inline int32_t pageIndex(uint32_t pc) {
     if (pc >= 0xFFFF0000u) return (int32_t)(0x10000u + ((pc >> 12) & 0xFu));
     return -1;
 }
+
+static inline size_t pageSlotIdx(uint32_t* pg) { return (size_t)(pg - g_pageArena) / PAGE_SLOTS; }
 
 static void flushICache(uint32_t* p, size_t nW) {
     DCFlushRange(p, nW * 4);
@@ -276,6 +272,8 @@ void flushJitCache() {
     }
     g_nLive = 0;
     g_pageUsed = 0;
+    memset(g_pageCover, 0, sizeof g_pageCover);
+    memset(g_jitCodePage, 0, sizeof g_jitCodePage);
 }
 
 static uint32_t* lookupBlock(int cpu, uint32_t pc, bool thumb) {
@@ -297,12 +295,42 @@ static uint32_t* getPage(int cpu, uint32_t pc) {
     uint32_t* pg = g_pageArena + g_pageUsed * PAGE_SLOTS;
     g_pageUsed++;
     memset(pg, 0, PAGE_SLOTS * 4);
+    g_pageCover[pageSlotIdx(pg)] = 0;
     g_pageTab[cpu][pi] = pg;
     g_livePages[g_nLive++] = ((uint32_t)cpu << 20) | (uint32_t)pi;
     return pg;
 }
 
-// ========================= emit context =========================
+// Record that [startPC, endPC) of pg's page now holds compiled code.
+static void markCover(uint32_t* pg, uint32_t startPC, uint32_t endPC) {
+    size_t   k  = pageSlotIdx(pg);
+    unsigned c0 = (startPC & 0xFFFu) >> 6, c1 = ((endPC - 1) & 0xFFFu) >> 6;
+    for (unsigned c = c0; c <= c1; c++) g_pageCover[k] |= 1ull << c;
+    if (startPC < 0x10000000u) g_jitCodePage[startPC >> 12] = 1;
+}
+
+// One guest write of `size` bytes at `addr`. O(1). Safe to call from inside a running block:
+// slots are only zeroed, code memory is never reused here.
+void invalidateJitWrite(uint32_t addr, uint32_t size) {
+    int32_t pi = pageIndex(addr);
+    if (pi < 0 || size == 0) return;
+    uint32_t last = addr + size - 1;
+    if ((last ^ addr) & ~0xFFFu) last = addr | 0xFFFu;        // clip to this page
+    unsigned c0 = (addr & 0xFFFu) >> 6, c1 = (last & 0xFFFu) >> 6;
+    uint64_t m = 0;
+    for (unsigned c = c0; c <= c1; c++) m |= 1ull << c;
+
+    bool still = false;
+    for (int cpu = 0; cpu < 2; cpu++) {
+        uint32_t* pg = g_pageTab[cpu][pi];
+        if (!pg) continue;
+        size_t k = pageSlotIdx(pg);
+        if (g_pageCover[k] & m) { memset(pg, 0, PAGE_SLOTS * 4); g_pageCover[k] = 0; }
+        if (g_pageCover[k]) still = true;
+    }
+    if (!still && addr < 0x10000000u) g_jitCodePage[addr >> 12] = 0;
+}
+
 struct Ctx {
     uint32_t *base, *cur;
     size_t cap;
@@ -378,21 +406,13 @@ uint32_t JitHelp_ldr32(Core* c, int a, uint32_t ad) {
     if (ad & 3u) { unsigned sh = (ad & 3u) * 8u; v = (v >> sh) | (v << (32u - sh)); }
     return v;
 }
-uint16_t JitHelp_r16(Core* c, int a, uint32_t ad) {
-    return c->memory.read<uint16_t>((bool)a, ad);
-}
-uint8_t JitHelp_r8(Core* c, int a, uint32_t ad) {
-    return c->memory.read<uint8_t>((bool)a, ad);
-}
-void JitHelp_w32(Core* c, int a, uint32_t ad, uint32_t v) {
-    c->memory.write<uint32_t>((bool)a, ad, v);
-}
-void JitHelp_w16(Core* c, int a, uint32_t ad, uint16_t v) {
-    c->memory.write<uint16_t>((bool)a, ad, v);
-}
-void JitHelp_w8(Core* c, int a, uint32_t ad, uint8_t v) {
-    c->memory.write<uint8_t>((bool)a, ad, v);
-}
+// Sub-word helpers are word-sized on purpose: the PPC ABI expects the *caller* to truncate
+// char/short arguments, and generated code passes the untruncated guest register.
+uint32_t JitHelp_r16(Core* c, int a, uint32_t ad) { return c->memory.read<uint16_t>((bool)a, ad); }
+uint32_t JitHelp_r8 (Core* c, int a, uint32_t ad) { return c->memory.read<uint8_t >((bool)a, ad); }
+void JitHelp_w32(Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint32_t>((bool)a, ad, v); }
+void JitHelp_w16(Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint16_t>((bool)a, ad, (uint16_t)v); }
+void JitHelp_w8 (Core* c, int a, uint32_t ad, uint32_t v) { c->memory.write<uint8_t >((bool)a, ad, (uint8_t )v); }
 
 int JitHelp_armBlock(Core* core, int arm7, uint32_t op,
                      uint32_t* regs, uint32_t pcForR15,
@@ -545,7 +565,12 @@ void JitHelp_tick(Core* core, uint32_t cycles) {
 
 } // extern "C"
 
-// ========================= shared stubs / exits =========================
+// Core::resetCycles() subtracts globalCycles from every timeline; the JIT's private
+// per-CPU timelines must follow or the runner jumps ~32 s forward after the first rebase.
+void rebaseCycles(uint32_t g) { g_cpuTime[0] -= g; g_cpuTime[1] -= g; }
+
+static uint32_t armCycles(uint32_t op);   // fwd (used by emitBlockXfer's fallback path)
+
 static void emitEpilogue(Ctx& ctx) {
     for (int r = 14; r <= 31; r++)
         ctx.E(ppc_lwz(r, FRAME_SAVE + (r - 14) * 4, 1));
@@ -567,7 +592,6 @@ static void emitReload(Ctx& ctx) {
     ctx.E(ppc_lwz(RCPSR, FRAME_CPSR, 1));
 }
 
-// Exit stub: expects TE = pc, TF = reason, TG = cycles.
 static void emitExitStubBody(Ctx& ctx) {
     emitSpill(ctx);
     ctx.ldInterp();                                  // r3
@@ -598,6 +622,20 @@ static void emitCommitExitDyn(Ctx& ctx, int reason) {
     emitJumpExitStub(ctx);
 }
 
+static void patchBc(Ctx& ctx, size_t idx, uint8_t bo, uint8_t bi);
+
+// If the store we just performed halted this CPU (HALTCNT / IME / IE write), commit state
+// with PC = next instruction and leave the block instead of running past the halt.
+static void emitHaltCheck(Ctx& ctx, uint32_t nextPC) {
+    ctx.li(TA, (uint32_t)(uintptr_t)&ctx.interp->halted);   // uint8_t, public
+    ctx.E(ppc_lbz(TA, 0, TA));
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t b = ctx.sz();
+    ctx.E(ppc_bc(12, 2, 0));                                  // beq continue
+    emitCommitExit(ctx, nextPC, EXIT_NORMAL);
+    patchBc(ctx, b, 12, 2);
+}
+
 static bool buildExitStub() {
     if (g_exitStub) return true;
     Ctx ctx;
@@ -613,7 +651,6 @@ static bool buildExitStub() {
     return true;
 }
 
-// Entry stub (per CPU): prologue, frame constants, inline register sync, jump to block.
 static bool ensureEntryStub(int cpu, Interpreter* interp, Core* core) {
     if (g_entryStub[cpu]) return true;
     uint32_t** regs = interp->getRegisters();
@@ -657,9 +694,6 @@ static bool ensureEntryStub(int cpu, Interpreter* interp, Core* core) {
     return true;
 }
 
-// ========================= conditions / branch patching =========================
-// mtcrf 0x80,RCPSR : CR0.LT=N (bit0) CR0.GT=Z (bit1) CR0.EQ=C (bit2) CR0.SO=V (bit3); cr1 bit4 scratch.
-// Returns the index of the skip branch (taken when the condition is FALSE), or SIZE_MAX.
 static size_t emitCondSkip(Ctx& ctx, uint8_t cond) {
     if (cond >= 14) return SIZE_MAX;
     ctx.E(ppc_mtcrf(0x80, RCPSR));
@@ -701,7 +735,6 @@ static void patchB(Ctx& ctx, size_t idx) {
     ctx.base[idx] = ppc_b((int32_t)((ctx.sz() - idx) * 4));
 }
 
-// ========================= flags =========================
 static void setNZ(Ctx& ctx, uint8_t r) {
     ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 2, 31));   // clear N,Z
     ctx.E(ppc_rlwimi(RCPSR, r, 0, 0, 0));        // N = r[31]
@@ -738,7 +771,6 @@ static void setC_bit0(Ctx& ctx, uint8_t cr) {
     ctx.E(ppc_or(RCPSR, RCPSR, TX));
 }
 
-// ========================= shifter =========================
 static inline uint8_t rotBitTo0(int bit) { return (uint8_t)((32 - bit) & 31); }
 
 static void sLslI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
@@ -831,16 +863,14 @@ static bool emitShifter(Ctx& ctx, uint32_t op, uint8_t dst, bool sc, uint32_t cu
         case 0: ctx.E(ppc_slw(dst, TA, TD)); break;
         case 1: ctx.E(ppc_srw(dst, TA, TD)); break;
         case 2: ctx.E(ppc_sraw(dst, TA, TD)); break;
-        default:
-            ctx.E(ppc_subfic(TB, TD, 32));
+        default:                                        // ROR Rm, Rs
+            ctx.E(ppc_neg(TB, TD));                     // (-n) & 31 == (32-n) & 31 ; does not touch CA
             ctx.E(ppc_rlwnm(dst, TA, TB, 0, 31));
             break;
     }
     return false;
 }
 
-// ========================= dynamic jumps =========================
-// Interworking jump: value in TA. T = bit0, PC = value & ~1 (commit aligns further).
 static void emitBX_TA(Ctx& ctx) {
     ctx.E(ppc_rlwinm(TB, TA, 0, 0, 30));
     ctx.E(ppc_stw(TB, FRAME_PC, 1));
@@ -862,7 +892,6 @@ static void emitJumpSameMode_SCR0(Ctx& ctx) {
     emitCommitExitDyn(ctx, EXIT_NORMAL);
 }
 
-// ========================= ARM emitters =========================
 enum DP { AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN };
 
 static bool emitDP(Ctx& ctx, uint32_t op, uint32_t curPC) {
@@ -915,7 +944,6 @@ static bool emitDP(Ctx& ctx, uint32_t op, uint32_t curPC) {
         ctx.E(ppc_stw(srcRn, FRAME_SCR1, 1));
     }
 
-    // Test results and PC writes go to TH (r10) – never TC, which holds the shifter carry-out.
     const uint8_t res = (isTest || rd == 15) ? TH : RA[rd];
 
     switch ((DP)dop) {
@@ -1064,13 +1092,15 @@ static bool emitLS(Ctx& ctx, uint32_t op, uint32_t curPC) {
         else          ctx.E(ppc_mr(RA[rd], TA));
     }
 
-    if (rn != 15) {
-        ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
-        if (!pre) {
-            if (up) ctx.E(ppc_add(RA[rn], RA[rn], TA));
+    // Writeback. When a LOAD targets the base register the loaded value wins (UNPREDICTABLE on
+    // real ARM for Pr+wb, but "load wins" is what ARM7TDMI/ARM946E-S do and what noods does).
+    if (rn != 15 && !(ld && rn == rd)) {
+        ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));               // offset
+        if (!pre) {                                      // post-index: always write back
+            if (up) ctx.E(ppc_add (RA[rn], RA[rn], TA));
             else    ctx.E(ppc_subf(RA[rn], TA, RA[rn]));
-        } else if (wb && rn != rd) {
-            ctx.E(ppc_lwz(RA[rn], FRAME_SCR1, 1));
+        } else if (wb) {                                 // pre-index with '!': also for STR Rn,[Rn,#x]!
+            ctx.E(ppc_lwz(RA[rn], FRAME_SCR1, 1));       // effective address
         }
     }
 
@@ -1082,6 +1112,7 @@ static bool emitLS(Ctx& ctx, uint32_t op, uint32_t curPC) {
         else patchSkip(ctx, si);
         return true;
     }
+    if (!ld) emitHaltCheck(ctx, curPC + 4);
     patchSkip(ctx, si);
     return true;
 }
@@ -1142,15 +1173,17 @@ static bool emitLSExtra(Ctx& ctx, uint32_t op, uint32_t curPC) {
         else ctx.E(ppc_mr(RA[rd], TA));
     }
 
-    if (rn != 15) {
+    // Writeback: loaded value wins when Rd == Rn; stores with '!' always write back.
+    if (rn != 15 && !(l && rn == rd)) {
         ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
         if (!p) {
             if (u) ctx.E(ppc_add(RA[rn], RA[rn], TA));
             else   ctx.E(ppc_subf(RA[rn], TA, RA[rn]));
-        } else if (w && rn != rd) {
+        } else if (w) {
             ctx.E(ppc_lwz(RA[rn], FRAME_SCR1, 1));
         }
     }
+    if (!l) emitHaltCheck(ctx, curPC + 4);
     patchSkip(ctx, si);
     return true;
 }
@@ -1179,14 +1212,13 @@ static bool emitMul(Ctx& ctx, uint32_t op) {
     return true;
 }
 
-// MRS / MSR (CPSR flags / full CPSR read; mode switches → fallback).
-// Every operand is tested BEFORE anything is emitted.
+// Every pattern below requires R == 0 (bit 22): SPSR forms go to the interpreter.
 static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t /*curPC*/) {
     uint8_t cond = (op >> 28) & 0xF;
     if (cond == 15) return false;
 
-    // MRS Rd, CPSR
-    if ((op & 0x0FBF0FFF) == 0x010F0000) {
+    // MRS Rd, CPSR            cond 0001 0 0 00 1111 Rd 0000 0000 0000
+    if ((op & 0x0FFF0FFF) == 0x010F0000) {
         uint8_t rd = (op >> 12) & 0xF;
         if (rd == 15) return false;
         size_t si = emitCondSkip(ctx, cond);
@@ -1195,8 +1227,8 @@ static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t /*curPC*/) {
         return true;
     }
 
-    // MSR CPSR_f, #imm  (flags field only)
-    if ((op & 0x0DB0F000) == 0x0320F000) {
+    // MSR CPSR_f, #imm        cond 0011 0 0 10 1000 1111 rot imm8
+    if ((op & 0x0FF0F000) == 0x0320F000) {
         uint8_t mask = (op >> 16) & 0xF;
         if (mask != 0x8) return false;
         uint32_t imm = op & 0xFF;
@@ -1212,8 +1244,8 @@ static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t /*curPC*/) {
         return true;
     }
 
-    // MSR CPSR_f, Rm
-    if ((op & 0x0DB0FFF0) == 0x0120F000) {
+    // MSR CPSR_f, Rm          cond 0001 0 0 10 1000 1111 0000 0000 Rm
+    if ((op & 0x0FF0FFF0) == 0x0120F000) {
         uint8_t mask = (op >> 16) & 0xF;
         uint8_t rm = op & 0xF;
         if (mask != 0x8 || rm == 15) return false;
@@ -1260,6 +1292,7 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
     ctx.E(ppc_bc(12, 0, 0));                            // blt fail   (patched below)
 
     emitReload(ctx);                                    // pick up regs written by helper
+    if (!load) emitHaltCheck(ctx, curPC + 4);           // STM may have hit HALTCNT / IME / IE
     size_t bJoin = SIZE_MAX;
     if (loadPC) {
         emitCommitExitDyn(ctx, EXIT_NORMAL);            // FRAME_PC = popped PC, FRAME_CPSR updated
@@ -1269,7 +1302,13 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
     }
 
     patchBc(ctx, bFail, 12, 0);                         // fail:
-    emitCommitExit(ctx, curPC, EXIT_FALLBACK);
+    {   // the interpreter will charge this instruction itself -> don't count it twice
+        const uint32_t saved = ctx.cycles;
+        const uint32_t own = armCycles(op);
+        ctx.cycles = saved > own ? saved - own : 0;
+        emitCommitExit(ctx, curPC, EXIT_FALLBACK);
+        ctx.cycles = saved;
+    }
 
     if (bJoin != SIZE_MAX) patchB(ctx, bJoin);          // join:
 
@@ -1279,7 +1318,7 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
 }
 
 static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
-    if ((op & 0xFE000000) == 0xFA000000) return emitBlxImm(ctx, op, curPC);
+    if ((op & 0xFE000000) == 0xFA000000) return JC_ON(JC_BRANCH) && emitBlxImm(ctx, op, curPC);
 
     uint8_t cond = (op >> 28) & 0xF;
     if (cond == 15) return false;
@@ -1297,32 +1336,33 @@ static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
 
     // MRS / MSR (register forms) only: bits 27-23 = 00010, bit 20 = 0, bits 7-4 = 0000.
     if ((op & 0x0F9000F0) == 0x01000000)
-        return emitMrsMsr(ctx, op, curPC);
+        return JC_ON(JC_PSR) && emitMrsMsr(ctx, op, curPC);
 
     uint32_t it = (op >> 25) & 7;
     switch (it) {
         case 0:
-            if ((op & 0x0FC000F0) == 0x00000090) return emitMul(ctx, op);
+            if ((op & 0x0FC000F0) == 0x00000090) return JC_ON(JC_MUL) && emitMul(ctx, op);
             if ((op & 0x0FFFFFF0) == 0x012FFF10 ||
                 (op & 0x0FFFFFF0) == 0x012FFF30)
-                return emitBranch(ctx, op, curPC);
-            if ((op & 0x0E000090) == 0x00000090) return emitLSExtra(ctx, op, curPC);
-            return emitDP(ctx, op, curPC);
+                return JC_ON(JC_BRANCH) && emitBranch(ctx, op, curPC);
+            if ((op & 0x0E000090) == 0x00000090) return JC_ON(JC_LSX) && emitLSExtra(ctx, op, curPC);
+            return JC_ON(JC_DP) && emitDP(ctx, op, curPC);
         case 1:
-            return emitDP(ctx, op, curPC);
+            if ((op & 0x0FB00000) == 0x03200000)          // MSR{ CPSR|SPSR }_x, #imm
+                return JC_ON(JC_PSR) && emitMrsMsr(ctx, op, curPC);
+            return JC_ON(JC_DP) && emitDP(ctx, op, curPC);
         case 2:
         case 3:
-            return emitLS(ctx, op, curPC);
+            return JC_ON(JC_LS) && emitLS(ctx, op, curPC);
         case 4:
-            return emitBlockXfer(ctx, op, curPC);
+            return JC_ON(JC_BLOCK) && emitBlockXfer(ctx, op, curPC);
         case 5:
-            return emitBranch(ctx, op, curPC);
+            return JC_ON(JC_BRANCH) && emitBranch(ctx, op, curPC);
         default:
             return false;
     }
 }
 
-// ========================= Thumb =========================
 static bool emitT_shifts(Ctx& ctx, uint16_t op) {
     uint8_t ty = (op >> 11) & 3, rd = op & 7, rs = (op >> 3) & 7;
     int i = (op >> 6) & 0x1F;
@@ -1371,14 +1411,50 @@ static bool emitT_imm8(Ctx& ctx, uint16_t op) {
     return false;
 }
 
+// Thumb format 4: LSL(2) LSR(3) ASR(4) ROR(7) Rd, Rs.  N,Z always; C only when n != 0.
+// ARM semantics (n = Rs & 0xFF): n = 0 -> value and C unchanged; LSL/LSR n = 32 -> 0, C = bit0/bit31;
+// n > 32 -> 0, C = 0; ASR n >= 32 -> sign fill, C = bit31; ROR by n & 31, C = result bit31.
+static bool emitT_aluShiftReg(Ctx& ctx, uint8_t o, uint8_t d, uint8_t s) {
+    ctx.E(ppc_rlwinm(TD, s, 0, 24, 31));                 // n = Rs & 0xFF
+    ctx.E(ppc_cmpi(0, TD, 0));
+    size_t bZero = ctx.sz();
+    ctx.E(ppc_bc(12, 2, 0));                             // beq -> only N,Z
+
+    if (o == 7) {                                        // ROR
+        ctx.E(ppc_neg(TB, TD));
+        ctx.E(ppc_rlwnm(d, d, TB, 0, 31));               // rotate right by n & 31
+        ctx.E(ppc_rlwinm(TC, d, 1, 31, 31));             // C = result bit 31 (also right when n & 31 == 0)
+    } else {
+        const int clamp = (o == 4) ? 32 : 33;            // behaviour is constant beyond this
+        ctx.E(ppc_cmpli(0, TD, (uint16_t)clamp));
+        size_t bOk = ctx.sz();
+        ctx.E(ppc_bc(4, 1, 0));                          // ble ok
+        ctx.E(ppc_addi(TD, 0, (int16_t)clamp));
+        patchBc(ctx, bOk, 4, 1);
+        if (o == 2) {                                    // LSL : C = bit(32-n)
+            ctx.E(ppc_subfic(TB, TD, 32));               // n=32 -> 0 (bit0) ; n=33 -> -1 -> srw gives 0
+            ctx.E(ppc_srw(TC, d, TB));
+            ctx.E(ppc_slw(d, d, TD));                    // n>=32 -> 0
+        } else {                                         // LSR / ASR : C = bit(n-1)
+            ctx.E(ppc_addi(TB, TD, -1));
+            ctx.E(ppc_srw(TC, d, TB));                   // n=32 -> bit31 ; n=33 -> 0
+            ctx.E(o == 3 ? ppc_srw(d, d, TD) : ppc_sraw(d, d, TD));
+        }
+        ctx.E(ppc_rlwinm(TC, TC, 0, 31, 31));
+    }
+    setC_bit0(ctx, TC);
+    patchBc(ctx, bZero, 12, 2);
+    setNZ(ctx, d);
+    return true;
+}
+
 static bool emitT_alu(Ctx& ctx, uint16_t op) {
     uint8_t rd = op & 7, rs = (op >> 3) & 7, o = (op >> 6) & 0xF;
     uint8_t d = RA[rd], s = RA[rs];
     switch (o) {
         case 0: ctx.E(ppc_and(d, d, s)); setNZ(ctx, d); break;
         case 1: ctx.E(ppc_xor(d, d, s)); setNZ(ctx, d); break;
-        // LSL/LSR/ASR/ROR by register also update C -> interpreter until implemented (P1)
-        case 2: case 3: case 4: case 7: return false;
+        case 2: case 3: case 4: case 7: return emitT_aluShiftReg(ctx, o, d, s);
         case 5:
             ctx.E(ppc_rlwinm(TA, RCPSR, 0, 2, 2)); ctx.E(ppc_mtxer(TA));
             ctx.E(ppc_mr(TB, d)); ctx.E(ppc_adde(d, TB, s));
@@ -1423,13 +1499,13 @@ static bool emitT_hiReg(Ctx& ctx, uint16_t op, uint32_t curPC) {
     }
     if (rd == 15) {                                 // ADD pc,Rs / MOV pc,Rs : stay in Thumb
         if (o == 1) return false;
+        if (o == 0 && rs == 15) return false;       // ADD pc,pc : unpredictable -> interpreter
         if (o == 2) {
             if (rs == 15) ctx.li(TA, curPC + 4);
             else          ctx.E(ppc_mr(TA, RA[rs]));
         } else {
             ctx.li(TA, curPC + 4);
-            if (rs != 15) ctx.E(ppc_add(TA, TA, RA[rs]));
-            else          ctx.E(ppc_add(TA, TA, TA));
+            ctx.E(ppc_add(TA, TA, RA[rs]));
         }
         ctx.E(ppc_stw(TA, FRAME_SCR0, 1));
         emitJumpSameMode_SCR0(ctx);
@@ -1466,7 +1542,7 @@ static bool emitT_ldrPc(Ctx& ctx, uint16_t op, uint32_t curPC) {
     return true;
 }
 
-static bool emitT_memReg(Ctx& ctx, uint16_t op) {
+static bool emitT_memReg(Ctx& ctx, uint16_t op, uint32_t curPC) {
     uint8_t rd = op & 7, rb = (op >> 3) & 7, ro = (op >> 6) & 7, k = (op >> 9) & 7;
     void* fn = nullptr;
     bool ld = true, sxb = false, sxh = false;
@@ -1492,11 +1568,13 @@ static bool emitT_memReg(Ctx& ctx, uint16_t op) {
         if (sxb) ctx.E(ppc_extsb(RA[rd], TA));
         else if (sxh) ctx.E(ppc_extsh(RA[rd], TA));
         else ctx.E(ppc_mr(RA[rd], TA));
+    } else {
+        emitHaltCheck(ctx, curPC + 2);
     }
     return true;
 }
 
-static bool emitT_memImm(Ctx& ctx, uint16_t op) {
+static bool emitT_memImm(Ctx& ctx, uint16_t op, uint32_t curPC) {
     uint8_t rd = op & 7, rb = (op >> 3) & 7;
     bool ld = (op >> 11) & 1;
     uint8_t h = (op >> 12) & 0xF;
@@ -1513,6 +1591,7 @@ static bool emitT_memImm(Ctx& ctx, uint16_t op) {
                   : (hw ? (void*)JitHelp_w16 : by ? (void*)JitHelp_w8 : (void*)JitHelp_w32);
     ctx.call(fn);
     if (ld) ctx.E(ppc_mr(RA[rd], TA));
+    else    emitHaltCheck(ctx, curPC + 2);
     return true;
 }
 
@@ -1534,6 +1613,7 @@ static bool emitT_spLoad(Ctx& ctx, uint16_t op, uint32_t curPC) {
     if (!ld) ctx.E(ppc_mr(TD, RA[rd]));
     ctx.call(ld ? (void*)JitHelp_ldr32 : (void*)JitHelp_w32);
     if (ld) ctx.E(ppc_mr(RA[rd], TA));
+    else    emitHaltCheck(ctx, curPC + 2);
     return true;
 }
 
@@ -1577,6 +1657,7 @@ static bool emitT_pushPop(Ctx& ctx, uint16_t op, uint32_t curPC) {
     ctx.call((void*)JitHelp_thumbPushPop);
     emitReload(ctx);
 
+    if (!pop) emitHaltCheck(ctx, curPC + 2);   // PUSH is a store
     if (pop && R) {                            // POP {..., pc}
         emitCommitExitDyn(ctx, EXIT_NORMAL);   // helper wrote FRAME_PC (+ FRAME_CPSR on ARM9)
         ctx.done = true;
@@ -1584,7 +1665,8 @@ static bool emitT_pushPop(Ctx& ctx, uint16_t op, uint32_t curPC) {
     return true;
 }
 
-static bool emitT_ldmStm(Ctx& ctx, uint16_t op) {
+static bool emitT_ldmStm(Ctx& ctx, uint16_t op, uint32_t curPC) {
+    const bool load = (op >> 11) & 1;
     emitSpill(ctx);
     ctx.ldCore();
     ctx.E(ppc_addi(TB, 0, ctx.arm7 ? 1 : 0));
@@ -1592,6 +1674,7 @@ static bool emitT_ldmStm(Ctx& ctx, uint16_t op) {
     ctx.E(ppc_addi(TD, 1, (int16_t)FRAME_REGSYNC));
     ctx.call((void*)JitHelp_thumbBlock);
     emitReload(ctx);
+    if (!load) emitHaltCheck(ctx, curPC + 2);  // STMIA
     return true;
 }
 
@@ -1645,45 +1728,38 @@ static bool emitT_bl(Ctx& ctx, uint16_t op1, uint16_t op2, uint32_t curPC) {
     return true;
 }
 
+// Thumb formats by the top nibble:
+//   0,1 = shifts / add-sub (fmt 1/2)   2,3 = MOV/CMP/ADD/SUB imm8 (fmt 3)
+//   4   = ALU / hi-reg+BX / LDR literal (fmt 4-6)   5 = register-offset ld/st (fmt 7/8)
 static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
-    uint8_t h = (op >> 12) & 0xF;
-    switch (h) {
-        case 0x0:
-            if (((op >> 11) & 3) < 3) return emitT_shifts(ctx, op);
-            return emitT_addSub3(ctx, op);
-        case 0x1:
-            return emitT_imm8(ctx, op);
-        case 0x2: {
+    switch ((op >> 12) & 0xF) {
+        case 0x0: case 0x1:                              // 000 op imm5 Rs Rd  |  00011 I op Rn/imm3 Rs Rd
+            if (((op >> 11) & 3) < 3) return JC_ON(JC_T_ALU) && emitT_shifts(ctx, op);   // LSL / LSR / ASR #imm
+            return JC_ON(JC_T_ALU) && emitT_addSub3(ctx, op);                            // ADD / SUB Rd, Rs, Rn|#imm3
+        case 0x2: case 0x3:                              // 001 op Rd imm8 : MOV / CMP / ADD / SUB
+            return JC_ON(JC_T_ALU) && emitT_imm8(ctx, op);
+        case 0x4: {                                      // 0100 00 = ALU, 0100 01 = hi-reg/BX, 0100 1x = LDR literal
             uint8_t b = (op >> 10) & 3;
-            if (b == 0) return emitT_alu(ctx, op);
-            if (b == 1) return emitT_hiReg(ctx, op, curPC);
-            return emitT_ldrPc(ctx, op, curPC);
+            if (b == 0) return JC_ON(JC_T_ALU) && emitT_alu(ctx, op);
+            if (b == 1) return JC_ON(JC_T_ALU) && emitT_hiReg(ctx, op, curPC);
+            return JC_ON(JC_T_MEM) && emitT_ldrPc(ctx, op, curPC);
         }
-        case 0x3: case 0x4: case 0x5:
-            return emitT_memReg(ctx, op);
-        case 0x6: case 0x7: case 0x8:
-            return emitT_memImm(ctx, op);
-        case 0x9:
-            return emitT_spLoad(ctx, op, curPC);
-        case 0xA:
-            return emitT_addSpPc(ctx, op, curPC);
-        case 0xB:
-            if (((op >> 8) & 0xF) == 0) return emitT_addSpPc(ctx, op, curPC);
-            if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6)
-                return emitT_pushPop(ctx, op, curPC);
-            return false;
-        case 0xC:
-            return emitT_ldmStm(ctx, op);
-        case 0xD: case 0xE:
-            return emitT_branch(ctx, op, curPC);
-        default:
-            return false;
+        case 0x5:                                        // 0101 : LDR/STR{B,H,SB,SH} Rd,[Rb,Ro]
+            return JC_ON(JC_T_MEM) && emitT_memReg(ctx, op, curPC);
+        case 0x6: case 0x7: case 0x8:                    // 011 B L imm5 | 1000 L imm5 : imm offset
+            return JC_ON(JC_T_MEM) && emitT_memImm(ctx, op, curPC);
+        case 0x9:  return JC_ON(JC_T_MEM) && emitT_spLoad(ctx, op, curPC);    // 1001 : SP-relative
+        case 0xA:  return JC_ON(JC_T_ALU) && emitT_addSpPc(ctx, op, curPC);   // 1010 : ADD Rd, PC/SP, #imm
+        case 0xB:                                        // 1011 : ADD SP / PUSH / POP
+            if (((op >> 8) & 0xF) == 0) return JC_ON(JC_T_ALU) && emitT_addSpPc(ctx, op, curPC);
+            if (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6) return JC_ON(JC_T_STACK) && emitT_pushPop(ctx, op, curPC);
+            return false;                                // BKPT, SETEND, CPS... -> interpreter
+        case 0xC:  return JC_ON(JC_T_STACK) && emitT_ldmStm(ctx, op, curPC);  // 1100 : LDMIA/STMIA
+        case 0xD: case 0xE: return JC_ON(JC_T_BR) && emitT_branch(ctx, op, curPC);
+        default:   return false;                         // 0xF : BL halves are paired in compileBlock
     }
 }
 
-// ========================= cycle estimates =========================
-// Constants (the interpreter charges real waitstates). 1 per instruction, +1 for memory,
-// +1 per transferred register for block transfers. First knob to turn if a title misbehaves.
 static uint32_t armCycles(uint32_t op) {
     uint32_t it = (op >> 25) & 7;
     if (it == 2 || it == 3) return 2;
@@ -1693,28 +1769,32 @@ static uint32_t armCycles(uint32_t op) {
 }
 static uint32_t thumbCycles(uint16_t op) {
     uint8_t h = (op >> 12) & 0xF;
-    if ((h >= 3 && h <= 9) || (h == 2 && ((op >> 11) & 1))) return 2;
+    if ((h >= 5 && h <= 9) || (h == 4 && ((op >> 11) & 1))) return 2;   // loads/stores (+ LDR literal)
     if (h == 0xB && (((op >> 9) & 7) == 2 || ((op >> 9) & 7) == 6))
         return 1u + (uint32_t)__builtin_popcount(op & 0x1FFu);
     if (h == 0xC) return 1u + (uint32_t)__builtin_popcount(op & 0xFFu);
     return 1;
 }
 
-// ========================= compile / run =========================
-static bool validPC(uint32_t pc, bool gba) {
+// arm7 == true for the NDS ARM7 and for GBA mode (both run on interpreter[1]).
+static bool validPC(uint32_t pc, bool gba, bool arm7) {
     pc &= ~1u;
-    if (pc >= 0x80000000u && pc < 0xFFFF0000u) return false;
     if (gba) {
-        return (pc < 0x4000u) ||
-               (pc >= 0x02000000u && pc < 0x02040000u) ||
-               (pc >= 0x03000000u && pc < 0x03008000u) ||
-               (pc >= 0x06000000u && pc < 0x06018000u) ||
-               (pc >= 0x08000000u && pc < 0x0E000000u);
+        return (pc < 0x4000u) ||                               // BIOS
+               (pc >= 0x02000000u && pc < 0x02040000u) ||      // EWRAM
+               (pc >= 0x03000000u && pc < 0x03008000u) ||      // IWRAM
+               (pc >= 0x06000000u && pc < 0x06018000u) ||      // VRAM (rare)
+               (pc >= 0x08000000u && pc < 0x0E000000u);        // ROM + mirrors
     }
-    return (pc < 0x8000u) ||
-           (pc >= 0x02000000u && pc < 0x02400000u) ||
-           (pc >= 0x03000000u && pc < 0x03800000u) ||
-           (pc >= 0xFFFF0000u);
+    if (arm7) {
+        return (pc < 0x4000u) ||                               // ARM7 BIOS
+               (pc >= 0x02000000u && pc < 0x02400000u) ||      // main RAM
+               (pc >= 0x03000000u && pc < 0x04000000u);        // shared WRAM + IWRAM @ 0x03800000 (+ mirrors)
+    }
+    return (pc < 0x02000000u) ||                               // ITCM, 32 KB mirrored (libnds: 0x01FF8000)
+           (pc >= 0x02000000u && pc < 0x02400000u) ||          // main RAM  (use 0x03000000 in dsiMode)
+           (pc >= 0x03000000u && pc < 0x04000000u) ||          // shared WRAM (ARM9 view, mirrored)
+           (pc >= 0xFFFF0000u);                                // ARM9 BIOS
 }
 
 // With an HLE BIOS the interpreter's runOpcode() intercepts magic addresses in the
@@ -1757,7 +1837,7 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
 
     while (!ctx.done && !ctx.overflow) {
         if (n >= (int)BLK_ARMS || ctx.rem() < BLK_MARGIN ||
-            (curPC & ~0xFFFu) != page || !validPC(curPC, gba)) {
+            (curPC & ~0xFFFu) != page || !validPC(curPC, gba, arm7)) {
             if (n == 0) break;                          // nothing usable -> sentinel below
             emitCommitExit(ctx, curPC, EXIT_NORMAL);
             ctx.done = true;
@@ -1772,7 +1852,7 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
         if (thumb) {
             uint16_t op = core->memory.read<uint16_t>(arm7, curPC);
             bool handled = false;
-            if (((op >> 11) & 0x1F) == 0x1E && validPC(curPC + 2, gba)) {
+            if (((op >> 11) & 0x1F) == 0x1E && validPC(curPC + 2, gba, arm7)) {
                 uint16_t op2 = core->memory.read<uint16_t>(arm7, curPC + 2);
                 uint8_t bb = (op2 >> 11) & 0x1F;
                 if (bb == 0x1F || bb == 0x1C) {
@@ -1786,17 +1866,23 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
                 ctx.cycles += thumbCycles(op);
                 ok = dispThumb(ctx, op, curPC);
             }
-            if (!ok && g_dbgFB < 32) { printf("[JIT] thumb FB pc=%08X op=%04X\n", curPC, op); g_dbgFB++; }
+            if (!ok) {
+                noteFallback(true, op);
+                if (g_dbgFB < 32) { printf("[JIT] thumb FB pc=%08X op=%04X\n", curPC, op); g_dbgFB++; }
+            }
         } else {
             uint32_t op = core->memory.read<uint32_t>(arm7, curPC);
             ctx.cycles += armCycles(op);
             ok = dispARM(ctx, op, curPC);
-            if (!ok && g_dbgFB < 32) { printf("[JIT] arm FB pc=%08X op=%08X\n", curPC, op); g_dbgFB++; }
+            if (!ok) {
+                noteFallback(false, op);
+                if (g_dbgFB < 32) { printf("[JIT] arm FB pc=%08X op=%08X\n", curPC, op); g_dbgFB++; }
+            }
         }
 
         if (!ok || ctx.overflow) {
             ctx.cur = mark;                             // discard partial emission
-            ctx.cycles = cycMark;
+            ctx.cycles = cycMark;                       // the interpreter charges the failing insn itself
             ctx.overflow = false;
             if (n == 0) break;                          // first insn not JIT-able -> sentinel
             emitCommitExit(ctx, curPC, ok ? EXIT_NORMAL : EXIT_FALLBACK);
@@ -1815,6 +1901,7 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
     size_t wds = ctx.sz();
     flushICache(ctx.base, wds);
     pg[slot] = (uint32_t)(uintptr_t)ctx.base | tbit;
+    markCover(pg, armPC, curPC > armPC ? curPC : armPC + (thumb ? 2u : 4u));
     codePos += wds;
     return ctx.base;
 }
@@ -1826,27 +1913,26 @@ static inline void ensurePipeline(Interpreter& interp, int cpu) {
         interp.setPC(interp.getActualPC());
     }
 }
-static inline void interpStep(Interpreter& interp, int cpu) {
+// One interpreter step; returns the interpreter's own cycle count.
+static inline int interpStep(Interpreter& interp, int cpu) {
     ensurePipeline(interp, cpu);
-    interp.jitRunOpcode();
+    return interp.jitRunOpcode();
 }
 
 // Runs one block (or one interpreter step). Returns estimated CPU cycles consumed.
 static uint32_t runCpu(Core& core, int cpu, bool gba) {
     Interpreter& interp = core.interpreter[cpu];
-    if (!interp.isReady()) { interpStep(interp, cpu); return 1; }
+    const bool arm7 = (cpu == 1) || gba;
+    if (!interp.isReady()) return (uint32_t)interpStep(interp, cpu);
 
     const uint32_t pc = interp.getActualPC();
-    if (!validPC(pc, gba) || hleBiosAddr(interp, cpu, pc)) {
-        interpStep(interp, cpu);                     // interpreter owns HLE hooks
-        return 2;
-    }
+    if (!validPC(pc, gba, arm7) || hleBiosAddr(interp, cpu, pc))
+        return (uint32_t)interpStep(interp, cpu);       // interpreter owns HLE hooks
 
     const bool thumb = interp.isThumb();
-    const bool arm7  = (cpu == 1) || gba;
     uint32_t* code = lookupBlock(cpu, pc, thumb);
     if (!code) code = compileBlock(&interp, &core, pc, thumb, arm7, cpu);
-    if (!code || code == g_fbSentinel) { interpStep(interp, cpu); return 2; }
+    if (!code || code == g_fbSentinel) return (uint32_t)interpStep(interp, cpu);
 
     g_exitReason[cpu] = EXIT_FALLBACK;
     g_exitPC[cpu]     = pc;
@@ -1858,14 +1944,12 @@ static uint32_t runCpu(Core& core, int cpu, bool gba) {
     const int reason = g_exitReason[cpu];
     if (reason == EXIT_FALLBACK) {
         const uint32_t expc = g_exitPC[cpu];
-        if (validPC(expc, gba)) { interp.setPC(expc); g_pipeDirty[cpu] = false; }
+        if (validPC(expc, gba, arm7)) { interp.setPC(expc); g_pipeDirty[cpu] = false; }
         else ensurePipeline(interp, cpu);
-        interp.jitRunOpcode();
-        cyc += 2;
+        cyc += (uint32_t)interp.jitRunOpcode();
     }
 #if JIT_INLINE_SWI
     else if (reason == EXIT_SWI) {
-        // Requires: Interpreter::jitException(uint8_t) public wrapper around exception().
         interp.jitException(0x08);
         cyc += 3;
     }
@@ -1874,7 +1958,8 @@ static uint32_t runCpu(Core& core, int cpu, bool gba) {
 }
 
 void runJitNds(Core& core) {
-    if (!g_jitLive || !codeBuf) {
+    // The 2x/4x global-cycle scaling below is NDS-only; DSi clocks differ -> interpreter.
+    if (!g_jitLive || !codeBuf || core.dsiMode) {
         Interpreter::runCoreNds(core);
         return;
     }
@@ -1918,12 +2003,11 @@ void runJitGba(Core& core) {
 
 static bool allocArena() {
     if (g_arena) return true;
-    size_t codeBytes = JIT_BYTES_MEM2;
-    void* raw = nullptr;
-//#ifdef HW_RVL
-//    raw = SYS_SetArena2Lo(codeBytes + PAGE_ARENA_BYTES);   // cached MEM2
-//#endif
-    if (!raw) {
+    size_t codeBytes = JIT_BYTES_MEM2;                                   // 16 MB
+    void*  raw = Noods_MEM2_Alloc(codeBytes + PAGE_ARENA_BYTES + 32);
+    if (raw) {
+        raw = (void*)(((uintptr_t)raw + 31) & ~(uintptr_t)31);           // 32-byte align for cache ops
+    } else {
         codeBytes = JIT_BYTES_MEM1;
         raw = memalign(32, codeBytes + PAGE_ARENA_BYTES);
         if (!raw) { printf("[JIT] arena alloc failed\n"); return false; }
@@ -1941,8 +2025,10 @@ bool initJit(Core* core) {
     g_jitLive = false;
     if (!allocArena()) return false;
 
-    // Reset all state (stubs are re-emitted: they bake in Core/Interpreter addresses).
     memset(g_pageTab, 0, sizeof g_pageTab);
+    memset(g_pageCover, 0, sizeof g_pageCover);
+    memset(g_jitCodePage, 0, sizeof g_jitCodePage);
+    memset(g_fbHist, 0, sizeof g_fbHist);
     g_nLive = 0; g_pageUsed = 0;
     codePos = STUB_WORDS;
     g_stubPos = 0;
@@ -1985,28 +2071,22 @@ void shutdownJit(Core* core) {
             ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
             : &Interpreter::runCoreNds);
     }
-    // Keep the arena (MEM2 allocations cannot be returned); drop everything that
-    // references the Core/Interpreter so a later initJit() re-emits it.
     flushJitCache();
     g_stubPos = 0;
     g_exitStub = nullptr;
     g_entryStub[0] = g_entryStub[1] = nullptr;
 }
 
-// Drop every block starting in a page that overlaps [start, end). Blocks never cross
-// pages, so clearing the page's slot array is exact. O(live pages).
+// Range invalidation for bulk copies (overlays, DMA, multiboot payloads): one O(1) call per page.
 void invalidateJitRange(uint32_t start, uint32_t end) {
     if (end <= start) return;
-    for (size_t i = 0; i < g_nLive; i++) {
-        uint32_t v = g_livePages[i];
-        int cpu = (int)(v >> 20);
-        uint32_t pi = v & 0xFFFFFu;
-        uint32_t pageStart = (pi >= 0x10000u) ? (0xFFFF0000u + ((pi - 0x10000u) << 12)) : (pi << 12);
-        uint32_t pageEnd = pageStart + 0x1000u;
-        if (pageStart < end && start < pageEnd) {
-            uint32_t* pg = g_pageTab[cpu][pi];
-            if (pg) memset(pg, 0, PAGE_SLOTS * 4);
-        }
+    uint32_t a = start;
+    for (;;) {
+        uint32_t pageEnd = (a | 0xFFFu) + 1u;                 // wraps to 0 for the top page
+        uint32_t e = (pageEnd == 0 || pageEnd > end) ? end : pageEnd;
+        invalidateJitWrite(a, e - a);
+        if (e >= end || pageEnd == 0) break;
+        a = pageEnd;
     }
 }
 
