@@ -1920,9 +1920,9 @@ static bool allocArena() {
     if (g_arena) return true;
     size_t codeBytes = JIT_BYTES_MEM2;
     void* raw = nullptr;
-#ifdef HW_RVL
-    raw = SYS_SetArena2Lo(codeBytes + PAGE_ARENA_BYTES);   // cached MEM2
-#endif
+//#ifdef HW_RVL
+//    raw = SYS_SetArena2Lo(codeBytes + PAGE_ARENA_BYTES);   // cached MEM2
+//#endif
     if (!raw) {
         codeBytes = JIT_BYTES_MEM1;
         raw = memalign(32, codeBytes + PAGE_ARENA_BYTES);
