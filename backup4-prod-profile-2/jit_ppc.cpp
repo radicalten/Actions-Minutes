@@ -1921,7 +1921,7 @@ static bool allocArena() {
     size_t codeBytes = JIT_BYTES_MEM2;
     void* raw = nullptr;
 #ifdef HW_RVL
-    raw = SYS_AllocArena2MemLo(codeBytes + PAGE_ARENA_BYTES, 32);   // cached MEM2
+    raw = SYS_SetArena2Lo(codeBytes + PAGE_ARENA_BYTES, 32);   // cached MEM2
 #endif
     if (!raw) {
         codeBytes = JIT_BYTES_MEM1;
