@@ -1345,7 +1345,6 @@ static const uint8_t TH = 10;   // result temp for TST/TEQ/CMP/CMN/ALU-pc (never
 static const uint8_t TX = 12;   // scratch for flag code ONLY – never holds an operand
 static const uint8_t RCALL = 11;
 
-// ========================= code buffer / block table =========================
 static const size_t JIT_BYTES_MEM2   = 16u * 1024u * 1024u;
 static const size_t JIT_BYTES_MEM1   = 2u * 1024u * 1024u;      // fallback if MEM2 is exhausted
 static const size_t PAGE_SLOTS       = 2048;                    // (pc & 0xFFF) >> 1
@@ -1424,7 +1423,6 @@ static uint32_t* getPage(int cpu, uint32_t pc) {
     return pg;
 }
 
-// ========================= emit context =========================
 struct Ctx {
     uint32_t *base, *cur;
     size_t cap;
@@ -1667,7 +1665,6 @@ void JitHelp_tick(Core* core, uint32_t cycles) {
 
 } // extern "C"
 
-// ========================= shared stubs / exits =========================
 static void emitEpilogue(Ctx& ctx) {
     for (int r = 14; r <= 31; r++)
         ctx.E(ppc_lwz(r, FRAME_SAVE + (r - 14) * 4, 1));
@@ -1689,7 +1686,6 @@ static void emitReload(Ctx& ctx) {
     ctx.E(ppc_lwz(RCPSR, FRAME_CPSR, 1));
 }
 
-// Exit stub: expects TE = pc, TF = reason, TG = cycles.
 static void emitExitStubBody(Ctx& ctx) {
     emitSpill(ctx);
     ctx.ldInterp();                                  // r3
@@ -1735,7 +1731,6 @@ static bool buildExitStub() {
     return true;
 }
 
-// Entry stub (per CPU): prologue, frame constants, inline register sync, jump to block.
 static bool ensureEntryStub(int cpu, Interpreter* interp, Core* core) {
     if (g_entryStub[cpu]) return true;
     uint32_t** regs = interp->getRegisters();
@@ -1779,9 +1774,6 @@ static bool ensureEntryStub(int cpu, Interpreter* interp, Core* core) {
     return true;
 }
 
-// ========================= conditions / branch patching =========================
-// mtcrf 0x80,RCPSR : CR0.LT=N (bit0) CR0.GT=Z (bit1) CR0.EQ=C (bit2) CR0.SO=V (bit3); cr1 bit4 scratch.
-// Returns the index of the skip branch (taken when the condition is FALSE), or SIZE_MAX.
 static size_t emitCondSkip(Ctx& ctx, uint8_t cond) {
     if (cond >= 14) return SIZE_MAX;
     ctx.E(ppc_mtcrf(0x80, RCPSR));
@@ -1823,7 +1815,6 @@ static void patchB(Ctx& ctx, size_t idx) {
     ctx.base[idx] = ppc_b((int32_t)((ctx.sz() - idx) * 4));
 }
 
-// ========================= flags =========================
 static void setNZ(Ctx& ctx, uint8_t r) {
     ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 2, 31));   // clear N,Z
     ctx.E(ppc_rlwimi(RCPSR, r, 0, 0, 0));        // N = r[31]
@@ -1860,7 +1851,6 @@ static void setC_bit0(Ctx& ctx, uint8_t cr) {
     ctx.E(ppc_or(RCPSR, RCPSR, TX));
 }
 
-// ========================= shifter =========================
 static inline uint8_t rotBitTo0(int bit) { return (uint8_t)((32 - bit) & 31); }
 
 static void sLslI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
@@ -1961,8 +1951,6 @@ static bool emitShifter(Ctx& ctx, uint32_t op, uint8_t dst, bool sc, uint32_t cu
     return false;
 }
 
-// ========================= dynamic jumps =========================
-// Interworking jump: value in TA. T = bit0, PC = value & ~1 (commit aligns further).
 static void emitBX_TA(Ctx& ctx) {
     ctx.E(ppc_rlwinm(TB, TA, 0, 0, 30));
     ctx.E(ppc_stw(TB, FRAME_PC, 1));
@@ -1984,7 +1972,6 @@ static void emitJumpSameMode_SCR0(Ctx& ctx) {
     emitCommitExitDyn(ctx, EXIT_NORMAL);
 }
 
-// ========================= ARM emitters =========================
 enum DP { AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN };
 
 static bool emitDP(Ctx& ctx, uint32_t op, uint32_t curPC) {
@@ -2037,7 +2024,6 @@ static bool emitDP(Ctx& ctx, uint32_t op, uint32_t curPC) {
         ctx.E(ppc_stw(srcRn, FRAME_SCR1, 1));
     }
 
-    // Test results and PC writes go to TH (r10) – never TC, which holds the shifter carry-out.
     const uint8_t res = (isTest || rd == 15) ? TH : RA[rd];
 
     switch ((DP)dop) {
@@ -2301,8 +2287,6 @@ static bool emitMul(Ctx& ctx, uint32_t op) {
     return true;
 }
 
-// MRS / MSR (CPSR flags / full CPSR read; mode switches → fallback).
-// Every operand is tested BEFORE anything is emitted.
 static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t /*curPC*/) {
     uint8_t cond = (op >> 28) & 0xF;
     if (cond == 15) return false;
@@ -2444,7 +2428,6 @@ static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
     }
 }
 
-// ========================= Thumb =========================
 static bool emitT_shifts(Ctx& ctx, uint16_t op) {
     uint8_t ty = (op >> 11) & 3, rd = op & 7, rs = (op >> 3) & 7;
     int i = (op >> 6) & 0x1F;
@@ -2803,9 +2786,6 @@ static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
     }
 }
 
-// ========================= cycle estimates =========================
-// Constants (the interpreter charges real waitstates). 1 per instruction, +1 for memory,
-// +1 per transferred register for block transfers. First knob to turn if a title misbehaves.
 static uint32_t armCycles(uint32_t op) {
     uint32_t it = (op >> 25) & 7;
     if (it == 2 || it == 3) return 2;
@@ -2822,7 +2802,6 @@ static uint32_t thumbCycles(uint16_t op) {
     return 1;
 }
 
-// ========================= compile / run =========================
 static bool validPC(uint32_t pc, bool gba) {
     pc &= ~1u;
     if (pc >= 0x80000000u && pc < 0xFFFF0000u) return false;
@@ -2987,7 +2966,6 @@ static uint32_t runCpu(Core& core, int cpu, bool gba) {
     }
 #if JIT_INLINE_SWI
     else if (reason == EXIT_SWI) {
-        // Requires: Interpreter::jitException(uint8_t) public wrapper around exception().
         interp.jitException(0x08);
         cyc += 3;
     }
@@ -3042,9 +3020,6 @@ static bool allocArena() {
     if (g_arena) return true;
     size_t codeBytes = JIT_BYTES_MEM2;
     void* raw = nullptr;
-//#ifdef HW_RVL
-//    raw = SYS_SetArena2Lo(codeBytes + PAGE_ARENA_BYTES);   // cached MEM2
-//#endif
     if (!raw) {
         codeBytes = JIT_BYTES_MEM1;
         raw = memalign(32, codeBytes + PAGE_ARENA_BYTES);
@@ -3063,7 +3038,6 @@ bool initJit(Core* core) {
     g_jitLive = false;
     if (!allocArena()) return false;
 
-    // Reset all state (stubs are re-emitted: they bake in Core/Interpreter addresses).
     memset(g_pageTab, 0, sizeof g_pageTab);
     g_nLive = 0; g_pageUsed = 0;
     codePos = STUB_WORDS;
@@ -3107,16 +3081,12 @@ void shutdownJit(Core* core) {
             ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
             : &Interpreter::runCoreNds);
     }
-    // Keep the arena (MEM2 allocations cannot be returned); drop everything that
-    // references the Core/Interpreter so a later initJit() re-emits it.
     flushJitCache();
     g_stubPos = 0;
     g_exitStub = nullptr;
     g_entryStub[0] = g_entryStub[1] = nullptr;
 }
 
-// Drop every block starting in a page that overlaps [start, end). Blocks never cross
-// pages, so clearing the page's slot array is exact. O(live pages).
 void invalidateJitRange(uint32_t start, uint32_t end) {
     if (end <= start) return;
     for (size_t i = 0; i < g_nLive; i++) {
