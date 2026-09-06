@@ -5,7 +5,6 @@
 //         run it. Previously *any* Core destructor cleared g_jitLive, silently
 //         forcing every later runJit* call to the interpreter.
 //  [FIX]  isReady()/pcData no longer gates the JIT (the JIT never touches pcData).
-//  [FIX]  DSi mode is supported instead of silently bypassed (JIT_ALLOW_DSI).
 //  [FIX]  Thumb NEG with Rd == Rs computed V from a clobbered source.
 //  [DIAG] All output goes through DebugLog; counters for every bail/exit reason,
 //         periodic DebugLogStatus line, dumpStats(), executable-arena probe.
@@ -32,10 +31,6 @@ extern "C" {
 #define JIT_INLINE_SWI 0
 #endif
 
-#ifndef JIT_ALLOW_DSI
-#define JIT_ALLOW_DSI 1
-#endif
-
 // Status line every (1 << JIT_STATUS_SHIFT) runJit* calls (~ every 20 frames).
 #ifndef JIT_STATUS_SHIFT
 #define JIT_STATUS_SHIFT 12
@@ -60,8 +55,6 @@ static bool     g_pipeDirty[2]   = {};
 static bool     g_r15Calib[2][2] = {};
 static uint32_t g_r15Off[2][2]   = {};
 static uint32_t g_cpuTime[2]     = {};
-static uint32_t g_dsiHalf        = 0;      // [FIX] ARM9 half-cycle carry in DSi mode
-static bool     g_dsi            = false;  // [FIX] validPC/hleBios use DSi layout
 static uint32_t* volatile g_nextBlock = nullptr;
 
 static const int FRAME_SIZE    = 256;
@@ -1860,7 +1853,7 @@ static uint32_t thumbCycles(uint16_t op) {
 }
 
 // ---------------------------------------------------------------------------
-// Address validity
+// Address validity — NDS layout only
 // ---------------------------------------------------------------------------
 static bool validPC(uint32_t pc, bool gba, bool arm7) {
     pc &= ~1u;
@@ -1871,12 +1864,12 @@ static bool validPC(uint32_t pc, bool gba, bool arm7) {
                (pc >= 0x06000000u && pc < 0x06018000u) ||      // VRAM (rare)
                (pc >= 0x08000000u && pc < 0x0E000000u);        // ROM + mirrors
     }
-    // [FIX] DSi: 16 MB main RAM, 64 KB ARM7 BIOS
-    const uint32_t mainEnd = g_dsi ? 0x03000000u : 0x02400000u;
+    // NDS: 4 MB main RAM, 16 KB ARM7 BIOS
+    const uint32_t mainEnd = 0x02400000u;
     if (arm7) {
-        return (pc < (g_dsi ? 0x10000u : 0x4000u)) ||          // ARM7 BIOS
+        return (pc < 0x4000u) ||                               // ARM7 BIOS
                (pc >= 0x02000000u && pc < mainEnd) ||          // main RAM
-               (pc >= 0x03000000u && pc < 0x04000000u);        // shared WRAM + IWRAM (+ NWRAM on DSi)
+               (pc >= 0x03000000u && pc < 0x04000000u);        // shared WRAM + IWRAM
     }
     return (pc < 0x02000000u) ||                               // ITCM (mirrored)
            (pc >= 0x02000000u && pc < mainEnd) ||              // main RAM
@@ -1886,7 +1879,7 @@ static bool validPC(uint32_t pc, bool gba, bool arm7) {
 
 static inline bool hleBiosAddr(const Interpreter& interp, int cpu, uint32_t pc) {
     if (!interp.bios) return false;
-    if (cpu == 1) return pc < (g_dsi ? 0x10000u : 0x4000u);
+    if (cpu == 1) return pc < 0x4000u;
     return pc >= 0xFFFF0000u;
 }
 
@@ -2082,14 +2075,6 @@ static inline bool eventWithin(const Core& core, uint32_t g, uint32_t adv) {
            (int32_t)((g + adv) - core.events.front().cycles) >= 0;
 }
 
-// [FIX] ARM9 runs at 2x in DSi mode: advance globalCycles by half, carrying odd cycles.
-static inline uint32_t arm9Advance(uint32_t cyc) {
-    if (!g_dsi) return cyc << SHIFT_ARM9;
-    const uint32_t t = cyc + g_dsiHalf;
-    g_dsiHalf = t & 1u;
-    return t >> 1;
-}
-
 void dumpStats() {
     JLOG("[JIT] stats: runNds=%u runGba=%u bypassed=%u owner=%p live=%d buf=%p",
          g_st.runNds, g_st.runGba, g_st.runBypassed, (void*)g_owner, (int)g_jitLive, (void*)codeBuf);
@@ -2123,14 +2108,11 @@ static inline bool jitUsable(Core& core, const char* who) {
 }
 
 void runJitNds(Core& core) {
-    if (!jitUsable(core, "runJitNds") || (core.dsiMode && !JIT_ALLOW_DSI)) {
-        static bool said = false;
-        if (!said && core.dsiMode) { said = true; JLOG("[JIT] dsiMode set and JIT_ALLOW_DSI=0 -> interpreter"); }
+    if (!jitUsable(core, "runJitNds")) {
         Interpreter::runCoreNds(core);
         return;
     }
-    if (++g_st.runNds == 1) JLOG("[JIT] runJitNds active (dsi=%d)", (int)core.dsiMode);
-    g_dsi = core.dsiMode;
+    if (++g_st.runNds == 1) JLOG("[JIT] runJitNds active");
     maybeStatus();
 
     Interpreter& a9 = core.interpreter[0];
@@ -2141,7 +2123,7 @@ void runJitNds(Core& core) {
         if ((int32_t)(g_cpuTime[1] - g) > 0x100000) g_cpuTime[1] = g;
 
         if (!a9.halted && (int32_t)(g - g_cpuTime[0]) >= 0)
-            g_cpuTime[0] = g + arm9Advance(runCpu(core, 0, false));
+            g_cpuTime[0] = g + (runCpu(core, 0, false) << SHIFT_ARM9);
         if (!a7.halted && (int32_t)(g - g_cpuTime[1]) >= 0)
             g_cpuTime[1] = g + (runCpu(core, 1, false) << SHIFT_ARM7);
 
@@ -2167,7 +2149,6 @@ void runJitGba(Core& core) {
         return;
     }
     if (++g_st.runGba == 1) JLOG("[JIT] runJitGba active");
-    g_dsi = false;
     maybeStatus();
 
     Interpreter& a7 = core.interpreter[1];
@@ -2226,8 +2207,6 @@ bool initJit(Core* core) {
     g_exitStub = nullptr;
     g_entryStub[0] = g_entryStub[1] = nullptr;
     g_dbgFB = 0;
-    g_dsiHalf = 0;
-    g_dsi = core ? core->dsiMode : false;
     memset(g_exitPC, 0, sizeof g_exitPC);
     memset(g_exitCycles, 0, sizeof g_exitCycles);
     memset(g_pipeDirty, 0, sizeof g_pipeDirty);
@@ -2254,11 +2233,11 @@ bool initJit(Core* core) {
 
     g_owner = core;
 
-    JLOG("[JIT] ready buf=%p (%uKB %s) pages=%u BLK_ARMS=%u shifts=%d/%d owner=%p dsi=%d",
+    JLOG("[JIT] ready buf=%p (%uKB %s) pages=%u BLK_ARMS=%u shifts=%d/%d owner=%p",
          (void*)codeBuf, (unsigned)((g_jitWords * 4) >> 10),
          ((uintptr_t)codeBuf >= 0x90000000u) ? "MEM2" : "MEM1",
          (unsigned)PAGE_ARENA_CNT, (unsigned)BLK_ARMS, SHIFT_ARM9, SHIFT_ARM7,
-         (void*)core, (int)g_dsi);
+         (void*)core);
 
     if (core)
         core->setRunFunc(core->gbaMode ? runJitGba : runJitNds);
