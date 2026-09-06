@@ -1115,16 +1115,6 @@ executeBlock_asm:
     .size executeBlock_asm, .-executeBlock_asm
 
 // jit_ppc.cpp — ARM → PPC JIT (Wii/Broadway)
-//
-// Changes in this revision (search for [FIX] / [DIAG]):
-//  [FIX]  JIT ownership: only the Core that initialised the JIT may tear it down or
-//         run it. Previously *any* Core destructor cleared g_jitLive, silently
-//         forcing every later runJit* call to the interpreter.
-//  [FIX]  isReady()/pcData no longer gates the JIT (the JIT never touches pcData).
-//  [FIX]  Thumb NEG with Rd == Rs computed V from a clobbered source.
-//  [DIAG] All output goes through DebugLog; counters for every bail/exit reason,
-//         periodic DebugLogStatus line, dumpStats(), executable-arena probe.
-
 #include "jit_ppc.h"
 #include "core.h"
 #include "interpreter.h"
@@ -1147,7 +1137,6 @@ extern "C" {
 #define JIT_INLINE_SWI 0
 #endif
 
-// Status line every (1 << JIT_STATUS_SHIFT) runJit* calls (~ every 20 frames).
 #ifndef JIT_STATUS_SHIFT
 #define JIT_STATUS_SHIFT 12
 #endif
@@ -1197,15 +1186,12 @@ enum JitClass { JC_DP = 1, JC_LS = 2, JC_LSX = 4, JC_MUL = 8, JC_BLOCK = 16, JC_
 uint32_t g_jitEnable = 0xFFFFFFFFu;
 #define JC_ON(c) ((g_jitEnable & (c)) != 0)
 
-// ---------------------------------------------------------------------------
-// [DIAG] statistics
-// ---------------------------------------------------------------------------
 struct JitStats {
-    uint32_t runNds, runGba;          // runJit* invocations
-    uint32_t runBypassed;             // runJit* fell back to interpreter wholesale
-    uint32_t cpuCalls;                // runCpu invocations
-    uint32_t bailBadPC, bailHle;      // runCpu bail reasons
-    uint32_t primed;                  // pcData was null and had to be primed
+    uint32_t runNds, runGba;
+    uint32_t runBypassed;
+    uint32_t cpuCalls;
+    uint32_t bailBadPC, bailHle;
+    uint32_t primed;
     uint32_t hits, compiles, sentinels, execs;
     uint32_t exitNormal, exitFallback, exitSwi;
     uint32_t interpSteps;
@@ -1214,7 +1200,7 @@ struct JitStats {
     uint32_t statusTick;
 };
 static JitStats g_st;
-static Core*    g_owner = nullptr;      // [FIX] which Core the JIT belongs to
+static Core*    g_owner = nullptr;
 
 static uint32_t g_fbHist[2][256];
 static inline void noteFallback(bool thumb, uint32_t op) {
@@ -1227,9 +1213,6 @@ void dumpFallbacks() {
                 JLOG("[JIT] %s key %02X : %u fallbacks", t ? "thumb" : "arm", k, g_fbHist[t][k]);
 }
 
-// ---------------------------------------------------------------------------
-// PPC encoders
-// ---------------------------------------------------------------------------
 static inline uint32_t ppc_blr() { return 0x4E800020u; }
 static inline uint32_t ppc_bctr(bool lk = false) {
     return (19u << 26) | (20u << 21) | (528u << 1) | (lk ? 1u : 0u);
@@ -1395,7 +1378,7 @@ static size_t    g_nLive     = 0;
 static uint64_t  g_pageCover[PAGE_ARENA_CNT];
 
 static uint32_t  g_fbSentinel[4] __attribute__((aligned(16)));
-static volatile uint32_t g_probeFlag = 0;   // [DIAG] executable-arena probe
+static volatile uint32_t g_probeFlag = 0;
 
 static inline int32_t pageIndex(uint32_t pc) {
     if (pc < 0x10000000u) return (int32_t)(pc >> 12);
@@ -1510,9 +1493,6 @@ struct Ctx {
     void ldCpu()    { E(ppc_lwz(TB, FRAME_CPUIDX, 1)); }
 };
 
-// ---------------------------------------------------------------------------
-// C helpers called from generated code
-// ---------------------------------------------------------------------------
 extern "C" {
 
 int JitHelp_commit(Interpreter* interp, int cpu,
@@ -1737,9 +1717,6 @@ void rebaseCycles(uint32_t g) { g_cpuTime[0] -= g; g_cpuTime[1] -= g; }
 
 static uint32_t armCycles(uint32_t op);
 
-// ---------------------------------------------------------------------------
-// Prologue / epilogue / stubs
-// ---------------------------------------------------------------------------
 static void emitEpilogue(Ctx& ctx) {
     for (int r = 14; r <= 31; r++)
         ctx.E(ppc_lwz(r, FRAME_SAVE + (r - 14) * 4, 1));
@@ -1818,9 +1795,6 @@ static bool buildExitStub() {
     return true;
 }
 
-// [DIAG] Emit "store magic to g_probeFlag; blr" into the arena and run it through
-// the trampoline. If the arena is not instruction-mapped (missing IBAT) this is
-// where you will crash, right after the "probing" log line.
 static bool probeExecutable() {
     Ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -1890,9 +1864,6 @@ static bool ensureEntryStub(int cpu, Interpreter* interp, Core* core) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// Condition codes / flags
-// ---------------------------------------------------------------------------
 static size_t emitCondSkip(Ctx& ctx, uint8_t cond) {
     if (cond >= 14) return SIZE_MAX;
     ctx.E(ppc_mtcrf(0x80, RCPSR));
@@ -1972,9 +1943,6 @@ static void setC_bit0(Ctx& ctx, uint8_t cr) {
 
 static inline uint8_t rotBitTo0(int bit) { return (uint8_t)((32 - bit) & 31); }
 
-// ---------------------------------------------------------------------------
-// Shifter
-// ---------------------------------------------------------------------------
 static void sLslI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
     if (i == 0) {
         if (d != s) ctx.E(ppc_mr(d, s));
@@ -2092,9 +2060,6 @@ static void emitJumpSameMode_SCR0(Ctx& ctx) {
     emitCommitExitDyn(ctx, EXIT_NORMAL);
 }
 
-// ---------------------------------------------------------------------------
-// ARM emitters
-// ---------------------------------------------------------------------------
 enum DP { AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN };
 
 static bool emitDP(Ctx& ctx, uint32_t op, uint32_t curPC) {
@@ -2552,9 +2517,6 @@ static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Thumb emitters
-// ---------------------------------------------------------------------------
 static bool emitT_shifts(Ctx& ctx, uint16_t op) {
     uint8_t ty = (op >> 11) & 3, rd = op & 7, rs = (op >> 3) & 7;
     int i = (op >> 6) & 0x1F;
@@ -2654,8 +2616,6 @@ static bool emitT_alu(Ctx& ctx, uint16_t op) {
             setNZ(ctx, d); setC_xer(ctx); setV_sub(ctx, d, TB, s); break;
         case 8: ctx.E(ppc_and(TA, d, s)); setNZ(ctx, TA); break;
         case 9:
-            // [FIX] NEG: copy Rs first — when Rd == Rs the old code computed V from
-            // the already-overwritten source.
             ctx.E(ppc_mr(TB, s));
             ctx.E(ppc_addi(TA, 0, 0));
             ctx.E(ppc_subfc(d, TB, TA));
@@ -2949,9 +2909,6 @@ static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cycle estimates
-// ---------------------------------------------------------------------------
 static uint32_t armCycles(uint32_t op) {
     uint32_t it = (op >> 25) & 7;
     if (it == 2 || it == 3) return 2;
@@ -2968,29 +2925,25 @@ static uint32_t thumbCycles(uint16_t op) {
     return 1;
 }
 
-// ---------------------------------------------------------------------------
-// Address validity — NDS layout only
-// ---------------------------------------------------------------------------
 static bool validPC(uint32_t pc, bool gba, bool arm7) {
     pc &= ~1u;
     if (gba) {
-        return (pc < 0x4000u) ||                               // BIOS
-               (pc >= 0x02000000u && pc < 0x02040000u) ||      // EWRAM
-               (pc >= 0x03000000u && pc < 0x03008000u) ||      // IWRAM
-               (pc >= 0x06000000u && pc < 0x06018000u) ||      // VRAM (rare)
-               (pc >= 0x08000000u && pc < 0x0E000000u);        // ROM + mirrors
+        return (pc < 0x4000u) ||
+               (pc >= 0x02000000u && pc < 0x02040000u) ||
+               (pc >= 0x03000000u && pc < 0x03008000u) ||
+               (pc >= 0x06000000u && pc < 0x06018000u) ||
+               (pc >= 0x08000000u && pc < 0x0E000000u); 
     }
-    // NDS: 4 MB main RAM, 16 KB ARM7 BIOS
     const uint32_t mainEnd = 0x02400000u;
     if (arm7) {
-        return (pc < 0x4000u) ||                               // ARM7 BIOS
-               (pc >= 0x02000000u && pc < mainEnd) ||          // main RAM
-               (pc >= 0x03000000u && pc < 0x04000000u);        // shared WRAM + IWRAM
+        return (pc < 0x4000u) ||
+               (pc >= 0x02000000u && pc < mainEnd) ||
+               (pc >= 0x03000000u && pc < 0x04000000u);
     }
-    return (pc < 0x02000000u) ||                               // ITCM (mirrored)
-           (pc >= 0x02000000u && pc < mainEnd) ||              // main RAM
-           (pc >= 0x03000000u && pc < 0x04000000u) ||          // shared WRAM (ARM9 view)
-           (pc >= 0xFFFF0000u);                                // ARM9 BIOS
+    return (pc < 0x02000000u) ||
+           (pc >= 0x02000000u && pc < mainEnd) ||
+           (pc >= 0x03000000u && pc < 0x04000000u) ||
+           (pc >= 0xFFFF0000u);
 }
 
 static inline bool hleBiosAddr(const Interpreter& interp, int cpu, uint32_t pc) {
@@ -2999,9 +2952,6 @@ static inline bool hleBiosAddr(const Interpreter& interp, int cpu, uint32_t pc) 
     return pc >= 0xFFFF0000u;
 }
 
-// ---------------------------------------------------------------------------
-// Block compiler
-// ---------------------------------------------------------------------------
 static uint32_t* compileBlock(Interpreter* interp, Core* core,
                               uint32_t armPC, bool thumb, bool arm7, int cpu) {
     if (!codeBuf || !g_jitLive || !g_exitStub) return nullptr;
@@ -3113,11 +3063,6 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
     return ctx.base;
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch loop
-// ---------------------------------------------------------------------------
-// [FIX] Prime whenever the pipeline is dirty OR the interpreter has no fetch
-// pointer. The JIT itself never needs pcData, only the interpreter does.
 static inline void ensurePipeline(Interpreter& interp, int cpu) {
     if (g_pipeDirty[cpu] || !interp.isReady()) {
         if (!interp.isReady()) g_st.primed++;
@@ -3212,8 +3157,6 @@ static inline void maybeStatus() {
                    (unsigned)((codePos * 4) >> 10));
 }
 
-// [FIX] The JIT belongs to exactly one Core. Any other Core (or a Core whose JIT
-// was torn down) runs on the interpreter and says so in the log.
 static inline bool jitUsable(Core& core, const char* who) {
     if (g_jitLive && codeBuf && g_owner == &core) return true;
     g_st.runBypassed++;
@@ -3282,9 +3225,6 @@ void runJitGba(Core& core) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Init / shutdown
-// ---------------------------------------------------------------------------
 static bool allocArena() {
     if (g_arena) return true;
     size_t codeBytes = JIT_BYTES_MEM2;
@@ -3366,8 +3306,6 @@ void shutdownJit(Core* core) {
             ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true, 0>)
             : &Interpreter::runCoreNds);
     }
-    // [FIX] Only the owning Core may tear the JIT down. Previously a stale Core's
-    // destructor killed the JIT for the live one.
     if (core && g_owner && g_owner != core) {
         JLOG("[JIT] shutdownJit from non-owner Core %p ignored (owner=%p)", (void*)core, (void*)g_owner);
         return;
