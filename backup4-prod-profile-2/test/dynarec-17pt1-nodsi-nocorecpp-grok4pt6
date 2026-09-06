@@ -1,6 +1,6 @@
 Can you help me fix my ds/gba arm to wii ppc dynamic recompiler written in c++? Here is the situation, followed by my code:
 
-The JIT path never seems to be taken. Can you make suggestions then implement them in jit_ppc.cpp?
+The JIT path seems starved. Can you make suggestions and implement them completely in jit_ppc.cpp?
 
 Here is my debug log:
 === NooDS-Wii JIT/CPU trace log ===
