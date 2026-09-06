@@ -1,8 +1,5 @@
 // jit_ppc.cpp — ARM → PPC JIT (Wii/Broadway)
-// PATCHED FOR STARVATION (slow-op keeps unsupported opcodes inside block)
-// All original emitter, trampoline, and helper skeleton preserved.
-// Changes: validPC (+mirrors/VRAM), JitHelp_slowOp, emitSlowOp,
-// compileBlock guard/fail, runCpu validPC call, Thumb BL check.
+// PATCHED: validPC mirrors + JitHelp_slowOp + emitSlowOp + compileBlock + runCpu
 
 #include "jit_ppc.h"
 #include "core.h"
@@ -348,36 +345,6 @@ void invalidateJitWrite(uint32_t addr, uint32_t size) {
     if (!still && addr < 0x10000000u) g_jitCodePage[addr >> 12] = 0;
 }
 
-// =====================================================================
-// REPLACED: validPC (matches main RAM mirrors + ARM9 VRAM + DSi)
-// =====================================================================
-static bool validPC(uint32_t pc, bool gba, bool arm7, bool dsi = false) {
-    pc &= ~1u;
-    if (gba) {
-        return (pc < 0x4000u) ||
-               (pc >= 0x02000000u && pc < 0x02040000u) ||
-               (pc >= 0x03000000u && pc < 0x03008000u) ||
-               (pc >= 0x06000000u && pc < 0x06018000u) ||
-               (pc >= 0x08000000u && pc < 0x0E000000u);
-    }
-
-    const uint32_t mainLo  = 0x02000000u;
-    const uint32_t mainEnd = 0x03000000u;
-
-    if (pc >= mainLo && pc < mainEnd)
-        return true;
-
-    if (arm7) {
-        return (pc < 0x4000u) ||
-               (pc >= 0x03000000u && pc < 0x04000000u);
-    }
-
-    return (pc < 0x02000000u) ||
-           (pc >= 0x03000000u && pc < 0x04000000u) ||
-           (pc >= 0x06000000u && pc < 0x06800000u) ||
-           (pc >= 0xFFFF0000u);
-}
-
 struct Ctx {
     uint32_t *base, *cur;
     size_t cap;
@@ -414,9 +381,6 @@ struct Ctx {
 
 extern "C" {
 
-// ================================================================
-// REPLACED / EXTENDED: JitHelp_commit (unchanged logic, preserved)
-// ================================================================
 int JitHelp_commit(Interpreter* interp, int cpu,
                    uint32_t* regs, uint32_t cpsr,
                    uint32_t pc, int reason, uint32_t cycles) {
@@ -633,9 +597,6 @@ void JitHelp_tick(Core* core, uint32_t cycles) {
         core->globalCycles = target;
 }
 
-// ================================================================
-// INSERTED: JitHelp_slowOp (unsupported / slow opcode in-block)
-// ================================================================
 int JitHelp_slowOp(Interpreter* interp, int cpu,
                    uint32_t* regs, uint32_t* cpsrInOut,
                    uint32_t pc, uint32_t* pcOut) {
@@ -728,34 +689,6 @@ static void emitCommitExitDyn(Ctx& ctx, int reason) {
     ctx.E(ppc_addi(TF, 0, (int16_t)reason));
     ctx.li(TG, ctx.cycles);
     emitJumpExitStub(ctx);
-}
-
-// ================================================================
-// INSERTED: emitSlowOp (keeps unsupported opcode inside block)
-// ================================================================
-static bool emitSlowOp(Ctx& ctx, uint32_t curPC, uint32_t step) {
-    if (ctx.rem() < 96)
-        return false;
-
-    emitSpill(ctx);
-
-    ctx.ldInterp();
-    ctx.ldCpu();
-    ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_addi(TD, 1, (int16_t)FRAME_CPSR));
-    ctx.li(TE, curPC);
-    ctx.E(ppc_addi(TF, 1, (int16_t)FRAME_PC));
-    ctx.call((void*)JitHelp_slowOp);
-    emitReload(ctx);
-
-    ctx.E(ppc_cmpi(0, TA, 0));
-    size_t bCont = ctx.sz();
-    ctx.E(ppc_bc(12, 2, 0));
-    emitCommitExitDyn(ctx, EXIT_NORMAL);
-    patchBc(ctx, bCont, 12, 2);
-
-    emitHaltCheck(ctx, curPC + step);
-    return !ctx.overflow;
 }
 
 static void patchBc(Ctx& ctx, size_t idx, uint8_t bo, uint8_t bi);
@@ -1048,6 +981,31 @@ static void emitJumpSameMode_SCR0(Ctx& ctx) {
     ctx.E(ppc_rlwinm(TB, TA, 0, 0, 30));
     ctx.E(ppc_stw(TB, FRAME_PC, 1));
     emitCommitExitDyn(ctx, EXIT_NORMAL);
+}
+
+static bool emitSlowOp(Ctx& ctx, uint32_t curPC, uint32_t step) {
+    if (ctx.rem() < 96)
+        return false;
+
+    emitSpill(ctx);
+
+    ctx.ldInterp();
+    ctx.ldCpu();
+    ctx.E(ppc_addi(TC, 1, (int16_t)FRAME_REGSYNC));
+    ctx.E(ppc_addi(TD, 1, (int16_t)FRAME_CPSR));
+    ctx.li(TE, curPC);
+    ctx.E(ppc_addi(TF, 1, (int16_t)FRAME_PC));
+    ctx.call((void*)JitHelp_slowOp);
+    emitReload(ctx);
+
+    ctx.E(ppc_cmpi(0, TA, 0));
+    size_t bCont = ctx.sz();
+    ctx.E(ppc_bc(12, 2, 0));
+    emitCommitExitDyn(ctx, EXIT_NORMAL);
+    patchBc(ctx, bCont, 12, 2);
+
+    emitHaltCheck(ctx, curPC + step);
+    return !ctx.overflow;
 }
 
 enum DP { AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN };
@@ -1915,8 +1873,32 @@ static uint32_t thumbCycles(uint16_t op) {
     return 1;
 }
 
-static bool validPC(uint32_t pc, bool gba, bool arm7) { // kept for internal use (same as above)
-    return validPC(pc, gba, arm7, false); // already defined above; this is a convenience if needed elsewhere
+static bool validPC(uint32_t pc, bool gba, bool arm7, bool dsi = false) {
+    pc &= ~1u;
+    if (gba) {
+        return (pc < 0x4000u) ||
+               (pc >= 0x02000000u && pc < 0x02040000u) ||
+               (pc >= 0x03000000u && pc < 0x03008000u) ||
+               (pc >= 0x06000000u && pc < 0x06018000u) ||
+               (pc >= 0x08000000u && pc < 0x0E000000u);
+    }
+
+    const uint32_t mainLo  = 0x02000000u;
+    const uint32_t mainEnd = 0x03000000u;
+    (void)dsi;
+
+    if (pc >= mainLo && pc < mainEnd)
+        return true;
+
+    if (arm7) {
+        return (pc < 0x4000u) ||
+               (pc >= 0x03000000u && pc < 0x04000000u);
+    }
+
+    return (pc < 0x02000000u) ||
+           (pc >= 0x03000000u && pc < 0x04000000u) ||
+           (pc >= 0x06000000u && pc < 0x06800000u) ||
+           (pc >= 0xFFFF0000u);
 }
 
 static inline bool hleBiosAddr(const Interpreter& interp, int cpu, uint32_t pc) {
@@ -1925,9 +1907,6 @@ static inline bool hleBiosAddr(const Interpreter& interp, int cpu, uint32_t pc) 
     return pc >= 0xFFFF0000u;
 }
 
-// ================================================================
-// REPLACED / EXTENDED: compileBlock (guard + failure arm + bl check)
-// ================================================================
 static uint32_t* compileBlock(Interpreter* interp, Core* core,
                               uint32_t armPC, bool thumb, bool arm7, int cpu) {
     if (!codeBuf || !g_jitLive || !g_exitStub) return nullptr;
@@ -1940,6 +1919,7 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
     const size_t   slot = (armPC & 0xFFFu) >> 1;
     const uint32_t tbit = thumb ? 1u : 0u;
     const bool     gba  = core->gbaMode;
+    const bool     dsi  = core->dsiMode;
 
     Ctx ctx;
     memset(&ctx, 0, sizeof(ctx));
@@ -1959,11 +1939,8 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
     int n = 0;
 
     while (!ctx.done && !ctx.overflow) {
-        // =====================================================
-        // REPLACED guard: validPC now accepts RAM mirrors/VRAM
-        // =====================================================
         if (n >= (int)BLK_ARMS || ctx.rem() < BLK_MARGIN ||
-            (curPC & ~0xFFFu) != page || !validPC(curPC, gba, arm7, core->dsiMode)) {
+            (curPC & ~0xFFFu) != page || !validPC(curPC, gba, arm7, dsi)) {
             if (n == 0) break;
             emitCommitExit(ctx, curPC, EXIT_NORMAL);
             ctx.done = true;
@@ -1979,7 +1956,7 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
             uint16_t op = core->memory.read<uint16_t>(arm7, curPC);
             bool handled = false;
             if (((op >> 11) & 0x1F) == 0x1E &&
-                ((curPC + 2) & ~0xFFFu) == page && validPC(curPC + 2, gba, arm7, core->dsiMode)) {
+                ((curPC + 2) & ~0xFFFu) == page && validPC(curPC + 2, gba, arm7, dsi)) {
                 uint16_t op2 = core->memory.read<uint16_t>(arm7, curPC + 2);
                 uint8_t bb = (op2 >> 11) & 0x1F;
                 if (bb == 0x1F || bb == 0x1C) {
@@ -2007,9 +1984,6 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
             }
         }
 
-        // =====================================================
-        // REPLACED failure arm: slow-op instead of sentinel
-        // =====================================================
         if (!ok || ctx.overflow) {
             ctx.cur = mark;
             ctx.cycles = cycMark;
@@ -2052,7 +2026,7 @@ static uint32_t* compileBlock(Interpreter* interp, Core* core,
         markCover(pg, armPC, armPC + (thumb ? 2u : 4u));
         g_st.sentinels++;
         if (g_st.sentinels <= 4)
-            JLOG("[JIT] sentinel cpu=%d pc=%08X thumb=%d (first insn unsupported/overflow or out of space)", cpu, armPC, thumb);
+            JLOG("[JIT] sentinel cpu=%d pc=%08X thumb=%d (first insn unsupported/overflow)", cpu, armPC, thumb);
         return g_fbSentinel;
     }
 
@@ -2082,9 +2056,6 @@ static inline int interpStep(Interpreter& interp, int cpu) {
     return interp.jitRunOpcode();
 }
 
-// ================================================================
-// REPLACED / EXTENDED: runCpu (pass dsiMode to validPC)
-// ================================================================
 static uint32_t runCpu(Core& core, int cpu, bool gba) {
     Interpreter& interp = core.interpreter[cpu];
     const bool arm7 = (cpu == 1) || gba;
@@ -2092,11 +2063,13 @@ static uint32_t runCpu(Core& core, int cpu, bool gba) {
 
     const uint32_t pc = interp.getActualPC();
     if (!validPC(pc, gba, arm7, core.dsiMode)) {
-        if (++g_st.bailBadPC <= 4) JLOG("[JIT] bail: cpu=%d pc=%08X outside JIT-able memory", cpu, pc);
+        if (++g_st.bailBadPC <= 4)
+            JLOG("[JIT] bail: cpu=%d pc=%08X outside JIT-able memory", cpu, pc);
         return (uint32_t)interpStep(interp, cpu);
     }
     if (hleBiosAddr(interp, cpu, pc)) {
-        if (++g_st.bailHle <= 2) JLOG("[JIT] bail: cpu=%d pc=%08X in HLE BIOS range", cpu, pc);
+        if (++g_st.bailHle <= 2)
+            JLOG("[JIT] bail: cpu=%d pc=%08X in HLE BIOS range", cpu, pc);
         return (uint32_t)interpStep(interp, cpu);
     }
 
@@ -2104,7 +2077,8 @@ static uint32_t runCpu(Core& core, int cpu, bool gba) {
     uint32_t* code = lookupBlock(cpu, pc, thumb);
     if (code) g_st.hits++;
     else      code = compileBlock(&interp, &core, pc, thumb, arm7, cpu);
-    if (!code || code == g_fbSentinel) return (uint32_t)interpStep(interp, cpu);
+    if (!code || code == g_fbSentinel)
+        return (uint32_t)interpStep(interp, cpu);
 
     g_exitReason[cpu] = EXIT_FALLBACK;
     g_exitPC[cpu]     = pc;
@@ -2122,8 +2096,12 @@ static uint32_t runCpu(Core& core, int cpu, bool gba) {
     if (reason == EXIT_FALLBACK) {
         g_st.exitFallback++;
         const uint32_t expc = g_exitPC[cpu];
-        if (validPC(expc, gba, arm7, core.dsiMode)) { interp.setPC(expc); g_pipeDirty[cpu] = false; }
-        else ensurePipeline(interp, cpu);
+        if (validPC(expc, gba, arm7, core.dsiMode)) {
+            interp.setPC(expc);
+            g_pipeDirty[cpu] = false;
+        } else {
+            ensurePipeline(interp, cpu);
+        }
         g_st.interpSteps++;
         cyc += (uint32_t)interp.jitRunOpcode();
     }
