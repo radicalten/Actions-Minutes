@@ -1333,18 +1333,17 @@ static void flushICache(uint32_t* p, size_t nW) {
     ICInvalidateRange(p, nW * 4);
 }
 
-// ========================= emit context =========================
 struct Ctx {
     uint32_t *base, *cur;
     size_t cap;
     bool thumb, arm7, done, overflow;
     uint32_t blockPC;
-    uint32_t endPC;      // P2-1: high-water mark of emitted guest addresses
-    uint32_t insns;      // instructions consumed by the commit being emitted
+    uint32_t endPC;      
+    uint32_t insns;      
     int cpuIdx;
     Interpreter* interp;
     Core* core;
-    uint8_t lastHandler;   // host-side only: set by dispThumb() at compile time
+    uint8_t lastHandler;   
 
     void E(uint32_t w) {
         if ((size_t)(cur - base) < cap) *cur++ = w;
@@ -1359,8 +1358,6 @@ struct Ctx {
         for (int i = 0; i < n; i++) E(t[i]);
     }
 
-    // P2-3: addis+ori reaches any 32-bit address, so there is no reason to
-    // abandon a block because a helper lives outside 0x80000000-0x81800000.
     void call(void* fn) {
         uint32_t a = (uint32_t)(uintptr_t)fn;
         if (!a) { overflow = true; return; }
@@ -1376,7 +1373,6 @@ struct Ctx {
     void ldCpu()    { E(ppc_lwz(TB, FRAME_CPUIDX, 1)); }
 };
 
-// ========================= C helpers =========================
 extern "C" {
 
 int JitHelp_testCond(uint32_t cpsr, uint32_t cond) {
@@ -1417,27 +1413,14 @@ int JitHelp_syncFrom(Interpreter* interp, uint32_t* regs, uint32_t* outCPSR) {
     return 0;
 }
 
-// Read the interpreter's own cycle counter through the offset helper it already
-// exposes, so the JIT can charge interpreter steps exactly (see runCpu).
 static inline uint32_t readCycles(Interpreter& in) {
     return *(uint32_t*)((uint8_t*)&in + Interpreter::offset_cycles());
 }
 
-// Charge the interpreter's own counter for work the JIT did, so that its value
-// stays in step with Core::globalCycles (timers, HALT wake-up timing and save
-// states all read one of the two).
 static inline void addCycles(Interpreter& in, uint32_t d) {
     if (d) *(uint32_t*)((uint8_t*)&in + Interpreter::offset_cycles()) += d;
 }
 
-// ---------------------------------------------------------------------------
-// P0-3.  A commit always mirrors the shadow CPU state back into the
-// interpreter, and always publishes the exit PC / instruction count / reason.
-//
-//   EXIT_NORMAL  : the block ended at pc, setPC() is done here.
-//   EXIT_FALLBACK: the runner will setPC(pc) and execute ONE instruction
-//                  through the interpreter, so the PC is not set here.
-// ---------------------------------------------------------------------------
 int JitHelp_commit(Interpreter* interp, int cpu,
                    uint32_t* regs, uint32_t cpsr,
                    uint32_t pc, uint32_t insns, int reason) {
@@ -1452,11 +1435,6 @@ int JitHelp_commit(Interpreter* interp, int cpu,
     }
     interp->getCpsrRef() = cpsr;
 
-    // 0xFFFF0000 is the ARM9 BIOS window (and where BIOS / HLE IRQ stubs run).
-    // validPC() accepts it, so it must never be treated as "invalid PC".  Any
-    // other address above 0x80000000 is a real emitter bug: downgrade the exit
-    // reason and let the interpreter take over from a correct state instead of
-    // throwing the register file away.
     if (pc >= 0x80000000u && pc < 0xFFFF0000u)
         reason = EXIT_FALLBACK;
 
@@ -1635,7 +1613,6 @@ int JitHelp_thumbBlock(Core* core, int arm7, uint32_t op, uint32_t* regs) {
     return 0;
 }
 
-// P1-3: fire due events, and stop the moment endFrame() clears core.running.
 void JitHelp_tick(Core* core, uint32_t cycles) {
     if (!core) return;
     core->globalCycles += cycles;
@@ -1649,9 +1626,8 @@ void JitHelp_tick(Core* core, uint32_t cycles) {
     }
 }
 
-} // extern "C"
+} 
 
-// ========================= prologue / epilogue / commit =========================
 static void emitPrologue(Ctx& ctx) {
     ctx.E(ppc_mflr(0));
     ctx.E(ppc_stwu(1, -(int16_t)FRAME_SIZE, 1));
@@ -1717,10 +1693,6 @@ static void emitReload(Ctx& ctx) {
     ctx.E(ppc_lwz(RCPSR, FRAME_CPSR, 1));
 }
 
-// insns = number of guest instructions consumed at this exit (P1-3).  The
-// runner multiplies it by INSN_CYCLES; for EXIT_FALLBACK the last one is the
-// instruction the interpreter will replay, so the runner charges insns-1
-// compiled instructions plus the measured cost of the replay.
 static void emitCommitExit(Ctx& ctx, uint32_t nextPC, int reason, uint32_t insns) {
     emitSpill(ctx);
     ctx.ldInterp();                                 // r3
@@ -1747,9 +1719,6 @@ static void emitCommitExitDyn(Ctx& ctx, int reason, uint32_t insns) {
     emitEpilogue(ctx);
 }
 
-// ========================= conditions =========================
-// bc(12, 2, off) = beq -> "condition true, skip the instruction body"
-// bc( 4, 2, off) = bne -> used for error / "not equal" tests
 static size_t emitCondSkip(Ctx& ctx, uint8_t cond) {
     if (cond == 14 || cond == 15) return SIZE_MAX;
     ctx.E(ppc_mr(TA, RCPSR));
@@ -1771,7 +1740,6 @@ static void patchSkip(Ctx& ctx, size_t idx) {
     ctx.base[idx] = ppc_bc(12, 2, (int16_t)off);
 }
 
-// ========================= flags =========================
 static void setNZ(Ctx& ctx, uint8_t r) {
     ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 2, 31));   // clear N
     ctx.E(ppc_rlwimi(RCPSR, r, 0, 0, 0));        // insert MSB into N
@@ -1786,10 +1754,7 @@ static void setC_xer(Ctx& ctx) {
     ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));    // clear C
     ctx.E(ppc_or(RCPSR, RCPSR, TA));
 }
-// P1-1: PPC bit numbering is big-endian (bit 0 = MSB, bit 3 = value bit 28 =
-// ARM V).  Moving a lone set bit from PPC bit 0 to PPC bit 3 is a LEFT ROTATE
-// of (0 - 3) mod 32 = 29.  With the old sh = 3 the bit landed on PPC bit 29 and
-// MASK(3,3) discarded it, so V was cleared by every flag-setting add/sub.
+
 static void setV_add(Ctx& ctx, uint8_t res, uint8_t a, uint8_t b) {
     ctx.E(ppc_xor(TE, res, a));
     ctx.E(ppc_xor(TF, res, b));
@@ -1814,15 +1779,6 @@ static void setC_bit0(Ctx& ctx, uint8_t cr) {
     ctx.E(ppc_or(RCPSR, RCPSR, TA));
 }
 
-// ========================= shifter =========================
-// ARM carry out:
-//   LSL #n : source bit (32-n) -> rotate amount n            (already correct)
-//   LSR #n : source bit (n-1)  -> rotate amount (33-n) & 31   (P1-2)
-//   ASR #n : source bit (n-1)  -> rotate amount (33-n) & 31   (P1-2)
-//   ROR #n : source bit (n-1)  -> rotate amount (33-n) & 31   (P1-2, n != 0)
-//   RRX    : source bit 0      -> rotate amount 0             (already correct)
-// rlwinm(TC, s, sh, 31, 31) places the LSB of ROTL(s, sh), i.e. source bit
-// (32-sh), into the carry: that is why only LSL may use sh = n.
 static inline uint8_t shCarryRight(int n) { return (uint8_t)((33 - n) & 31); }
 
 static void sLslI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
@@ -1880,9 +1836,6 @@ static void sRorI(Ctx& ctx, uint8_t d, uint8_t s, int i, bool sc) {
     }
 }
 
-// Returns true when the carry has been placed in TC as a 0/1 value and the
-// caller must OR it into the CPSR (setC_bit0).  Immediate shifter forms only:
-// register-specified shifts never reach here (see the guard in emitDP).
 static bool emitShifter(Ctx& ctx, uint32_t op, uint8_t dst, bool sc) {
     if ((op >> 25) & 1) {
         uint32_t v = op & 0xFF;
@@ -1910,7 +1863,6 @@ static bool emitShifter(Ctx& ctx, uint32_t op, uint8_t dst, bool sc) {
     return sc;
 }
 
-// ========================= ARM emitters =========================
 enum DP { AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN };
 
 static bool emitDP(Ctx& ctx, uint32_t op, uint32_t curPC) {
@@ -1925,18 +1877,6 @@ static bool emitDP(Ctx& ctx, uint32_t op, uint32_t curPC) {
     if (!immShift && (op & 0xF) == 15) return false;           // Rm == PC (invalid)
     if (!immShift && ((op >> 4) & 1) && ((op >> 8) & 0xF) == 15) return false;
 
-    // (P1-2) Register-specified shifter operand -> interpreter.
-    //
-    //  * with the S bit set the carry out depends on the shift amount's 8-bit
-    //    value and on ARM7TDMI/ARMv5TE special cases (0 = unchanged, 1..31
-    //    normal, 32, > 32) while PPC srw/sraw only look at the low 5 bits, so
-    //    no single PPC instruction reproduces it;
-    //  * with the S bit clear, ARM gives 0 for amounts >= 32 whereas PPC
-    //    slw shifts by (amount mod 64) and srw by (amount mod 32);
-    //  * ARMv4T additionally reads R15 as instruction+12 (not +8) when the
-    //    shift amount comes from a register (ARM ARM A2.9).
-    // Falling back costs a handful of interpreted instructions and buys
-    // bit-exactness for both flags and results.
     if (!immShift && ((op >> 4) & 1)) return false;
 
     size_t si = emitCondSkip(ctx, cond);
@@ -2121,17 +2061,6 @@ static bool emitLS(Ctx& ctx, uint32_t op, uint32_t) {
     return true;
 }
 
-// Extra (halfword / doubleword / signed-byte) transfers.
-//
-// P0-4: the S/H field is (op>>5)&3 and decodes as
-//     sh = 0 : SWP                (-> interpreter)
-//     sh = 1 : LDRH / STRH
-//     sh = 2 : LDRD / STRD        (-> interpreter, two words per operation)
-//     sh = 3 : LDRSB              (L=1; L=0 with S=1,H=1 is undefined)
-// The previous revision treated sh = 2 as LDRSB and sh = 3 as LDRSH, i.e.
-// every LDRD executed as a sign-extended byte load and every LDRSB as a
-// sign-extended halfword load (wrong width, wrong MMIO side effects, wrong
-// value for negative bytes).
 static bool emitLSExtra(Ctx& ctx, uint32_t op, uint32_t) {
     if ((op & 0x0E000090) != 0x00000090) return false;
     if (((op >> 25) & 7) != 0) return false;
@@ -2151,7 +2080,6 @@ static bool emitLSExtra(Ctx& ctx, uint32_t op, uint32_t) {
     const bool isHalf = (sh == 1);
     const bool isByte = (sh == 3);
 
-    // All rejections happen before anything is emitted.
     if (rd == 15 || rn == 15 || sh == 0) return false;   // SWP -> interpreter
     if (sh == 2) return false;                           // LDRD / STRD -> interp
     if (!l && !isHalf) return false;                     // undefined store form
@@ -2227,7 +2155,6 @@ static bool emitMul(Ctx& ctx, uint32_t op) {
     return true;
 }
 
-// MRS / MSR (CPSR flags only; SPSR and mode switches -> interpreter)
 static bool emitMrsMsr(Ctx& ctx, uint32_t op, uint32_t) {
     uint8_t cond = (op >> 28) & 0xF;
     if (cond == 15) return false;
@@ -2290,9 +2217,7 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
     if (si == SIZE_MAX && cond != 14) return false;
 
     emitSpill(ctx);
-    // Value stored for R15 in a register list: instruction + 12 for ARMv4T and
-    // ARMv5TE (GBA ARM7 and NDS ARM9 both use the +12 rule; ARMv6+ uses +8).
-    // Keep this identical to what Interpreter::runOpcode() writes.
+
     ctx.li(TA, curPC + 12);
     ctx.E(ppc_stw(TA, FRAME_SCR2, 1));
     ctx.li(TA, curPC + 4);
@@ -2323,11 +2248,6 @@ static bool emitBlockXfer(Ctx& ctx, uint32_t op, uint32_t curPC) {
     emitReload(ctx);
 
     if (loadPC) {
-        // P0-2: the helper returns 1 when the transfer wrote PC and leaves the
-        // target in FRAME_PC.  This test used to be bc(4,2,8) (bne), so the
-        // TA == 1 case fell through and committed curPC+4 - the instruction
-        // after the function return.  That is the black/white-screen hang and
-        // the runaway PC behind the "Invalid read from 0x00007fff" spam.
         ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
         ctx.E(ppc_cmpi(0, TA, 1));
         ctx.E(ppc_bc(12, 2, 8));                        // beq: TA == 1 -> commit FRAME_PC
@@ -2385,7 +2305,6 @@ static bool dispARM(Ctx& ctx, uint32_t op, uint32_t curPC) {
     }
 }
 
-// ========================= Thumb =========================
 static bool emitT_shifts(Ctx& ctx, uint16_t op) {
     uint8_t ty = (op >> 11) & 3, rd = op & 7, rs = (op >> 3) & 7;
     int i = (op >> 6) & 0x1F;
@@ -2651,9 +2570,6 @@ static bool emitT_pushPop(Ctx& ctx, uint16_t op, uint32_t curPC) {
     emitReload(ctx);
 
     if (((op >> 11) & 1) && ((op >> 8) & 1)) {
-        // P0-2: POP {.., pc}.  The helper returns 1 when PC was loaded, so the
-        // test must be beq (bc(12,2,8)); bne here committed curPC+2 and made
-        // every Thumb function return fall into whatever followed it.
         ctx.E(ppc_lwz(TA, FRAME_SCR0, 1));
         ctx.E(ppc_cmpi(0, TA, 1));
         ctx.E(ppc_bc(12, 2, 8));
@@ -2725,18 +2641,11 @@ static bool emitT_bl(Ctx& ctx, uint16_t op1, uint16_t op2, uint32_t curPC) {
     return true;
 }
 
-// Handler ids, used by the JIT_SELFTEST table below.  Set at compile time, so
-// they cost nothing at run time.
 enum ThumbHandler {
     TH_NONE = 0, TH_SHIFTS, TH_ADDSUB3, TH_IMM8, TH_ALU, TH_HIREG, TH_LOADLIT,
     TH_MEMREG, TH_MEMIMM, TH_SPLOAD, TH_ADDSPPC, TH_PUSH_POP, TH_LDMSTM, TH_BRANCH
 };
 
-// P0-1: the switch used to be shifted by one group.  Corrected table:
-//   0x0/0x1 shifts + ADD/SUB 3-bit | 0x2/0x3 MOV/CMP/ADD/SUB #imm8
-//   0x4 ALU regs / hi-reg (BX!) / PC-literal | 0x5 [Rn,Rm] | 0x6-0x8 #imm5
-//   0x9 SP-rel | 0xA add PC/SP | 0xB add SP / PUSH / POP | 0xC LDM/STM
-//   0xD cond B / SWI | 0xE B / BL prefix | 0xF BL suffix (pair, handled above)
 static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
     uint8_t h = (op >> 12) & 0xF;
     switch (h) {
@@ -2793,7 +2702,6 @@ static bool dispThumb(Ctx& ctx, uint16_t op, uint32_t curPC) {
     }
 }
 
-// ========================= compile / run =========================
 static bool validPC(uint32_t pc, bool gba) {
     pc &= ~1u;
     if (pc >= 0x80000000u) return false;
@@ -2993,10 +2901,6 @@ static JitBlock* compile(Interpreter* interp, Core* core,
     return &slot;
 }
 
-// ---------------------------------------------------------------------------
-// P1-3: the runner now knows how much guest time each block and each
-// interpreted step really cost.
-// ---------------------------------------------------------------------------
 static uint32_t measureInterpStep(Interpreter& in) {
     uint32_t before = readCycles(in);
     in.jitRunOpcode();
@@ -3048,9 +2952,6 @@ static uint32_t runCpu(Core& core, int cpu, bool gba, uint32_t* cyclesOut) {
 #endif
 
     if (reason == EXIT_FALLBACK) {
-        // The block executed (insns - 1) compiled instructions and bailed at
-        // expc; replay that one instruction through the interpreter from the
-        // state JitHelp_commit() just mirrored.
         const uint32_t jitCyc = (insns - 1u) * INSN_CYCLES;
         *cyclesOut += jitCyc;
         addCycles(interp, jitCyc);
@@ -3126,10 +3027,6 @@ void runJitGba(Core& core) {
     jitStats(cycles);
 }
 
-// ---------------------------------------------------------------------------
-// Code buffer: MEM1 first (fast), MEM2 as fallback.  Both are cached windows
-// the Broadway can execute from.
-// ---------------------------------------------------------------------------
 static bool validCodeRange(uintptr_t addr, size_t bytes) {
     if (addr >= 0x80000000u && (addr + bytes) <= 0x81800000u) return true;  // MEM1
     if (addr >= 0x90000000u && (addr + bytes) <= 0x94000000u) return true;  // MEM2
@@ -3228,9 +3125,6 @@ void shutdownJit(Core* core) {
     for (size_t i = 0; i < CSIZ; i++) cache[i].valid = false;
 }
 
-// P2-1: invalidate every block whose *span* overlaps [start, end).  A block
-// that begins in page A can execute into page B, so an entry-PC-only test lets
-// stale code survive a write to page B.
 void invalidateJitRange(uint32_t start, uint32_t end) {
     for (size_t i = 0; i < CSIZ; i++) {
         JitBlock& b = cache[i];
