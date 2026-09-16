@@ -1,1905 +1,2108 @@
-// jit_ppc.cpp — ARM (ARMv4T / ARMv5TE-lite) -> PowerPC (Broadway, Wii) dynamic recompiler
+// ============================================================================
+//  jit_ppc.cpp — ARM → PowerPC dynamic recompiler for NooDS on Wii (Broadway)
+//  Full rewrite implementing the audit plan P1..P13.
 //
-// Revision 9 — triage fixes for "NDS white screen / GBA black screen" hangs.
+//  P1  direct `bl` helper calls                    4 insns + ctr dep -> 1 insn
+//  P2  inline condition tests (andis./rlwnm+xor)   call + ~26 cyc -> 2..5 cyc
+//  P3  block chaining (C entry / body split, link lists, cycle budget)
+//  P4  shadow register file + lazy commit          sync 92 -> 18 cyc, commit
+//      only when the interpreter is handed control (removes the setPC() hazard)
+//  P5  R15 as operand (MOV lr,pc, shifter operands, offset registers)
+//  P6  writes to PC (MOV|ADD pc, LDR pc, POP {pc}) including the conditional
+//      form where the post-index writeback must still happen
+//  P7  CP15 emitted (emitCoproc) + translation invalidation on cache/control
+//      writes (Cp15::write companion patch)
+//  P8  inline shift-by-register via slw/srw/sraw (XER.CA == ARM's C bit)
+//  P9  chain budget derived from the scheduler deadline; works with either the
+//      std::vector scheduler or the fixed-array one (companion patch)
+//  P10 instrumentation: block signature verification, IRQ storm detector,
+//      per-CPU counters, ring-buffered hot logging, bad-PC bitmap
+//  P11 Thumb BLX (suffix 0x1D!), ARMv5 J1/J2 offsets, LDRD guard
+//  P12 fast RAM window for loads (cached window always; true inline optional)
+//  P13 one cache line per exit, bitmap instead of a 512-entry scan, exact
+//      cycle accounting (conditional operand cost + taken-branch penalty)
 //
-//   F1  setC_xer()   mask (0,29,29) kept XER value bit 2 (reserved, always 0) -> C never set.
-//                    CA is XER value bit 29 == MSB-relative bit 2 == CPSR.C: no rotate needed.
-//   F2  setV_add/sub  mask (29,28,28) masks value bit 3 while the rotate produced value bit 28
-//                    -> the AND is always 0, V was never asserted.  Mask must be (3,3).
-//   F3  operand destruction: setNZ() used mfcr TA, and setC_xer() used mfxer TA, both of which
-//                    destroyed op2/Rn that the V emitters read afterwards.  Both now use TG (r9),
-//                    which is only live inside emitBlockXfer()'s argument setup.
-//   F4  setC_imm()   mask (29,29) -> (2,2) so the shift-out bit actually reaches CPSR.C.
-//   F5  register-specified shifts now produce the ARM carry (amount 0 keeps C, amount 32/33+
-//                    are handled explicitly; PPC shifts by >=32 are not ARM shifts).
-//   F6  Thumb ALU LSL/LSR/ASR/ROR now produce the carry too (same helper as F5).
-//   F6b the shifter carry lives in RSHC (r10), not TC (r5), so CMP/CMN/TST/TEQ - which use TC as
-//                    their result - no longer overwrite it before setC_imm() reads it.
-//   F7  emitLS() writeback: pre-index writeback is no longer dropped when rd==rn, post-index
-//                    writeback is computed from the saved base instead of the loaded register.
-//   F8  block yield: BLK_ARMS 8 -> 48, BLK_WDS 800 -> 2600, 2-way block cache with LRU,
-//                    invalidation gated by a per-page "has JIT code" bitmap (O(1) for data writes).
-//                    Cycle charge for EXIT_FALLBACK no longer discards the block's own work.
-//   F9  event-dispatch counters (tickInline + JitHelp_tick) so the log can distinguish
-//                    "stuck in code" from "event never dispatched".
-//   F10 stuck-PC watchdog: ring buffer of the last 32 blocks, dumps on a 4000x PC repeat.
-//   F11 differential harness: for the first JIT_DIFF_BLOCKS store-free blocks, re-run the same
-//                    instructions under the interpreter and log the first diverging register/CPSR.
-//
-// Each behaviour change can be disabled individually for bisecting (see the switch block below).
-// The interpreter remains the ground truth: every switch below degenerates to "send it to
-// jitRunOpcode()", which is the behaviour you already know works.
+//  INVARIANTS
+//  ----------
+//  I1 r14..r28 = guest r0..r14, r29 = CPSR, r30 = fast-window base, r31 = mask.
+//     Scratch: TA=r3 TB=r4 TC=r5 TD=r6 TE=r7 TF=r8 TG=r9 TS=r10 RCALL=r11 TR=r12.
+//     Only r14..r31 survive a chained branch, so a body must end with TA..TR dead.
+//  I2 A link is a plain `b` (not `bl`). Every block in a chain shares the head
+//     frame; the head's epilogue is the only return.
+//  I3 A PC write never falls through: store FRAME_PC (+T bit), exit with NORMAL,
+//     set ctx.done.
+//  I4 A *conditional* PC write uses FRAME_FLAG: the body sits inside the
+//     condition skip, the flag records "wrote PC", and the flag test is emitted
+//     outside the skip so an unconditional writeback still executes.
+//  I5 Only the C dispatcher calls JitHelp_takeOver/JitHelp_release. Generated
+//     code writes the shadow, never the Interpreter. Any C code that touches the
+//     Interpreter must call JitPpc::invalidateInterpreterView(cpu).
+//  I6 Every exit records pendingPC + reason in the shadow; cycles are accumulated
+//     by the emitter as a constant, so exits perform no allocation and no calls.
+//  I7 The fast-window registers are baked into already-emitted blocks: changing
+//     the window (Memory::updateMap*) requires a JIT flush. See P12 notes.
+// ============================================================================
 
 #include "jit_ppc.h"
 #include "core.h"
 #include "interpreter.h"
 #include "memory.h"
+#include "cp15.h"
 #include "defines.h"
 #include "debug_log.h"
 
 #include <cstdint>
-#include <cstdlib>
+#include <cstddef>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
+#include <cstdarg>
 #include <malloc.h>
+#include <vector>
 
 extern "C" {
 #include <ogc/cache.h>
 #include <ogc/system.h>
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Switch block — flip these to bisect.  Defaults are the fixed build.
-// ═══════════════════════════════════════════════════════════════════════
-#define JIT_NO_S            0   // 1 = every S-flagged ALU op goes to the interpreter (bisect #1)
-#define JIT_NO_THUMB        0   // 1 = no Thumb codegen at all (bisect #2)
-#define JIT_NO_BLOCKXFER    0   // 1 = no LDM/STM/LDMIA codegen (bisect #4)
-#define JIT_REG_SHIFT_CARRY 1   // 0 = reg-shift + S falls back instead of using F5
-#define JIT_THUMB_ALU_CARRY 1   // 0 = Thumb ALU shifts fall back instead of using F6
-#define JIT_LONG_BLOCKS     1   // 1 = blocks end only at branches/fallback/limits (F8)
-#define JIT_WATCHDOG        1   // 1 = pinned-PC ring dump (F10)
-#define JIT_EV_COUNTERS     1   // 1 = count every scheduler dispatch + IRQ (F9)
-#define JIT_DIFF            1   // 1 = differential JIT-vs-interpreter check (F11)
-#define JIT_INVALIDATE      1   // 1 = honour invalidateJitRange() (required unless bisecting)
-#define JIT_CHARGE_MAX      1   // 1 = charge max(c0,c1*2) as before; 0 = charge the sum
+#ifndef JIT_LOG_ENABLE
+#define JIT_LOG_ENABLE 0          // 1 = also print boot/fail messages
+#endif
+#if JIT_LOG_ENABLE
+#define JLOG(...) DebugLog(__VA_ARGS__)
+#else
+#define JLOG(...) do{}while(0)
+#endif
+
+// ============================================================================
+//  Configuration — every optimisation has a switch so you can bisect safely
+// ============================================================================
+namespace JitCfg {
+    constexpr bool kDirectCalls  = true;   // P1
+    constexpr bool kInlineCond   = true;   // P2
+    constexpr bool kChain        = true;   // P3
+    constexpr bool kShadow       = true;   // P4
+    constexpr bool kPcWrites     = true;   // P5/P6
+    constexpr bool kCp15         = true;   // P7
+    constexpr bool kInlineShift  = true;   // P8
+    constexpr bool kVerifyBlocks = false;  // P10: audit invalidation coverage
+    constexpr bool kStormDump    = true;   // P10
+    constexpr bool kFastWindow   = true;   // P12a: helper fast path (safe)
+    constexpr bool kInlineRam    = false;  // P12b: true inline LDR (risky)
+    constexpr bool kSafeEntry    = true;   // defensive shadow->valid check
+    constexpr int  kBlkInsnsMax  = 96;     // guest insns per block body
+    constexpr int  kMaxLinks     = 24;     // incoming chain links per block
+}
 
 static const int EXIT_NORMAL   = 0;
 static const int EXIT_FALLBACK = 1;
+static const int EXIT_BUDGET   = 2;
+static const int EXIT_PCWRITE  = 3;
 
-static uint32_t g_exitPC[2]    = {};
-static uint32_t g_exitCPSR[2]  = {};
-static int      g_exitReason[2]= {};
+extern "C" void JitHelp_takeOver(Interpreter*, struct JitCpuState*);
+extern "C" void JitHelp_release(Interpreter*, struct JitCpuState*);
 
-static const uint32_t CYCLES_PER_INSN_ARM9 = 2;
-static const uint32_t CYCLES_PER_INSN_ARM7 = 1;
-
-static const int ITERS_NDS = 32;
-static const int ITERS_GBA = 32;
-
-// ── Frame layout ──────────────────────────────────────────────────────
-static const int FRAME_SIZE    = 256;
-static const int FRAME_LR_OFF  = FRAME_SIZE + 4;
-static const int FRAME_SAVE    = 16;
-static const int FRAME_CORE    = 88;
-static const int FRAME_INTERP  = 92;
-static const int FRAME_CPUIDX  = 96;
-static const int FRAME_SCR0    = 100;   // shift scratch 0 (op2)
-static const int FRAME_SCR1    = 104;   // shift scratch 1 (address / Rn)
-static const int FRAME_SCR2    = 108;   // shift scratch 2 (R15 value)
-static const int FRAME_REGSYNC = 112;
-static const int FRAME_CPSR    = 172;
-static const int FRAME_PC      = 176;
-
-static_assert(FRAME_SIZE % 16 == 0,            "frame align");
-static_assert(FRAME_SAVE + 18*4 == FRAME_CORE, "save map");
-static_assert(FRAME_REGSYNC + 15*4 == FRAME_CPSR, "regsync map");
-static_assert(FRAME_PC + 4 <= FRAME_SIZE,       "pc fits");
-
-// ── Debug logging ─────────────────────────────────────────────────────
-static const size_t FB_LOG_MAX = 512;
-struct FbEntry { uint32_t pc; uint32_t op; };
-static FbEntry  g_fbLog[FB_LOG_MAX];
-static size_t   g_fbLogCount  = 0;
-static uint32_t g_totalFB[2]  = {};
-static uint32_t g_totalJIT[2] = {};
-
-static bool fbAlreadyLogged(uint32_t pc, uint32_t op) {
-    for (size_t i = 0; i < g_fbLogCount; i++)
-        if (g_fbLog[i].pc == pc && g_fbLog[i].op == op) return true;
-    return false;
-}
-static void fbLogOnce(bool thumb, int cpu, uint32_t pc, uint32_t op) {
-    g_totalFB[cpu]++;
-    if (fbAlreadyLogged(pc, op)) return;
-    if (g_fbLogCount < FB_LOG_MAX) {
-        g_fbLog[g_fbLogCount].pc = pc;
-        g_fbLog[g_fbLogCount].op = op;
-        g_fbLogCount++;
-    }
-    if (thumb) DebugLog("[JIT] thumb FB cpu%d pc=%08X op=%04X\n", cpu, pc, op);
-    else       DebugLog("[JIT] arm   FB cpu%d pc=%08X op=%08X\n", cpu, pc, op);
-}
-
-namespace JitPpc {
-
-// ═══════════════════════════════════════════════════════════════════════
-// PPC encoders
-// ═══════════════════════════════════════════════════════════════════════
-static inline uint32_t ppc_blr()  { return 0x4E800020u; }
-static inline uint32_t ppc_bctr(bool lk=false) {
-    return (19u<<26)|(20u<<21)|(528u<<1)|(lk?1u:0u);
-}
-static inline uint32_t ppc_bc(uint8_t bo,uint8_t bi,int16_t off,bool lk=false){
-    return (16u<<26)|((bo&31u)<<21)|((bi&31u)<<16)|((uint32_t)(off&0xFFFC))|(lk?1u:0u);
-}
-static inline uint32_t ppc_b(int32_t off,bool lk=false){
-    return (18u<<26)|((uint32_t)(off&0x03FFFFFC))|(lk?1u:0u);
-}
-static inline uint32_t ppc_addi(uint8_t rt,uint8_t ra,int16_t i){
-    return (14u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;
-}
-static inline uint32_t ppc_addis(uint8_t rt,uint8_t ra,int16_t i){
-    return (15u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;
-}
-static inline uint32_t ppc_addic(uint8_t rt,uint8_t ra,int16_t i){
-    return (12u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;
-}
-static inline uint32_t ppc_ori(uint8_t ra,uint8_t rs,uint16_t i){
-    return (24u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i;
-}
-static inline uint32_t ppc_andi_record(uint8_t ra,uint8_t rs,uint16_t i){
-    return (28u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i;   // andi. -> CR0
-}
-static inline uint32_t ppc_stw(uint8_t rs,int16_t d,uint8_t ra){
-    return (36u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d;
-}
-static inline uint32_t ppc_stwu(uint8_t rs,int16_t d,uint8_t ra){
-    return (37u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d;
-}
-static inline uint32_t ppc_lwz(uint8_t rt,int16_t d,uint8_t ra){
-    return (32u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d;
-}
-static inline uint32_t ppc_cmpi(uint8_t cr,uint8_t ra,int16_t i){
-    return (11u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|(uint16_t)i;
-}
-static inline uint32_t ppc_subfic(uint8_t rt,uint8_t ra,int16_t i){
-    return (8u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i;
-}
+// ============================================================================
+//  Encoders (with the additions the plan needs: andis., cmplw/cmpli, slw/srw/
+//  sraw, rlwnm, bl, b)
+// ============================================================================
+namespace Enc {
+static inline uint32_t blr() { return 0x4E800020u; }
+static inline uint32_t bl(intptr_t d){ return (18u<<26)|(((uint32_t)d)&0x03FFFFFCu)|1u; }
+static inline uint32_t b (intptr_t d){ return (18u<<26)|(((uint32_t)d)&0x03FFFFFCu); }
+static inline uint32_t bc(uint8_t bo,uint8_t bi,int16_t off,bool lk=false){
+    return (16u<<26)|((bo&31u)<<21)|((bi&31u)<<16)|((uint32_t)(off&0xFFFC))|(lk?1u:0u); }
+static inline uint32_t addi (uint8_t rt,uint8_t ra,int16_t i){ return (14u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i; }
+static inline uint32_t addis(uint8_t rt,uint8_t ra,int16_t i){ return (15u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i; }
+static inline uint32_t addic(uint8_t rt,uint8_t ra,int16_t i){ return (12u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i; }
+static inline uint32_t subfic(uint8_t rt,uint8_t ra,int16_t i){ return (8u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)i; }
+static inline uint32_t ori  (uint8_t ra,uint8_t rs,uint16_t i){ return (24u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i; }
+static inline uint32_t xori (uint8_t ra,uint8_t rs,uint16_t i){ return (26u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i; }
+static inline uint32_t andis_(uint8_t ra,uint8_t rs,uint16_t i){ return (29u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|i; }
+static inline uint32_t cmpi (uint8_t cr,uint8_t ra,int16_t i){ return (11u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|(uint16_t)i; }
+static inline uint32_t cmpli(uint8_t cr,uint8_t ra,uint16_t i){ return (10u<<26)|((cr&7u)<<23)|((uint32_t)ra<<16)|i; }
+static inline uint32_t stw (uint8_t rs,int16_t d,uint8_t ra){ return (36u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
+static inline uint32_t stwu(uint8_t rs,int16_t d,uint8_t ra){ return (37u<<26)|((uint32_t)rs<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
+static inline uint32_t lwz (uint8_t rt,int16_t d,uint8_t ra){ return (32u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|(uint16_t)d; }
 static inline uint32_t Xf(uint8_t rt,uint8_t ra,uint8_t rb,uint32_t x,bool rc=false){
-    return (31u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|
-           ((uint32_t)rb<<11)|(x<<1)|(rc?1u:0u);
-}
-static inline uint32_t XOf(uint8_t rt,uint8_t ra,uint8_t rb,bool oe,uint32_t x,bool rc=false){
-    return (31u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|
-           ((uint32_t)rb<<11)|(oe?0x400u:0u)|(x<<1)|(rc?1u:0u);
-}
-static inline uint32_t ppc_add  (uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,266);}
-static inline uint32_t ppc_addc (uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,10); }
-static inline uint32_t ppc_adde (uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,138);}
-static inline uint32_t ppc_subf (uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,40); }
-static inline uint32_t ppc_subfc(uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,8);  }
-static inline uint32_t ppc_subfe(uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,136);}
-static inline uint32_t ppc_mullw(uint8_t d,uint8_t a,uint8_t b){return XOf(d,a,b,false,235);}
-static inline uint32_t ppc_and  (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,28); }
-static inline uint32_t ppc_or   (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,444);}
-static inline uint32_t ppc_xor  (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,316);}
-static inline uint32_t ppc_andc (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,60); }
-static inline uint32_t ppc_nor  (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,124);}
-static inline uint32_t ppc_mr   (uint8_t a,uint8_t s)           {return ppc_or(a,s,s);}
-static inline uint32_t ppc_slw  (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,24); }
-static inline uint32_t ppc_srw  (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,536);}
-static inline uint32_t ppc_sraw (uint8_t a,uint8_t s,uint8_t b){return Xf(s,a,b,792);}
-static inline uint32_t ppc_extsb(uint8_t a,uint8_t s)           {return Xf(s,a,0,954);}
-static inline uint32_t ppc_extsh(uint8_t a,uint8_t s)           {return Xf(s,a,0,922);}
-static inline uint32_t ppc_rlwinm(uint8_t a,uint8_t s,uint8_t sh,
-                                   uint8_t mb,uint8_t me,bool rc=false){
-    return (21u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|
-           ((uint32_t)sh<<11)|((uint32_t)mb<<6)|((uint32_t)me<<1)|(rc?1u:0u);
-}
-static inline uint32_t ppc_rlwimi(uint8_t a,uint8_t s,uint8_t sh,uint8_t mb,uint8_t me){
-    return (20u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|
-           ((uint32_t)sh<<11)|((uint32_t)mb<<6)|((uint32_t)me<<1);
-}
-static inline uint32_t ppc_rlwnm(uint8_t a,uint8_t s,uint8_t b,uint8_t mb,uint8_t me){
-    return (23u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|
-           ((uint32_t)b<<11)|((uint32_t)mb<<6)|((uint32_t)me<<1);
-}
-static inline uint32_t ppc_srawi(uint8_t a,uint8_t s,uint8_t sh){
-    return (31u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|((uint32_t)sh<<11)|(824u<<1);
-}
-static inline uint32_t ppc_mtspr(uint16_t spr,uint8_t rs){
+    return (31u<<26)|((uint32_t)rt<<21)|((uint32_t)ra<<16)|((uint32_t)rb<<11)|(x<<1)|(rc?1u:0u); }
+static inline uint32_t add  (uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,266); }
+static inline uint32_t addc (uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,10);  }
+static inline uint32_t adde (uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,138); }
+static inline uint32_t subf (uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,40);  }
+static inline uint32_t subfc(uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,8);   }
+static inline uint32_t subfe(uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,136); }
+static inline uint32_t neg  (uint8_t d,uint8_t a){ return Xf(d,a,0,104); }
+static inline uint32_t mullw(uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,235); }
+static inline uint32_t and_ (uint8_t a,uint8_t s,uint8_t b){ return Xf(s,a,b,28);  }
+static inline uint32_t or_  (uint8_t a,uint8_t s,uint8_t b){ return Xf(s,a,b,444); }
+static inline uint32_t xor_ (uint8_t a,uint8_t s,uint8_t b){ return Xf(s,a,b,316); }
+static inline uint32_t andc (uint8_t a,uint8_t s,uint8_t b){ return Xf(s,a,b,60);  }
+static inline uint32_t nor  (uint8_t a,uint8_t s,uint8_t b){ return Xf(s,a,b,124); }
+static inline uint32_t mr   (uint8_t a,uint8_t s)          { return or_(a,s,s); }
+static inline uint32_t extsb(uint8_t a,uint8_t s){ return Xf(s,a,0,954); }
+static inline uint32_t extsh(uint8_t a,uint8_t s){ return Xf(s,a,0,922); }
+static inline uint32_t cntlzw(uint8_t a,uint8_t s){ return Xf(s,a,0,26); }
+static inline uint32_t slw (uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,24);  }
+static inline uint32_t srw (uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,536); }
+static inline uint32_t sraw(uint8_t d,uint8_t a,uint8_t b){ return Xf(d,a,b,792); }
+static inline uint32_t rlwinm(uint8_t a,uint8_t s,uint8_t sh,uint8_t mb,uint8_t me,bool rc=false){
+    return (21u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|((uint32_t)sh<<11)|((uint32_t)mb<<6)|((uint32_t)me<<1)|(rc?1u:0u); }
+static inline uint32_t rlwimi(uint8_t a,uint8_t s,uint8_t sh,uint8_t mb,uint8_t me){
+    return (20u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|((uint32_t)sh<<11)|((uint32_t)mb<<6)|((uint32_t)me<<1); }
+static inline uint32_t rlwnm(uint8_t a,uint8_t s,uint8_t b,uint8_t mb,uint8_t me){
+    return (23u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|((uint32_t)b<<11)|((uint32_t)mb<<6)|((uint32_t)me<<1); }
+static inline uint32_t srawi(uint8_t a,uint8_t s,uint8_t sh){
+    return (31u<<26)|((uint32_t)s<<21)|((uint32_t)a<<16)|((uint32_t)sh<<11)|(824u<<1); }
+static inline uint32_t mtspr(uint16_t spr,uint8_t rs){
     uint8_t lo=spr&31,hi=(spr>>5)&31;
-    return (31u<<26)|((uint32_t)rs<<21)|((uint32_t)lo<<16)|((uint32_t)hi<<11)|(467u<<1);
-}
-static inline uint32_t ppc_mfspr(uint8_t rt,uint16_t spr){
+    return (31u<<26)|((uint32_t)rs<<21)|((uint32_t)lo<<16)|((uint32_t)hi<<11)|(467u<<1); }
+static inline uint32_t mfspr(uint8_t rt,uint16_t spr){
     uint8_t lo=spr&31,hi=(spr>>5)&31;
-    return (31u<<26)|((uint32_t)rt<<21)|((uint32_t)lo<<16)|((uint32_t)hi<<11)|(339u<<1);
+    return (31u<<26)|((uint32_t)rt<<21)|((uint32_t)lo<<16)|((uint32_t)hi<<11)|(339u<<1); }
+static inline uint32_t mtctr(uint8_t s){ return mtspr(9,s); }
+static inline uint32_t mtlr (uint8_t s){ return mtspr(8,s); }
+static inline uint32_t mflr (uint8_t t){ return mfspr(t,8); }
+static inline uint32_t mfxer(uint8_t t){ return mfspr(t,1); }
+static inline uint32_t mfcr (uint8_t t){ return (31u<<26)|((uint32_t)t<<21)|(19u<<1); }
+
+// CR field f occupies CR bits 4f..4f+3: LT, GT, EQ, SO
+static inline uint8_t crLT(int f){ return (uint8_t)(f*4+0); }
+static inline uint8_t crGT(int f){ return (uint8_t)(f*4+1); }
+static inline uint8_t crEQ(int f){ return (uint8_t)(f*4+2); }
+
+static inline int liSeq(uint8_t rt,uint32_t v,uint32_t* buf){
+    uint16_t hi=(uint16_t)(v>>16), lo=(uint16_t)(v&0xFFFF);
+    if(!hi&&!lo){ buf[0]=addi(rt,0,0); return 1; }
+    if(!hi){ if(lo<0x8000){ buf[0]=addi(rt,0,(int16_t)lo); return 1; }
+             buf[0]=addi(rt,0,0); buf[1]=ori(rt,rt,lo); return 2; }
+    if(!lo){ buf[0]=addis(rt,0,(int16_t)hi); return 1; }
+    buf[0]=addis(rt,0,(int16_t)hi); buf[1]=ori(rt,rt,lo); return 2;
 }
-static inline uint32_t ppc_mtctr(uint8_t s){return ppc_mtspr(9,s);}
-static inline uint32_t ppc_mtlr (uint8_t s){return ppc_mtspr(8,s);}
-static inline uint32_t ppc_mflr (uint8_t t){return ppc_mfspr(t,8);}
-static inline uint32_t ppc_mtxer(uint8_t s){return ppc_mtspr(1,s);}
-static inline uint32_t ppc_mfxer(uint8_t t){return ppc_mfspr(t,1);}
-static inline uint32_t ppc_mfcr (uint8_t t){
-    return (31u<<26)|((uint32_t)t<<21)|(19u<<1);
-}
+} // namespace Enc
+using namespace Enc;
 
-static int emit_li32(uint32_t* out,uint8_t rt,uint32_t v){
-    uint16_t hi=(uint16_t)(v>>16),lo=(uint16_t)(v&0xFFFF);
-    if(!hi&&!lo){out[0]=ppc_addi(rt,0,0);return 1;}
-    if(!hi){
-        if(lo<0x8000){out[0]=ppc_addi(rt,0,(int16_t)lo);return 1;}
-        out[0]=ppc_addi(rt,0,0);out[1]=ppc_ori(rt,rt,lo);return 2;
-    }
-    if(!lo){out[0]=ppc_addis(rt,0,(int16_t)hi);return 1;}
-    out[0]=ppc_addis(rt,0,(int16_t)hi);
-    out[1]=ppc_ori(rt,rt,lo);
-    return 2;
-}
-
-// ARM register map: RA[0..14] = r14..r28, RCPSR = r29.
-// Scratch: r3..r12 are volatile; r2 (RTOC) and r13 (SDA) are avoided on purpose.
-static const uint8_t RA[15]={14,15,16,17,18,19,20,21,22,23,24,25,26,27,28};
-static const uint8_t RCPSR=29;
-static const uint8_t TA=3,TB=4,TC=5,TD=6,TE=7,TF=8,TG=9;
-static const uint8_t RSHC=10;      // shifter carry-out (LSB holds the ARM C bit)
-static const uint8_t RCALL=11;
-static const uint8_t TK=12;        // shift-amount scratch
-
-// ═══════════════════════════════════════════════════════════════════════
-// Code buffer + block cache
-// ═══════════════════════════════════════════════════════════════════════
-static const size_t JIT_BYTES=2u*1024u*1024u;
-static const size_t JIT_WORDS=JIT_BYTES/4;
-#if JIT_LONG_BLOCKS
-static const size_t BLK_ARMS=48;
-static const size_t BLK_WDS =2600;
-#else
-static const size_t BLK_ARMS=8;
-static const size_t BLK_WDS =800;
-#endif
-
-static uint32_t* codeBuf =nullptr;
-static size_t    codePos =0;
-static uint32_t  cacheGen=0;
-static bool      g_jitLive=false;
-
-struct JitBlock {
-    uint32_t  armPC;
-    uint32_t  endPC;          // first PC not covered by this block (for invalidation)
-    uint32_t* code;
-    uint32_t  nW;
-    uint32_t  gen;
-    uint32_t  insnCount;
-    uint32_t  use;            // LRU stamp
-    bool      thumb;
-    bool      hasStore;       // block contains a memory store (diff harness skips those)
-    bool      valid;
+// ============================================================================
+//  P4 — shadow register file
+// ============================================================================
+struct JitCpuState {
+    uint32_t  regs[15];       // guest r0..r14
+    uint32_t  cpsr;           // guest CPSR (N,Z,C,V,... in ARM positions)
+    uint32_t  pendingPC;      // PC the JIT stopped at (no +8 bias)
+    uint32_t  cycles;         // guest cycles accumulated for the current group
+    uint32_t  budget;         // chain budget, in guest cycles (P9)
+    int32_t   reason;         // EXIT_*
+    uint8_t   valid;          // 0 => the interpreter owns guest state
+    uint8_t   thumb;
+    uint16_t  pad;
+    uint32_t  fastBase;       // P12 guest window
+    uint32_t  fastMask;
 };
+static JitCpuState g_state[2] __attribute__((aligned(64)));
 
-static const size_t CSIZ=1u<<13;      // buckets
-static JitBlock cache[CSIZ*2];        // 2-way
-static uint32_t g_useCounter=0;
+static const int SH_REGS   = (int)offsetof(JitCpuState,regs);
+static const int SH_CPSR   = (int)offsetof(JitCpuState,cpsr);
+static const int SH_PC     = (int)offsetof(JitCpuState,pendingPC);
+static const int SH_CYC    = (int)offsetof(JitCpuState,cycles);
+static const int SH_BUDGET = (int)offsetof(JitCpuState,budget);
+static const int SH_REASON = (int)offsetof(JitCpuState,reason);
+static const int SH_VALID  = (int)offsetof(JitCpuState,valid);
+static const int SH_THUMB  = (int)offsetof(JitCpuState,thumb);
+static const int SH_BASE   = (int)offsetof(JitCpuState,fastBase);
+static const int SH_MASK   = (int)offsetof(JitCpuState,fastMask);
 
-// Per-4KB-page "has JIT code" bitmap: makes invalidation O(1) for the overwhelmingly
-// common case of a store into memory that never held compiled code.
-static const uint32_t PAGE_BITS_BYTES = 256u*1024u*1024u;
-static uint8_t  g_pageSeen[PAGE_BITS_BYTES>>12];
-static inline size_t pageIdx(uint32_t addr){ return (size_t)(addr>>12); }
-static inline void markPage(uint32_t addr){
-    if(addr<PAGE_BITS_BYTES) g_pageSeen[pageIdx(addr)]=1;
-}
-
-static inline size_t bucketOf(uint32_t pc){ return ((pc>>1)&(CSIZ-1))*2; }
-
-void flushJitCache(){
-    codePos=0;++cacheGen;
-    for(size_t i=0;i<CSIZ*2;i++)cache[i].valid=false;
-    memset(g_pageSeen,0,sizeof(g_pageSeen));
-    DebugLog("[JIT] cache flushed gen=%u\n",cacheGen);
-}
-
-static void flushICache(uint32_t* p,size_t nW){
-    DCFlushRange(p,nW*4);
-    ICInvalidateRange(p,nW*4);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Emit context
-// ═══════════════════════════════════════════════════════════════════════
-static const int MAX_MARK=12, MAX_FIX=32;
-
-struct Ctx {
-    uint32_t *base,*cur;
-    size_t cap;
-    bool thumb,arm7,done,overflow,hasStore;
-    uint32_t blockPC;
-    int cpuIdx;
-    Interpreter* interp;
-    Core* core;
-    int insnCount;
-
-    size_t mark[MAX_MARK];
-    struct Fixup { uint32_t at; uint8_t mk; };
-    Fixup  fix[MAX_FIX];
-    int    nFix;
-    int    nextMark;
-
-    void E(uint32_t w){
-        if((size_t)(cur-base)<cap)*cur++=w;
-        else overflow=true;
-    }
-    size_t sz()  const{return(size_t)(cur-base);}
-    size_t rem() const{size_t u=sz();return u<cap?cap-u:0;}
-
-    void li(uint8_t rt,uint32_t v){
-        uint32_t t[2];int n=emit_li32(t,rt,v);
-        for(int i=0;i<n;i++)E(t[i]);
-    }
-    void call(void* fn){
-        uint32_t a=(uint32_t)(uintptr_t)fn;
-        if(a<0x80000000u||a>=0x81800000u){overflow=true;return;}
-        uint16_t hi=(uint16_t)(a>>16),lo=(uint16_t)(a&0xFFFF);
-        E(ppc_addis(RCALL,0,(int16_t)hi));
-        if(lo)E(ppc_ori(RCALL,RCALL,lo));
-        E(ppc_mtctr(RCALL));
-        E(ppc_bctr(true));
-    }
-    void ldCore()  {E(ppc_lwz(TA,FRAME_CORE,  1));}
-    void ldInterp(){E(ppc_lwz(TA,FRAME_INTERP,1));}
-    void ldCpu()   {E(ppc_lwz(TB,FRAME_CPUIDX,1));}
-
-    // ── local branch fixups ───────────────────────────────────────────
-    int  NEWMARK(){ return (nextMark<MAX_MARK)?nextMark++:-1; }
-    void SETMARK(int m){ if(m>=0&&m<MAX_MARK) mark[m]=sz(); }
-    void FWD(uint8_t bo,uint8_t bi,int m){          // branch forward to SETMARK(m)
-        if(m>=0&&nFix<MAX_FIX){ fix[nFix].at=(uint32_t)sz(); fix[nFix].mk=(uint8_t)m; nFix++; }
-        E(ppc_bc(bo,bi,0));
-    }
-    // RESOLVE_FROM lets a nested emitter (emitRegShiftCarry) resolve only the fixups it
-    // created, so an enclosing condition-skip fixup stays pending until its own emitter
-    // closes it.  Marks are indexed, so nested allocation above nextMark cannot collide.
-    int  baseFix() const { return nFix; }
-    void RESOLVE_FROM(int b0){
-        if(b0<0)b0=0;
-        for(int i=b0;i<nFix;i++){
-            size_t at=fix[i].at; int m=fix[i].mk;
-            if(at>=cap||m<0||m>=MAX_MARK) continue;
-            int32_t d=(int32_t)((mark[m]-at)*4);
-            if(d<0||d>32764){ overflow=true; continue; }
-            base[at]|=(uint32_t)((uint16_t)d);      // low 2 bits of BD are always 0
-        }
-        nFix=b0;
-    }
-    void RESOLVE(){ RESOLVE_FROM(0); nextMark=0; }
-};
-
-// ═══════════════════════════════════════════════════════════════════════
-// C helpers
-// ═══════════════════════════════════════════════════════════════════════
-static uint32_t g_evCount[MAX_TASKS] = {};
-static uint32_t g_irqCount[2]        = {};
+struct MemWindow { uint8_t* host; uint32_t base, mask; };
+static MemWindow g_win[2] = {};
 
 extern "C" {
 
-int JitHelp_testCond(uint32_t cpsr,uint32_t cond){
-    const uint32_t N=(cpsr>>31)&1u,Z=(cpsr>>30)&1u,
-                   C=(cpsr>>29)&1u,V=(cpsr>>28)&1u;
-    switch(cond&15u){
-        case  0:return(int)Z;
-        case  1:return(int)(Z^1u);
-        case  2:return(int)C;
-        case  3:return(int)(C^1u);
-        case  4:return(int)N;
-        case  5:return(int)(N^1u);
-        case  6:return(int)V;
-        case  7:return(int)(V^1u);
-        case  8:return(int)(C&(Z^1u));
-        case  9:return(int)((C^1u)|Z);
-        case 10:return N==V;
-        case 11:return N!=V;
-        case 12:return(Z==0u&&N==V);
-        case 13:return(Z==1u||N!=V);
-        case 14:return 1;
-        default:return 0;
-    }
+void JitHelp_takeOver(Interpreter* in, JitCpuState* sh){
+    sh->valid = 0;
+    if(!in || !in->isReady()) return;
+    uint32_t** p = in->getRegisters();
+    if(!p) return;
+    for(int i=0;i<15;i++){ if(!p[i]) return; sh->regs[i]=*p[i]; }
+    sh->cpsr      = in->getCpsrRef();
+    sh->pendingPC = in->getActualPC();
+    sh->thumb     = (uint8_t)in->isThumb();
+    sh->valid     = 1;
+}
+void JitHelp_release(Interpreter* in, JitCpuState* sh){
+    if(!sh->valid) return;
+    uint32_t** p = in->getRegisters();
+    if(!p) return;
+    for(int i=0;i<15;i++) *p[i] = sh->regs[i];
+    in->getCpsrRef() = sh->cpsr;
+    in->setPC(sh->pendingPC);       // expense paid only on hand-off (I5)
+    sh->valid = 0;
 }
 
-int JitHelp_syncFrom(Interpreter* interp,uint32_t* regs,uint32_t* outCPSR){
-    if(!interp||!regs||!outCPSR)return -1;
-    if(!interp->isReady())return -1;
-    uint32_t** p=interp->getRegisters();
-    if(!p)return -1;
-    for(int i=0;i<15;i++){
-        if(!p[i])return -1;
-        regs[i]=*p[i];
+// ---- P2/P8 slow paths ------------------------------------------------------
+uint32_t JitHelp_shiftReg(uint32_t type,uint32_t val,uint32_t amt,uint32_t* cpsr,int setC){
+    amt &= 0xFFu;
+    uint32_t C=(*cpsr>>29)&1u, res;
+    switch(type&3u){
+    case 0:
+        if(amt==0) res=val;
+        else if(amt<32){ C=(val>>(32-amt))&1u; res=val<<amt; }
+        else if(amt==32){ C=val&1u; res=0; }
+        else { C=0; res=0; }
+        break;
+    case 1:
+        if(amt==0) res=val;
+        else if(amt<32){ C=(val>>(amt-1))&1u; res=val>>amt; }
+        else if(amt==32){ C=val>>31; res=0; }
+        else { C=0; res=0; }
+        break;
+    case 2:
+        if(amt==0) res=val;
+        else if(amt<32){ C=(val>>(amt-1))&1u; res=(uint32_t)((int32_t)val>>amt); }
+        else { C=val>>31; res=(uint32_t)((int32_t)val>>31); }
+        break;
+    default:
+        if(amt==0) res=val;
+        else { uint32_t r=amt&31u; if(r==0){ C=val>>31; res=val; } else { C=(val>>(r-1))&1u; res=(val>>r)|(val<<(32u-r)); } }
+        break;
     }
-    *outCPSR=interp->getCpsrRef();
-    return 0;
+    if(setC) *cpsr = (*cpsr & ~(1u<<29)) | (C<<29);
+    return res;
 }
 
-int JitHelp_commit(Interpreter* interp,int cpu,
-                   uint32_t* regs,uint32_t cpsr,
-                   uint32_t pc,int reason){
-    if(!interp||!regs||cpu<0||cpu>1)return -1;
-    uint32_t** p=interp->getRegisters();
-    if(!p)return -1;
-    for(int i=0;i<15;i++){
-        if(!p[i])return -1;
-        *p[i]=regs[i];
-    }
-    interp->getCpsrRef()=cpsr;
-    g_exitPC[cpu]    =pc;
-    g_exitCPSR[cpu]  =cpsr;
-    g_exitReason[cpu]=reason;
-    interp->setPC(pc);
-    return 0;
-}
-
-uint32_t JitHelp_r32(Core*c,int a,uint32_t ad){return c?c->memory.read<uint32_t>((bool)a,ad):0;}
-uint16_t JitHelp_r16(Core*c,int a,uint32_t ad){return c?c->memory.read<uint16_t>((bool)a,ad):0;}
-uint8_t  JitHelp_r8 (Core*c,int a,uint32_t ad){return c?c->memory.read<uint8_t> ((bool)a,ad):0;}
-void JitHelp_w32(Core*c,int a,uint32_t ad,uint32_t v){if(c)c->memory.write<uint32_t>((bool)a,ad,v);}
-void JitHelp_w16(Core*c,int a,uint32_t ad,uint16_t v){if(c)c->memory.write<uint16_t>((bool)a,ad,v);}
-void JitHelp_w8 (Core*c,int a,uint32_t ad,uint8_t  v){if(c)c->memory.write<uint8_t> ((bool)a,ad,v);}
-
-int JitHelp_armBlock(Core* core,int arm7,uint32_t op,
-                     uint32_t* regs,uint32_t pcForR15,
+// ---- LDM/STM (operates straight on the shadow array) ----------------------
+int JitHelp_armBlock(Core* core,int arm7,uint32_t op,uint32_t* regs,uint32_t pcForR15,
                      uint32_t* pcOut,uint32_t* cpsrInOut){
-    if(!core||!regs||!pcOut||!cpsrInOut)return -1;
-    const bool p=(op>>24)&1,u=(op>>23)&1,S=(op>>22)&1;
-    const bool w=(op>>21)&1,l=(op>>20)&1;
+    if(!core||!regs||!pcOut||!cpsrInOut) return -1;
+    const bool p=(op>>24)&1,u=(op>>23)&1,S=(op>>22)&1,w=(op>>21)&1,l=(op>>20)&1;
     const uint8_t  rn  =(op>>16)&0xF;
     const uint16_t list=(uint16_t)(op&0xFFFF);
-    if(S||rn>14||!list)return -1;
-    int n=0;
-    for(int i=0;i<16;i++)if(list&(1u<<i))n++;
+    if(S||rn>14||!list) return -1;
+    int n=0; for(int i=0;i<16;i++) if(list&(1u<<i)) n++;
     const uint32_t base=regs[rn];
     uint32_t addr,wb;
-    if(u){wb=base+(uint32_t)n*4u;addr=p?base+4u:base;}
-    else {wb=base-(uint32_t)n*4u;addr=p?wb      :wb+4u;}
+    if(u){ wb=base+(uint32_t)n*4u; addr=p?base+4u:base; }
+    else { wb=base-(uint32_t)n*4u; addr=p?wb:wb+4u; }
     int wrotePC=0;
     if(l){
         for(int i=0;i<16;i++){
-            if(!(list&(1u<<i)))continue;
-            uint32_t val=core->memory.read<uint32_t>((bool)arm7,addr);addr+=4;
+            if(!(list&(1u<<i))) continue;
+            uint32_t val=core->memory.read<uint32_t>((bool)arm7,addr); addr+=4;
             if(i==15){
-                if(val&1u){*cpsrInOut|=(1u<<5);*pcOut=val&~1u;}
-                else      {*cpsrInOut&=~(1u<<5);*pcOut=val&~3u;}
+                if(!arm7&&(val&1u)){ *cpsrInOut|=(1u<<5);  *pcOut=val&~1u; }
+                else               { *cpsrInOut&=~(1u<<5); *pcOut=val&~3u; }
                 wrotePC=1;
-            }else regs[i]=val;
+            } else regs[i]=val;
         }
-        if(w&&!(list&(1u<<rn)))regs[rn]=wb;
-    }else{
+        if(w&&!(list&(1u<<rn))) regs[rn]=wb;
+    } else {
+        int first=-1; for(int i=0;i<16;i++) if(list&(1u<<i)){ first=i; break; }
         for(int i=0;i<16;i++){
-            if(!(list&(1u<<i)))continue;
-            core->memory.write<uint32_t>((bool)arm7,addr,(i==15)?pcForR15:regs[i]);
-            addr+=4;
+            if(!(list&(1u<<i))) continue;
+            uint32_t val=(i==15)?pcForR15:((i==rn&&w&&i!=first)?wb:regs[i]);
+            core->memory.write<uint32_t>((bool)arm7,addr,val); addr+=4;
         }
-        if(w)regs[rn]=wb;
+        if(w) regs[rn]=wb;
     }
     return wrotePC;
 }
 
-int JitHelp_thumbPushPop(Core* core,int arm7,uint32_t op,
-                         uint32_t* regs,uint32_t* pcOut,uint32_t* cpsrInOut){
-    if(!core||!regs||!pcOut||!cpsrInOut)return -1;
+int JitHelp_thumbPushPop(Core* core,int arm7,uint32_t op,uint32_t* regs,
+                         uint32_t* pcOut,uint32_t* cpsrInOut){
+    if(!core||!regs||!pcOut||!cpsrInOut) return -1;
     const bool load=(op>>11)&1,R=(op>>8)&1;
     const uint8_t list=(uint8_t)(op&0xFF);
-    int n=0;
-    for(int i=0;i<8;i++)if(list&(1u<<i))n++;
-    if(R)n++;
+    int n=0; for(int i=0;i<8;i++) if(list&(1u<<i)) n++;
+    if(R) n++;
     if(!load){
-        uint32_t sp=regs[13]-(uint32_t)n*4u,addr=sp;
-        for(int i=0;i<8;i++){
-            if(!(list&(1u<<i)))continue;
-            core->memory.write<uint32_t>((bool)arm7,addr,regs[i]);addr+=4;
-        }
-        if(R)core->memory.write<uint32_t>((bool)arm7,addr,regs[14]);
-        regs[13]=sp;return 0;
+        uint32_t sp=regs[13]-(uint32_t)n*4u, addr=sp;
+        for(int i=0;i<8;i++){ if(!(list&(1u<<i))) continue; core->memory.write<uint32_t>((bool)arm7,addr,regs[i]); addr+=4; }
+        if(R) core->memory.write<uint32_t>((bool)arm7,addr,regs[14]);
+        regs[13]=sp; return 0;
     }
     uint32_t addr=regs[13];
-    for(int i=0;i<8;i++){
-        if(!(list&(1u<<i)))continue;
-        regs[i]=core->memory.read<uint32_t>((bool)arm7,addr);addr+=4;
-    }
+    for(int i=0;i<8;i++){ if(!(list&(1u<<i))) continue; regs[i]=core->memory.read<uint32_t>((bool)arm7,addr); addr+=4; }
     int wrotePC=0;
     if(R){
-        uint32_t val=core->memory.read<uint32_t>((bool)arm7,addr);addr+=4;
-        if(val&1u){*cpsrInOut|=(1u<<5);*pcOut=val&~1u;}
-        else      {*cpsrInOut&=~(1u<<5);*pcOut=val&~3u;}
+        uint32_t val=core->memory.read<uint32_t>((bool)arm7,addr); addr+=4;
+        if(arm7) *pcOut=val&~1u;                       // ARMv4T: stays in Thumb
+        else if(val&1u){ *cpsrInOut|=(1u<<5);  *pcOut=val&~1u; }
+        else           { *cpsrInOut&=~(1u<<5); *pcOut=val&~3u; }
         wrotePC=1;
     }
-    regs[13]=addr;return wrotePC;
+    regs[13]=addr; return wrotePC;
 }
-
 int JitHelp_thumbBlock(Core* core,int arm7,uint32_t op,uint32_t* regs){
-    if(!core||!regs)return -1;
-    const bool    load=(op>>11)&1;
-    const uint8_t rb=(op>>8)&7,list=(uint8_t)(op&0xFF);
-    if(!list){regs[rb]+=0x40;return 0;}
-    uint32_t addr=regs[rb],wb=addr;
-    for(int i=0;i<8;i++)if(list&(1u<<i))wb+=4;
+    if(!core||!regs) return -1;
+    const bool load=(op>>11)&1;
+    const uint8_t rb=(op>>8)&7, list=(uint8_t)(op&0xFF);
+    if(!list){ regs[rb]+=0x40; return 0; }
+    uint32_t addr=regs[rb];
+    int n=0; for(int i=0;i<8;i++) if(list&(1u<<i)) n++;
+    const uint32_t wb=addr+(uint32_t)n*4u;
     const bool rbIn=(list&(1u<<rb))!=0;
     if(load){
+        for(int i=0;i<8;i++){ if(!(list&(1u<<i))) continue; regs[i]=core->memory.read<uint32_t>((bool)arm7,addr); addr+=4; }
+        if(!rbIn) regs[rb]=wb;
+    } else {
+        int first=-1; for(int i=0;i<8;i++) if(list&(1u<<i)){ first=i; break; }
         for(int i=0;i<8;i++){
-            if(!(list&(1u<<i)))continue;
-            regs[i]=core->memory.read<uint32_t>((bool)arm7,addr);addr+=4;
-        }
-        if(!rbIn)regs[rb]=wb;
-    }else{
-        for(int i=0;i<8;i++){
-            if(!(list&(1u<<i)))continue;
-            core->memory.write<uint32_t>((bool)arm7,addr,regs[i]);addr+=4;
+            if(!(list&(1u<<i))) continue;
+            core->memory.write<uint32_t>((bool)arm7,addr,(i==rb&&i!=first)?wb:regs[i]); addr+=4;
         }
         regs[rb]=wb;
     }
     return 0;
 }
 
-// F9: scheduler dispatches are counted so the log can prove whether VBlank/SPU/timer
-// events are being delivered while the CPUs are pinned.
-void JitHelp_tick(Core* core,uint32_t cycles){
-    if(!core)return;
-    core->globalCycles+=cycles;
-    while(!core->events.empty()&&
-          core->globalCycles>=core->events.front().cycles){
-        SchedEvent e=core->events.front();
-        core->events.erase(core->events.begin());
-        if(e.task>=0&&e.task<MAX_TASKS&&core->tasks[e.task].fn){
-#if JIT_EV_COUNTERS
-            g_evCount[e.task]++;
-#endif
-            core->tasks[e.task]();
-        }
-    }
+// ---- P7: CP15 --------------------------------------------------------------
+uint32_t JitHelp_cp15(Core* core,int arm7,uint32_t op,uint32_t val){
+    (void)arm7;
+    if(!core) return 0;
+    const int op1=(op>>21)&7, crn=(op>>16)&0xF, crm=op&0xF, op2=(op>>5)&7;
+    if((op>>20)&1) return core->cp15.read(op1,crn,crm,op2,false);
+    core->cp15.write(op1,crn,crm,op2,val);      // + P7b flush (companion patch)
+    return 0;
 }
 
-uint32_t JitHelp_getEvCount(int task){
-    if(task<0||task>=MAX_TASKS)return 0;
-    return g_evCount[task];
+// ---- memory ----------------------------------------------------------------
+static inline bool winHit(int cpu,uint32_t ad,uint32_t* off){
+    const MemWindow& w=g_win[cpu];
+    if(!w.host) return false;
+    const uint32_t d=ad-w.base;
+    if(d>w.mask) return false;
+    *off=d; return true;
 }
-uint32_t JitHelp_getIrqCount(int cpu){
-    if(cpu<0||cpu>1)return 0;
-    return g_irqCount[cpu];
+uint32_t JitHelp_r32(Core* c,int a,uint32_t ad){
+    if(JitCfg::kFastWindow){ uint32_t o; if(c&&winHit(a,ad,&o)) return *(const uint32_t*)(g_win[a].host+o); }
+    return c?c->memory.read<uint32_t>((bool)a,ad):0; }
+uint32_t JitHelp_ldr32(Core* c,int a,uint32_t ad){
+    if(!c) return 0;
+    if(JitCfg::kFastWindow){ uint32_t o; if(winHit(a,ad,&o)){ uint32_t v=*(const uint32_t*)(g_win[a].host+o), r=(ad&3u)*8u; return r?((v>>r)|(v<<(32u-r))):v; } }
+    uint32_t v=c->memory.read<uint32_t>((bool)a,ad&~3u), r=(ad&3u)*8u;
+    return r?((v>>r)|(v<<(32u-r))):v; }
+uint16_t JitHelp_r16(Core* c,int a,uint32_t ad){
+    if(JitCfg::kFastWindow){ uint32_t o; if(c&&winHit(a,ad,&o)) return *(const uint16_t*)(g_win[a].host+o); }
+    return c?c->memory.read<uint16_t>((bool)a,ad):0; }
+uint8_t JitHelp_r8(Core* c,int a,uint32_t ad){
+    if(JitCfg::kFastWindow){ uint32_t o; if(c&&winHit(a,ad,&o)) return g_win[a].host[o]; }
+    return c?c->memory.read<uint8_t>((bool)a,ad):0; }
+uint32_t JitHelp_ldrh(Core* c,int a,uint32_t ad){
+    if(JitCfg::kFastWindow){ uint32_t o; if(c&&winHit(a,ad&~1u,&o)){ uint32_t v=*(const uint16_t*)(g_win[a].host+o); return (a&&(ad&1u))?((v>>8)|(v<<24)):v; } }
+    if(!c) return 0;
+    uint32_t v=c->memory.read<uint16_t>((bool)a,ad&~1u);
+    return (a&&(ad&1u))?((v>>8)|(v<<24)):v; }
+uint32_t JitHelp_ldrsh(Core* c,int a,uint32_t ad){
+    if(a&&(ad&1u)) return (uint32_t)(int32_t)(int8_t)JitHelp_r8(c,a,ad);
+    return (uint32_t)(int32_t)(int16_t)JitHelp_r16(c,a,ad&~1u); }
+void JitHelp_w32(Core* c,int a,uint32_t ad,uint32_t v){ if(c)c->memory.write<uint32_t>((bool)a,ad,v); }
+void JitHelp_w16(Core* c,int a,uint32_t ad,uint16_t v){ if(c)c->memory.write<uint16_t>((bool)a,ad,v); }
+void JitHelp_w8 (Core* c,int a,uint32_t ad,uint8_t  v){ if(c)c->memory.write<uint8_t>((bool)a,ad,v); }
+
+// ---- P10: signature over the guest bytes a block was built from ------------
+uint32_t JitHelp_sigBlock(Core* core,int arm7,uint32_t pc,uint32_t thumb,uint32_t insns){
+    if(!core) return 0;
+    uint32_t h=0x811C9DC5u;
+    const uint32_t step = thumb?2u:4u;
+    for(uint32_t i=0;i<insns;i++){
+        uint32_t w = thumb ? core->memory.read<uint16_t>((bool)arm7,pc+i*step)
+                           : core->memory.read<uint32_t>((bool)arm7,pc+i*step);
+        h=(h^w)*16777619u;
+    }
+    return h;
 }
 
 } // extern "C"
 
-// ═══════════════════════════════════════════════════════════════════════
-// Prologue / Epilogue
-// ═══════════════════════════════════════════════════════════════════════
-static void emitPrologue(Ctx& ctx){
-    ctx.E(ppc_mflr(0));
-    ctx.E(ppc_stwu(1,-(int16_t)FRAME_SIZE,1));
-    ctx.E(ppc_stw(0,(int16_t)FRAME_LR_OFF,1));
-    for(int r=14;r<=31;r++)ctx.E(ppc_stw(r,FRAME_SAVE+(r-14)*4,1));
-    ctx.li(TA,(uint32_t)(uintptr_t)ctx.core);
-    ctx.E(ppc_stw(TA,FRAME_CORE,1));
-    ctx.li(TA,(uint32_t)(uintptr_t)ctx.interp);
-    ctx.E(ppc_stw(TA,FRAME_INTERP,1));
-    ctx.E(ppc_addi(TA,0,(int16_t)ctx.cpuIdx));
-    ctx.E(ppc_stw(TA,FRAME_CPUIDX,1));
+// ============================================================================
+//  P10 — instrumentation: counters + MEM1 ring buffer (never fwrite in a storm)
+// ============================================================================
+struct JitStats {
+    uint32_t insnJit[2]={}, insnInterp[2]={}, cTrips[2]={}, chains[2]={};
+    uint32_t compileFail=0, stale[2]={}, storm[2]={}, badPC[2]={};
+    uint32_t exits[4]={}, guestCycles[2]={}, blocksLive=0;
+};
+static JitStats g_stats;
+
+static const size_t RING_BYTES=16384;
+static char     g_ring[RING_BYTES];
+static size_t   g_ringLen=0;
+static uint32_t g_ringDrops=0;
+
+static void ringAdd(const char* fmt,...) __attribute__((format(printf,1,2)));
+static void ringAdd(const char* fmt,...){
+    if(g_ringLen+192>=RING_BYTES){ g_ringDrops++; return; }
+    va_list ap; va_start(ap,fmt);
+    int n=vsnprintf(g_ring+g_ringLen,RING_BYTES-g_ringLen-1,fmt,ap);
+    va_end(ap);
+    if(n>0) g_ringLen+=(size_t)n;
 }
 
-static void emitEpilogue(Ctx& ctx){
-    for(int r=14;r<=31;r++)ctx.E(ppc_lwz(r,FRAME_SAVE+(r-14)*4,1));
-    ctx.E(ppc_lwz(0,(int16_t)FRAME_LR_OFF,1));
-    ctx.E(ppc_mtlr(0));
-    ctx.E(ppc_addi(1,1,(int16_t)FRAME_SIZE));
-    ctx.E(ppc_blr());
-}
+// ============================================================================
+//  Code buffer + block cache
+// ============================================================================
+namespace JitPpc { namespace {
 
-// Pull the interpreter's architectural state into the JIT register file.
-static void emitSyncFrom(Ctx& ctx){
-    ctx.ldInterp();
-    ctx.E(ppc_addi(TB,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_addi(TC,1,(int16_t)FRAME_CPSR));
-    ctx.call((void*)JitHelp_syncFrom);
-    ctx.E(ppc_cmpi(0,TA,0));
-    size_t bOk=ctx.sz();
-    ctx.E(ppc_bc(12,2,0));
-    ctx.li(TA,(uint32_t)(uintptr_t)g_exitReason);
-    ctx.E(ppc_lwz(TB,FRAME_CPUIDX,1));
-    ctx.E(ppc_rlwinm(TB,TB,2,0,29));
-    ctx.E(ppc_add(TA,TA,TB));
-    ctx.E(ppc_addi(TB,0,EXIT_FALLBACK));
-    ctx.E(ppc_stw(TB,0,TA));
-    emitEpilogue(ctx);
-    {int32_t d=(int32_t)((ctx.sz()-bOk)*4);ctx.base[bOk]=ppc_bc(12,2,(int16_t)d);}
-    for(int i=0;i<15;i++)ctx.E(ppc_lwz(RA[i],FRAME_REGSYNC+i*4,1));
-    ctx.E(ppc_lwz(RCPSR,FRAME_CPSR,1));
-}
+static const size_t JIT_BYTES = 4u*1024u*1024u;   // 4 MB: chaining needs headroom
+static const size_t JIT_WORDS = JIT_BYTES/4;
 
-static void emitSpill(Ctx& ctx){
-    for(int i=0;i<15;i++)ctx.E(ppc_stw(RA[i],FRAME_REGSYNC+i*4,1));
-    ctx.E(ppc_stw(RCPSR,FRAME_CPSR,1));
-}
-static void emitReload(Ctx& ctx){
-    for(int i=0;i<15;i++)ctx.E(ppc_lwz(RA[i],FRAME_REGSYNC+i*4,1));
-    ctx.E(ppc_lwz(RCPSR,FRAME_CPSR,1));
-}
+static uint32_t* codeBuf=nullptr;
+static size_t    codePos=0;
+static uint32_t  cacheGen=0;
+static bool      g_live=false;
 
-static void emitCommitExit(Ctx& ctx,uint32_t nextPC,int reason){
-    emitSpill(ctx);
-    ctx.ldInterp();ctx.ldCpu();
-    ctx.E(ppc_addi(TC,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_mr(TD,RCPSR));
-    ctx.li(TE,nextPC);
-    ctx.E(ppc_addi(TF,0,(int16_t)reason));
-    ctx.call((void*)JitHelp_commit);
-    emitEpilogue(ctx);
-}
-static void emitCommitExitDyn(Ctx& ctx,int reason){
-    emitSpill(ctx);
-    ctx.ldInterp();ctx.ldCpu();
-    ctx.E(ppc_addi(TC,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_mr(TD,RCPSR));
-    ctx.E(ppc_lwz(TE,FRAME_PC,1));
-    ctx.E(ppc_addi(TF,0,(int16_t)reason));
-    ctx.call((void*)JitHelp_commit);
-    emitEpilogue(ctx);
-}
+static const uint8_t RA[15]={14,15,16,17,18,19,20,21,22,23,24,25,26,27,28};
+static const uint8_t RCPSR=29, RWINB=30, RWINM=31;
+static const uint8_t TA=3,TB=4,TC=5,TD=6,TE=7,TF=8,TG=9,TS=10,RCALL=11,TR=12;
 
-// ═══════════════════════════════════════════════════════════════════════
-// Condition skip — inline for the single-bit conditions, helper otherwise
-//
-// andi. rA,rS,UI  sets CR0 from (CPSR & UI), so CR0.EQ == 1 means "the flag bit
-// is clear".  EQ/CS/MI/VS must skip when the bit is clear -> bc(12,2) [beq cr0];
-// NE/CC/PL/VC must skip when the bit is set   -> bc(4,2)  [bne cr0].
-// CR0 is never used by the flag writers (they use cr6), so this is safe.
-// ═══════════════════════════════════════════════════════════════════════
-static int openCondSkip(Ctx& ctx,uint8_t cond){
-    if(cond==14)return -1;
-    if(cond==15){                     // ARM "never": branch over the whole body
-        int m=ctx.NEWMARK();
-        if(m<0){ctx.overflow=true;return -1;}
-        ctx.FWD(20,0,m);
-        return m;
+// ---- frame layout (I1: nothing here collides with r14..r31 saves) ----------
+static const int FRAME_SIZE   =256;
+static const int FRAME_LR_OFF =FRAME_SIZE+4;
+static const int FRAME_SAVE   =16;                 // r14..r31 -> 16..88
+static const int FRAME_SHADOW =92;
+static const int FRAME_CORE   =96;
+static const int FRAME_INTERP =100;
+static const int FRAME_CPUIDX =104;
+static const int FRAME_PC     =108;
+static const int FRAME_BUDGET =112;
+static const int FRAME_SCR0   =116;
+static const int FRAME_SCR1   =120;
+static const int FRAME_SCR2   =124;
+static const int FRAME_FLAG   =128;
+static_assert(FRAME_SIZE%16==0,"frame align");
+static_assert(FRAME_SAVE+18*4==FRAME_SHADOW,"save map");
+static_assert(FRAME_FLAG+4<=FRAME_SIZE,"frame fits");
+
+struct LinkSite { uint32_t* site; uint32_t* stub; };
+
+struct JitBlock {
+    uint32_t  armPC=0, endPC=0, sig=0, nW=0, insnCount=0, cycles=0;
+    uint32_t* code=nullptr;      // C entry  (prologue + reload + body)
+    uint32_t* body=nullptr;      // chained entry (body only)
+    uint8_t   cpu=0, linkCount=0;
+    bool      thumb=false, valid=false;
+    uint32_t  gen=0;
+    LinkSite  links[JitCfg::kMaxLinks];
+    void addLink(uint32_t* site,uint32_t* stub){
+        if(linkCount<JitCfg::kMaxLinks) links[linkCount++]={site,stub};
     }
+};
 
-    uint32_t bits=0; bool wantSet=false, inlineable=false;
-    switch(cond){
-        case 0: bits=0x40000000u; wantSet=true;  inlineable=true; break; // EQ (Z)
-        case 1: bits=0x40000000u; wantSet=false; inlineable=true; break; // NE
-        case 2: bits=0x20000000u; wantSet=true;  inlineable=true; break; // CS (C)
-        case 3: bits=0x20000000u; wantSet=false; inlineable=true; break; // CC
-        case 4: bits=0x80000000u; wantSet=true;  inlineable=true; break; // MI (N)
-        case 5: bits=0x80000000u; wantSet=false; inlineable=true; break; // PL
-        case 6: bits=0x10000000u; wantSet=true;  inlineable=true; break; // VS (V)
-        case 7: bits=0x10000000u; wantSet=false; inlineable=true; break; // VC
-        default: break;
-    }
+static const size_t CSIZ=1u<<13;               // 8192 blocks
+static JitBlock cache[CSIZ];
+static uint16_t g_pageBlocks[1u<<16];
+static uint8_t  g_badPC[2][8192];              // P13: 1 bit per 4 guest bytes
 
-    int m=ctx.NEWMARK();
-    if(m<0){ctx.overflow=true;return -1;}
+static inline uint32_t pageIdx(uint32_t a){ return (a>>12)&0xFFFFu; }
+static void pageAdd(uint32_t s,uint32_t e){ uint32_t a=pageIdx(s),b=pageIdx(e-1); g_pageBlocks[a]++; if(b!=a) g_pageBlocks[b]++; }
+static void pageSub(uint32_t s,uint32_t e){ uint32_t a=pageIdx(s),b=pageIdx(e-1); if(g_pageBlocks[a])g_pageBlocks[a]--; if(b!=a&&g_pageBlocks[b])g_pageBlocks[b]--; }
+static inline size_t hashPC(uint32_t pc,int cpu){ return ((pc>>1)^(pc>>13)^((uint32_t)cpu<<11))&(CSIZ-1); }
 
-    if(inlineable){
-        ctx.E(ppc_andi_record(TA,RCPSR,(uint16_t)(bits>>16)));
-        ctx.FWD(wantSet?12:4,2,m);
-    }else{
-        ctx.E(ppc_mr(TA,RCPSR));
-        ctx.E(ppc_addi(TB,0,(int16_t)cond));
-        ctx.call((void*)JitHelp_testCond);
-        ctx.E(ppc_cmpi(0,TA,0));
-        ctx.FWD(12,2,m);          // beq cr0 : testCond()==0 -> skip the body
-    }
-    return m;
-}
-static void closeCondSkip(Ctx& ctx,int m){ if(m>=0)ctx.SETMARK(m); ctx.RESOLVE(); }
+static inline bool badPCBit(int cpu,uint32_t pc){ return (g_badPC[cpu][(pc>>2)&0x1FFF]&(1u<<((pc>>2)&7)))!=0; }
+static inline void markBadPC(int cpu,uint32_t pc){ g_badPC[cpu][(pc>>2)&0x1FFF]|=(uint8_t)(1u<<((pc>>2)&7)); }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Flag write-back  (F1..F4)
-//
-// The ONLY rule that matters: PPC rlwinm's MB/ME are MSB-relative bit numbers.
-//   bit31 -> MB/ME = 0     bit30 -> 1     bit29 (ARM C) -> 2
-//   bit28 (ARM V) -> 3     bit3 -> 28
-// ═══════════════════════════════════════════════════════════════════════
-static void setNZ(Ctx& ctx,uint8_t r){
-    // F3: TG (r9) instead of TA (r3) - TA/TD hold op1/op2 for the V emitters.
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,2,31));        // clear N,Z (MSB 2..31 == value bits 29..0)
-    ctx.E(ppc_rlwimi(RCPSR,r,0,0,0));             // N = r[31]
-    ctx.E(ppc_cmpi(6,r,0));
-    ctx.E(ppc_mfcr(TG));
-    ctx.E(ppc_rlwinm(TG,TG,25,1,1));              // cr6.EQ (value bit 5) -> value bit 30 (Z)
-    ctx.E(ppc_or(RCPSR,RCPSR,TG));
-}
-static void setC_xer(Ctx& ctx){
-    // F1: CA is XER value bit 29 == MSB-relative bit 2 == CPSR.C.  No rotate needed.
-    // F3: TG instead of TA, so op1/op2 survive for the V emitters that follow.
-    ctx.E(ppc_mfxer(TG));
-    ctx.E(ppc_rlwinm(TG,TG,0,2,2));
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));         // clear C (MSB 3..1 wraps around bit 2)
-    ctx.E(ppc_or(RCPSR,RCPSR,TG));
-}
-static void setV_add(Ctx& ctx,uint8_t res,uint8_t a,uint8_t b){
-    ctx.E(ppc_xor(TE,res,a));ctx.E(ppc_xor(TF,res,b));ctx.E(ppc_and(TE,TE,TF));
-    ctx.E(ppc_rlwinm(TE,TE,0,0,0));               // sign -> value bit 31
-    ctx.E(ppc_rlwinm(TE,TE,29,3,3));              // F2: V -> value bit 28 (was 28,28 -> bit 3)
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));         // clear V
-    ctx.E(ppc_or(RCPSR,RCPSR,TE));
-}
-static void setV_sub(Ctx& ctx,uint8_t res,uint8_t a,uint8_t b){
-    ctx.E(ppc_xor(TE,a,b));ctx.E(ppc_xor(TF,a,res));ctx.E(ppc_and(TE,TE,TF));
-    ctx.E(ppc_rlwinm(TE,TE,0,0,0));
-    ctx.E(ppc_rlwinm(TE,TE,29,3,3));              // F2
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,4,2));
-    ctx.E(ppc_or(RCPSR,RCPSR,TE));
-}
-static void setC_imm(Ctx& ctx,uint8_t cr){
-    // F4: SH=29 moves the LSB to value bit 29; mask (2,2) keeps value bit 29.
-    //     The old mask (29,29) kept value bit 2, so the OR wrote a constant 0.
-    ctx.E(ppc_rlwinm(TA,cr,29,2,2));
-    ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,3,1));
-    ctx.E(ppc_or(RCPSR,RCPSR,TA));
-}
-static void primeCarry(Ctx& ctx){                  // XER.CA = CPSR.C  (for adde/subfe)
-    ctx.E(ppc_rlwinm(TA,RCPSR,3,31,31));          // value bit 29 -> value bit 0
-    ctx.E(ppc_addic(0,TA,-1));
-}
+static void flushICache(uint32_t* p,size_t nW){ DCFlushRange(p,nW*4); ICInvalidateRange(p,nW*4); }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Shifter helpers.  Carry-out is written into RSHC with the ARM carry bit in
-// the LSB (that is what the fixed setC_imm() expects).
-// ═══════════════════════════════════════════════════════════════════════
-static void sLslI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i==0){if(d!=s)ctx.E(ppc_mr(d,s));if(sc)ctx.E(ppc_rlwinm(RSHC,RCPSR,3,31,31));}
-    else if(i<32){if(sc)ctx.E(ppc_rlwinm(RSHC,s,(uint8_t)i,31,31));
-                  ctx.E(ppc_rlwinm(d,s,(uint8_t)i,0,(uint8_t)(31-i)));}
-    else if(i==32){if(sc)ctx.E(ppc_rlwinm(RSHC,s,0,31,31));ctx.E(ppc_addi(d,0,0));}
-    else{if(sc)ctx.E(ppc_addi(RSHC,0,0));ctx.E(ppc_addi(d,0,0));}
-}
-static void sLsrI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i==32){if(sc)ctx.E(ppc_rlwinm(RSHC,s,1,31,31));ctx.E(ppc_addi(d,0,0));}
-    else if(i>0&&i<32){if(sc)ctx.E(ppc_rlwinm(RSHC,s,(uint8_t)((33-i)&31),31,31));
-                       ctx.E(ppc_rlwinm(d,s,(uint8_t)(32-i),(uint8_t)i,31));}
-    else{if(sc)ctx.E(ppc_addi(RSHC,0,0));ctx.E(ppc_addi(d,0,0));}
-}
-static void sAsrI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i>=32){if(sc)ctx.E(ppc_rlwinm(RSHC,s,1,31,31));ctx.E(ppc_srawi(d,s,31));}
-    else if(i>0){if(sc)ctx.E(ppc_rlwinm(RSHC,s,(uint8_t)((33-i)&31),31,31));
-                 ctx.E(ppc_srawi(d,s,(uint8_t)i));}
-    else{if(d!=s)ctx.E(ppc_mr(d,s));if(sc)ctx.E(ppc_rlwinm(RSHC,RCPSR,3,31,31));}
-}
-static void sRorI(Ctx& ctx,uint8_t d,uint8_t s,int i,bool sc){
-    if(i==0){
-        // imm ROR #0 is really RRX: result = (C << 31) | (s >> 1), carry = s[0]
-        if(sc)ctx.E(ppc_rlwinm(RSHC,s,0,31,31));
-        ctx.E(ppc_rlwinm(TA,RCPSR,2,0,0));
-        ctx.E(ppc_rlwinm(d,s,31,1,31));
-        ctx.E(ppc_or(d,d,TA));
-    }else{
-        i&=31;
-        if(i==0){if(d!=s)ctx.E(ppc_mr(d,s));if(sc)ctx.E(ppc_rlwinm(RSHC,s,1,31,31));}
-        else{if(sc)ctx.E(ppc_rlwinm(RSHC,s,(uint8_t)((33-i)&31),31,31));
-             ctx.E(ppc_rlwinm(d,s,(uint8_t)(32-i),0,31));}
-    }
-}
+// ---- emit context ----------------------------------------------------------
+struct Ctx {
+    uint32_t *base=nullptr,*cur=nullptr; size_t cap=0;
+    bool thumb=false,arm7=false,done=false,overflow=false;
+    uint32_t blockPC=0;
+    int cpuIdx=0;
+    Interpreter* interp=nullptr;
+    Core* core=nullptr;
+    int insnCount=0;
+    uint32_t cyc=0;
 
-// F5: register-specified shift WITH the ARM carry, for every amount (0, 1..31, 32, >32).
-//   type 0 = LSL, 1 = LSR, 2 = ASR, 3 = ROR
-//   value  : src (Rs)      amount : amtReg (low 8 bits)
-//   result : dst           carry  : RSHC LSB
-// Clobbers TB, TK, RSHC.  dst may alias src or amtReg.
-//   Layout of the emitted sequence (M* = local branch mark):
-//
-//     rlwinm TK,amt,0,24,31          ; amount = amtReg & 0xFF
-//     cmpi   0,TK,0    ; beq  -> MZERO
-//     <type specific>
-//        LSL/LSR/ASR: cmpi 0,TK,32 ; bge -> MBIG
-//                     addi TB,TK,-1 ; srw RSHC,src,TB   (C = src[amount-1])
-//                     slw/srw/sraw dst,src,TK
-//        ROR:         rlwinm TK,TK,0,27,31 (n = amount%32) ; beq -> MRMUL
-//                     subfic TB,TK,32 ; rlwnm dst,src,TB,0,31
-//                     rlwinm RSHC,dst,1,31,31            (C = src[n-1])
-//     b -> MGDONE
-//   MBIG: LSL/LSR:  cmpi 0,TK,32 ; bgt -> MGT
-//                   rlwinm RSHC,src,(0|1),31,31          (amount==32: C = src[0] / src[31])
-//                   b -> MZ
-//        MGT:       addi RSHC,0,0                           (amount>32: C = 0)
-//        MZ:        addi dst,0,0
-//        ASR:       rlwinm RSHC,src,1,31,31 ; srawi dst,src,31
-//     b -> MGDONE
-//   MRMUL: mr dst,src ; rlwinm RSHC,src,1,31,31           (ROR by a multiple of 32)
-//   MGDONE: b -> MEND
-//   MZERO: mr dst,src ; rlwinm RSHC,RCPSR,3,31,31         (C unchanged: re-read CPSR bit 29)
-//   MEND:
-static void emitRegShiftCarry(Ctx& ctx,int type,uint8_t dst,uint8_t src,uint8_t amtReg){
-    const int savedFix =ctx.baseFix();      // keep any enclosing condition-skip pending
-    const int savedMark=ctx.nextMark;
-    const int mZero  =ctx.NEWMARK();
-    const int mGDone =ctx.NEWMARK();
-    const int mEnd   =ctx.NEWMARK();
-    const int mBig   =ctx.NEWMARK();
-    const int mGt    =ctx.NEWMARK();
-    const int mRmul  =ctx.NEWMARK();
-    if(mZero<0||mGDone<0||mEnd<0||mBig<0||mGt<0||mRmul<0){
-        ctx.overflow=true;ctx.nextMark=savedMark;return;
-    }
+    void E(uint32_t w){ if((size_t)(cur-base)<cap) *cur++=w; else overflow=true; }
+    size_t sz() const { return (size_t)(cur-base); }
+    size_t rem() const { size_t u=sz(); return u<cap?cap-u:0; }
+    void li(uint8_t rt,uint32_t v){ uint32_t t[2]; int n=liSeq(rt,v,t); for(int i=0;i<n;i++) E(t[i]); }
+    void ldShadowTo(uint8_t rt){ E(lwz(rt,FRAME_SHADOW,1)); }
+    void ldShadow(){ ldShadowTo(TA); }
+    void ldCore(){ E(lwz(TA,FRAME_CORE,1)); }
+    void ldInterp(){ E(lwz(TA,FRAME_INTERP,1)); }
+    void ldCpu(){ E(lwz(TB,FRAME_CPUIDX,1)); }
 
-    ctx.E(ppc_rlwinm(TK,amtReg,0,24,31));      // amount = amtReg & 0xFF
-    ctx.E(ppc_cmpi(0,TK,0));
-    ctx.FWD(12,2,mZero);                       // amount == 0 -> result = src, C unchanged
-
-    if(type==3){                               // ── ROR ──
-        ctx.E(ppc_rlwinm(TK,TK,0,27,31));      // n = amount & 31
-        ctx.E(ppc_cmpi(0,TK,0));
-        ctx.FWD(12,2,mRmul);                   // n == 0 (amount is a multiple of 32)
-        ctx.E(ppc_subfic(TB,TK,32));
-        ctx.E(ppc_rlwnm(dst,src,TB,0,31));     // load_shift = rotl(src, 32-n) = ror(src, n)
-        ctx.E(ppc_rlwinm(RSHC,dst,1,31,31));   // C = src[n-1] == result[31]
-        ctx.FWD(20,0,mGDone);
-        ctx.SETMARK(mRmul);
-        ctx.E(ppc_mr(dst,src));
-        ctx.E(ppc_rlwinm(RSHC,src,1,31,31));   // C = src[31]
-        ctx.FWD(20,0,mGDone);
-    }else{
-        ctx.E(ppc_cmpi(0,TK,32));
-        ctx.FWD(4,0,mBig);                     // !(amount < 32) -> MBIG
-        ctx.E(ppc_addi(TB,TK,-1));             // amount-1 (0..30)
-        ctx.E(ppc_srw(RSHC,src,TB));           // C = src[amount-1]
-        if(type==0)     ctx.E(ppc_slw(dst,src,TK));
-        else if(type==1)ctx.E(ppc_srw(dst,src,TK));
-        else            ctx.E(ppc_sraw(dst,src,TK));
-        ctx.FWD(20,0,mGDone);
-
-        ctx.SETMARK(mBig);                     // amount >= 32
-        if(type==0||type==1){
-            ctx.E(ppc_cmpi(0,TK,32));
-            ctx.FWD(12,1,mGt);                 // amount > 32
-            ctx.E(ppc_rlwinm(RSHC,src,(uint8_t)(type==0?0:1),31,31));
-            int mZ=ctx.NEWMARK();
-            if(mZ<0){ctx.overflow=true;return;}
-            ctx.FWD(20,0,mZ);
-            ctx.SETMARK(mGt);
-            ctx.E(ppc_addi(RSHC,0,0));
-            ctx.SETMARK(mZ);
-            ctx.E(ppc_addi(dst,0,0));          // result = 0 for amount >= 32
-        }else{                                 // ASR: sign bits, C = src[31] for 32 or more
-            ctx.E(ppc_rlwinm(RSHC,src,1,31,31));
-            ctx.E(ppc_srawi(dst,src,31));
+    // P1: one instruction when the callee is inside MEM1 (it always is here)
+    void call(void* fn){
+        uint32_t a=(uint32_t)(uintptr_t)fn;
+        if(JitCfg::kDirectCalls && a>=0x80000000u && a<0x81800000u){
+            intptr_t disp=(intptr_t)a-(intptr_t)cur;
+            if(disp>=-(1<<25) && disp<=(1<<25)-4){ E(bl(disp)); return; }
         }
-        ctx.FWD(20,0,mGDone);
+        uint16_t hi=(uint16_t)(a>>16), lo=(uint16_t)(a&0xFFFF);
+        E(addis(RCALL,0,(int16_t)hi));
+        if(lo) E(ori(RCALL,RCALL,lo));
+        E(mtctr(RCALL));
+        E(bc(20,0,0,true));                       // bctrl
     }
+};
 
-    ctx.SETMARK(mGDone);
-    ctx.FWD(20,0,mEnd);                        // all general paths skip the amount==0 body
+// ---------------------------------------------------------------------------
+//  Branch-site patching.  Every branch template carries disp 0, so the final
+//  displacement is ORed in (this preserves bo/bi, which P2 needs).
+// ---------------------------------------------------------------------------
+struct Skip { size_t a=SIZE_MAX, b=SIZE_MAX; };
 
-    ctx.SETMARK(mZero);
-    if(dst!=src)ctx.E(ppc_mr(dst,src));
-    ctx.E(ppc_rlwinm(RSHC,RCPSR,3,31,31));     // C = old C (value bit 29 -> value bit 0)
-
-    ctx.SETMARK(mEnd);
-    ctx.RESOLVE_FROM(savedFix);                // resolve only our own branches
-    ctx.nextMark=savedMark;                    // hand the mark slots back to the caller
+static void patchOne(Ctx& C,size_t idx){
+    if(idx==SIZE_MAX) return;
+    int32_t d=(int32_t)((C.sz()-idx)*4);
+    if(d<-32768||d>32764){ C.overflow=true; return; }
+    C.base[idx] |= (uint32_t)d & 0xFFFCu;
+}
+static void patchSkip(Ctx& C,Skip s){ patchOne(C,s.a); patchOne(C,s.b); }
+static void patchTo(Ctx& C,size_t idx,size_t targetAbs){
+    if(idx==SIZE_MAX) return;
+    int32_t d=(int32_t)((targetAbs-idx)*4);
+    if(d<-32768||d>32764){ C.overflow=true; return; }
+    C.base[idx] |= (uint32_t)d & 0xFFFCu;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Shifter dispatch (used by ARM data-processing and single data transfer)
-// ═══════════════════════════════════════════════════════════════════════
-static bool emitShifter(Ctx& ctx,uint32_t op,uint8_t dst,bool sc){
-    if((op>>25)&1){                            // immediate form
-        uint32_t v=op&0xFF,rot=((op>>8)&0xF)*2;
-        if(rot)v=(v>>rot)|(v<<(32-rot));
-        ctx.li(dst,v);
-        if(sc&&rot){ctx.E(ppc_rlwinm(RSHC,dst,1,31,31));return true;}   // C = imm[31] after rotate
+// ============================================================================
+//  P2 — inline condition evaluation.
+//  CPSR: N=31 Z=30 C=29 V=28.  andis. TS,RCPSR,mask sets CR0 from the masked
+//  value, so CR0.EQ means "that flag is clear": 2 instructions, no call, no
+//  mfcr, and no dependency on CR fields surviving a helper call.
+// ============================================================================
+static Skip emitCondSkip(Ctx& C,uint8_t cond){
+    Skip s;
+    if(cond==14||cond==0xF||!JitCfg::kInlineCond) return s;
+    switch(cond){
+    case 0x0: C.E(andis_(TS,RCPSR,0x4000)); s.a=C.sz(); C.E(bc(12,crEQ(0),0)); break; // EQ
+    case 0x1: C.E(andis_(TS,RCPSR,0x4000)); s.a=C.sz(); C.E(bc(4 ,crEQ(0),0)); break; // NE
+    case 0x2: C.E(andis_(TS,RCPSR,0x2000)); s.a=C.sz(); C.E(bc(12,crEQ(0),0)); break; // CS
+    case 0x3: C.E(andis_(TS,RCPSR,0x2000)); s.a=C.sz(); C.E(bc(4 ,crEQ(0),0)); break; // CC
+    case 0x4: C.E(andis_(TS,RCPSR,0x8000)); s.a=C.sz(); C.E(bc(12,crEQ(0),0)); break; // MI
+    case 0x5: C.E(andis_(TS,RCPSR,0x8000)); s.a=C.sz(); C.E(bc(4 ,crEQ(0),0)); break; // PL
+    case 0x6: C.E(andis_(TS,RCPSR,0x1000)); s.a=C.sz(); C.E(bc(12,crEQ(0),0)); break; // VS
+    case 0x7: C.E(andis_(TS,RCPSR,0x1000)); s.a=C.sz(); C.E(bc(4 ,crEQ(0),0)); break; // VC
+    case 0x8: C.E(andis_(TS,RCPSR,0x2000)); s.a=C.sz(); C.E(bc(12,crEQ(0),0));       // HI=C&&!Z
+              C.E(andis_(TS,RCPSR,0x4000)); s.b=C.sz(); C.E(bc(4 ,crEQ(0),0)); break;
+    case 0x9: C.E(andis_(TS,RCPSR,0x2000)); s.a=C.sz(); C.E(bc(4 ,crEQ(0),0));       // LS=!C|Z
+              C.E(andis_(TS,RCPSR,0x4000)); s.b=C.sz(); C.E(bc(12,crEQ(0),0)); break;
+    default:                                                                         // GE/LT/GT/LE
+        C.E(rlwinm(TS,RCPSR,3,0,0));            // V into bit31
+        C.E(xor_(TS,TS,RCPSR));                 // bit31 = N^V
+        C.E(andis_(TS,TS,0x8000));
+        if(cond==0xA){ s.a=C.sz(); C.E(bc(4 ,crEQ(0),0)); }        // GE: skip if N!=V
+        else if(cond==0xB){ s.a=C.sz(); C.E(bc(12,crEQ(0),0)); }   // LT: skip if N==V
+        else if(cond==0xC){ s.a=C.sz(); C.E(bc(4 ,crEQ(0),0));     // GT: N!=V or Z!=0
+                            C.E(andis_(TS,RCPSR,0x4000)); s.b=C.sz(); C.E(bc(4 ,crEQ(0),0)); }
+        else { s.a=C.sz(); C.E(bc(12,crEQ(0),0));                  // LE: N==V and Z==0
+               C.E(andis_(TS,RCPSR,0x4000)); s.b=C.sz(); C.E(bc(12,crEQ(0),0)); }
+        break;
+    }
+    return s;
+}
+
+// ============================================================================
+//  Flags.  Scratch: TS/TE/TF only, so operands in TA..TD survive.
+//  rlwinm masks use IBM numbering (bit 0 = MSB): N=0, Z=1, C=2, V=3.
+// ============================================================================
+static void setNZ(Ctx& C,uint8_t r){
+    C.E(rlwinm(RCPSR,RCPSR,0,2,31));      // clear N,Z
+    C.E(rlwimi(RCPSR,r,0,0,0));           // N = r[31]
+    C.E(cmpi(6,r,0));                     // CR6.EQ <= (r==0)
+    C.E(mfcr(TS));
+    C.E(rlwinm(TS,TS,25,1,1));            // CR6.EQ -> bit30
+    C.E(or_(RCPSR,RCPSR,TS));
+}
+static void setC_xer(Ctx& C){
+    C.E(mfxer(TS));
+    C.E(rlwinm(TS,TS,0,2,2));             // XER.CA sits at bit29 == ARM C
+    C.E(rlwinm(RCPSR,RCPSR,0,3,1));       // clear C
+    C.E(or_(RCPSR,RCPSR,TS));
+}
+static void setC_bit0(Ctx& C,uint8_t r){
+    C.E(rlwinm(TS,r,29,2,2));
+    C.E(rlwinm(RCPSR,RCPSR,0,3,1));
+    C.E(or_(RCPSR,RCPSR,TS));
+}
+static void setV_add(Ctx& C,uint8_t res,uint8_t a,uint8_t b){
+    C.E(xor_(TE,res,a)); C.E(xor_(TF,res,b)); C.E(and_(TE,TE,TF));
+    C.E(rlwinm(TE,TE,29,3,3)); C.E(rlwinm(RCPSR,RCPSR,0,4,2)); C.E(or_(RCPSR,RCPSR,TE));
+}
+static void setV_sub(Ctx& C,uint8_t res,uint8_t a,uint8_t b){   // a - b
+    C.E(xor_(TE,a,b)); C.E(xor_(TF,a,res)); C.E(and_(TE,TE,TF));
+    C.E(rlwinm(TE,TE,29,3,3)); C.E(rlwinm(RCPSR,RCPSR,0,4,2)); C.E(or_(RCPSR,RCPSR,TE));
+}
+// Carry-in.  addc/adde take CA as carry-in; subfc/subfe take CA as
+// "no borrow".  Both want CA == CPSR.C, and one addic gives exactly that:
+//     TS  = CPSR.C                       (0 or 1)
+//     addic r0,TS,-1   ->  CA = 1 iff TS != 0  (0xFFFFFFFF + 0 = no carry)
+// so this single pair of instructions serves ADC/SBC/RSC/ADD/SUB carry logic.
+// It must be emitted *after* the shifter (which may clobber CA) and before the
+// addc/subfc that consumes it — that ordering is why emitDP/the Thumb ALU ops
+// look the way they do.
+static void primeCarry(Ctx& C){             // XER.CA <= CPSR.C
+    C.E(rlwinm(TS,RCPSR,3,31,31));
+    C.E(addic(0,TS,-1));
+}
+
+// ============================================================================
+//  Shifter, immediate amounts.  Carry-out lands in TC bit0 when sc.
+// ============================================================================
+static void sLslI(Ctx& C,uint8_t d,uint8_t s,int i,bool sc){
+    if(i==0){ if(sc)C.E(rlwinm(TC,RCPSR,3,31,31)); if(d!=s)C.E(mr(d,s)); }
+    else if(i<32){ if(sc)C.E(rlwinm(TC,s,(uint8_t)i,31,31));
+                   if(i==31)C.E(addi(d,0,0)); else C.E(rlwinm(d,s,(uint8_t)i,0,(uint8_t)(31-i))); }
+    else if(i==32){ if(sc)C.E(rlwinm(TC,s,0,31,31)); C.E(addi(d,0,0)); }
+    else { if(sc)C.E(addi(TC,0,0)); C.E(addi(d,0,0)); }
+}
+static void sLsrI(Ctx& C,uint8_t d,uint8_t s,int i,bool sc){
+    if(i==32){ if(sc)C.E(rlwinm(TC,s,1,31,31)); C.E(addi(d,0,0)); }
+    else if(i>=1&&i<32){ if(sc)C.E(rlwinm(TC,s,(uint8_t)((33-i)&31),31,31));
+                         C.E(rlwinm(d,s,(uint8_t)(32-i),(uint8_t)i,31)); }
+    else { if(sc)C.E(addi(TC,0,0)); C.E(addi(d,0,0)); }
+}
+static void sAsrI(Ctx& C,uint8_t d,uint8_t s,int i,bool sc){
+    if(i>=32){ if(sc)C.E(rlwinm(TC,s,1,31,31)); C.E(srawi(d,s,31)); }
+    else if(i>0){ if(sc)C.E(rlwinm(TC,s,(uint8_t)((33-i)&31),31,31)); C.E(srawi(d,s,(uint8_t)i)); }
+    else { if(sc)C.E(rlwinm(TC,RCPSR,3,31,31)); if(d!=s)C.E(mr(d,s)); }
+}
+static void sRorI(Ctx& C,uint8_t d,uint8_t s,int i,bool sc){
+    if(i==0){                                              // RRX
+        if(sc)C.E(rlwinm(TC,s,0,31,31));
+        C.E(rlwinm(TS,RCPSR,2,0,0));
+        C.E(rlwinm(d,s,31,1,31));
+        C.E(or_(d,d,TS));
+    } else {
+        i&=31;
+        if(i==0){ if(sc)C.E(rlwinm(TC,s,1,31,31)); if(d!=s)C.E(mr(d,s)); }
+        else { if(sc)C.E(rlwinm(TC,s,(uint8_t)((33-i)&31),31,31));
+               C.E(rlwinm(d,s,(uint8_t)(32-i),0,31)); }
+    }
+}
+
+// ============================================================================
+//  P8 — shift by register.  slw/srw/sraw give ARM's carry in XER.CA for
+//  amounts 1..31; the helper covers amt==0 (C preserved) and amt>=32.
+//  ROR has no cheap CA on PPC, so it always uses the helper.
+// ============================================================================
+static void emitShiftHelper(Ctx& C,uint32_t type,uint8_t dst,uint8_t val,uint8_t amt,bool setC){
+    uint8_t v=val, m=amt;
+    C.E(mr(TB,v));
+    C.E(mr(TC,m));                       // copy before TD/TA are reused
+    C.ldShadowTo(TF);
+    C.E(addi(TD,TF,SH_CPSR));
+    C.E(addi(TA,0,(int16_t)type));
+    C.E(addi(TE,0,setC?1:0));
+    C.call((void*)&JitHelp_shiftReg);
+    if(dst!=TA) C.E(mr(dst,TA));
+}
+static bool emitShiftReg(Ctx& C,uint32_t type,uint8_t dst,uint8_t val,uint8_t amt,bool setC){
+    if(!JitCfg::kInlineShift || type==3){ emitShiftHelper(C,type,dst,val,amt,setC); return true; }
+    uint8_t v=val;
+    if(v==TD){ C.E(mr(TF,v)); v=TF; }     // TD is about to hold the masked amount
+    C.E(rlwinm(TD,amt,0,24,31));          // ARM masks the shift amount to 8 bits
+    C.E(cmpi(0,TD,0));
+    size_t z=C.sz(); C.E(bc(4,crEQ(0),0));         // amt==0 -> helper
+    C.E(cmpli(1,TD,32));
+    size_t m=C.sz(); C.E(bc(4,crLT(1),0));         // CR1.LT clear => amt>=32 -> helper
+    if(type==0) C.E(slw (v==dst?dst:dst,v,TD));    // result + XER.CA
+    if(type==1) C.E(srw (dst,v,TD));
+    if(type==2) C.E(sraw(dst,v,TD));
+    if(setC){ C.E(mfxer(TS)); C.E(rlwinm(RCPSR,RCPSR,0,3,1)); C.E(rlwinm(TS,TS,0,2,2)); C.E(or_(RCPSR,RCPSR,TS)); }
+    size_t j=C.sz(); C.E(b(0));                    // over the helper
+    size_t helperStart=C.sz();
+    patchTo(C,z,helperStart); patchTo(C,m,helperStart);
+    emitShiftHelper(C,type,dst,val,amt,setC);
+    C.base[j]=b((intptr_t)((C.sz()-j)*4));
+    return true;
+}
+// ============================================================================
+//  Prologue / reload / epilogue / exits
+// ============================================================================
+static void emitReloadFromShadow(Ctx& C){
+    C.ldShadowTo(TA);
+    for(int i=0;i<15;i++) C.E(lwz(RA[i],SH_REGS+i*4,TA));
+    C.E(lwz(RCPSR,SH_CPSR,TA));
+    C.E(lwz(RWINB,SH_BASE,TA));
+    C.E(lwz(RWINM,SH_MASK,TA));
+}
+static void emitEpilogue(Ctx& C){
+    for(int r=14;r<=31;r++) C.E(lwz(r,FRAME_SAVE+(r-14)*4,1));
+    C.E(lwz(0,FRAME_LR_OFF,1));
+    C.E(mtlr(0));
+    C.E(addi(1,1,(int16_t)FRAME_SIZE));
+    C.E(blr());
+}
+// Exit to C: write the whole shadow back, record PC/reason/cycles, return.
+static void emitExitToC(Ctx& C,uint32_t nextPC,int reason){
+    C.ldShadowTo(TA);
+    for(int i=0;i<15;i++) C.E(stw(RA[i],SH_REGS+i*4,TA));
+    C.E(stw(RCPSR,SH_CPSR,TA));
+    C.li(TB,nextPC);
+    C.E(stw(TB,SH_PC,TA));
+    C.E(addi(TC,0,(int16_t)reason));
+    C.E(stw(TC,SH_REASON,TA));
+    C.E(lwz(TD,SH_CYC,TA));
+    C.E(addi(TD,TD,(int16_t)C.cyc));
+    C.E(stw(TD,SH_CYC,TA));
+    emitEpilogue(C);
+}
+static void emitExitToCDyn(Ctx& C,int reason){          // PC already in FRAME_PC
+    C.ldShadowTo(TA);
+    for(int i=0;i<15;i++) C.E(stw(RA[i],SH_REGS+i*4,TA));
+    C.E(stw(RCPSR,SH_CPSR,TA));
+    C.E(lwz(TB,FRAME_PC,1));
+    C.E(stw(TB,SH_PC,TA));
+    C.E(addi(TC,0,(int16_t)reason));
+    C.E(stw(TC,SH_REASON,TA));
+    C.E(lwz(TD,SH_CYC,TA));
+    C.E(addi(TD,TD,(int16_t)C.cyc));
+    C.E(stw(TD,SH_CYC,TA));
+    emitEpilogue(C);
+}
+// I4: conditional PC writes.  Flag = "this instruction wrote PC".
+static void emitSetPCFlag(Ctx& C,uint32_t v){
+    C.li(TD,v); C.E(stw(TD,FRAME_FLAG,1));
+}
+static void emitPCFlagGate(Ctx& C){
+    C.E(lwz(TD,FRAME_FLAG,1));
+    C.E(cmpi(0,TD,0));
+    size_t keep=C.sz(); C.E(bc(12,crEQ(0),0));          // flag==0 -> keep compiling
+    emitExitToCDyn(C,EXIT_PCWRITE);
+    patchOne(C,keep);
+}
+// Load-to-PC / POP {pc} / LDM-with-PC: ARMv5 interworks on bit 0, ARM7 does not.
+static void emitPCWriteDyn(Ctx& C){                     // value in FRAME_PC
+    C.E(lwz(TA,FRAME_PC,1));
+    if(C.arm7){
+        C.E(rlwinm(TB,TA,0,0,29));
+        C.E(stw(TB,FRAME_PC,1));
+        C.E(rlwinm(RCPSR,RCPSR,0,27,25));
+    } else {
+        C.E(rlwinm(TC,TA,0,31,31));                     // bit0
+        C.E(rlwinm(TD,TC,1,30,30));                     // bit0<<1
+        C.E(xori(TD,TD,2));                             // 2 (ARM) / 0 (Thumb)
+        C.E(ori(TD,TD,1));                              // 3 / 1
+        C.E(andc(TB,TA,TD));
+        C.E(stw(TB,FRAME_PC,1));
+        C.E(rlwinm(TC,TC,5,26,26));                     // -> T
+        C.E(rlwinm(RCPSR,RCPSR,0,27,25));
+        C.E(or_(RCPSR,RCPSR,TC));
+    }
+    emitExitToCDyn(C,EXIT_NORMAL);
+}
+// BX/BLX target: value in FRAME_SCR0 (always interworks, both CPUs)
+static void emitBXTarget(Ctx& C){
+    C.E(lwz(TA,FRAME_SCR0,1));
+    C.E(rlwinm(TC,TA,0,31,31));
+    C.E(rlwinm(TD,TC,1,30,30));
+    C.E(xori(TD,TD,2));
+    C.E(ori(TD,TD,1));
+    C.E(andc(TB,TA,TD));
+    C.E(stw(TB,FRAME_PC,1));
+    C.E(rlwinm(TC,TC,5,26,26));
+    C.E(rlwinm(RCPSR,RCPSR,0,27,25));
+    C.E(or_(RCPSR,RCPSR,TC));
+    emitExitToCDyn(C,EXIT_NORMAL);
+}
+
+// ============================================================================
+//  P3 — chaining.  Forward declarations first (compile() publishes blocks).
+// ============================================================================
+struct PendingLink { uint32_t* site; uint32_t* stub; uint32_t targetPC; uint8_t cpu; bool thumb; };
+static std::vector<PendingLink> g_pending;
+static JitBlock* compile(Interpreter* interp,Core* core,uint32_t armPC,bool arm7,int cpuIdx);
+
+static JitBlock* lookupValid(uint32_t pc,int cpu,bool thumb){
+    JitBlock& b=cache[hashPC(pc,cpu)];
+    if(b.valid&&b.armPC==pc&&b.cpu==(uint8_t)cpu&&b.thumb==thumb&&b.gen==cacheGen) return &b;
+    return nullptr;
+}
+static void resolvePendingFor(JitBlock* t){
+    for(size_t i=0;i<g_pending.size();){
+        PendingLink& l=g_pending[i];
+        if(l.targetPC==t->armPC && l.cpu==t->cpu && l.thumb==t->thumb){
+            *l.site = b((intptr_t)((t->body)-l.site));
+            t->addLink(l.site,l.stub);
+            g_pending[i]=g_pending.back(); g_pending.pop_back();
+        } else ++i;
+    }
+}
+// A site with no link yet must still be *correct*: point it at a local stub that
+// exits to C with the intended PC.  Compiling the target later repoints it.
+static void emitLinkOrExit(Ctx& C,uint32_t targetPC){
+    JitBlock* t = JitCfg::kChain?lookupValid(targetPC,C.cpuIdx,C.thumb):nullptr;
+    size_t site=C.sz(); C.E(b(0));
+    size_t stub=C.sz();
+    emitExitToC(C,targetPC,EXIT_NORMAL);
+    if(t){
+        C.base[site]=b((intptr_t)((t->body)-(C.base+site)));
+        t->addLink(C.base+site,nullptr);
+    } else {
+        C.base[site]=b((intptr_t)((stub-site)*4));
+        g_pending.push_back({C.base+site,C.base+stub,targetPC,(uint8_t)C.cpuIdx,C.thumb});
+    }
+}
+// End of a body that fell through (or of a taken branch): spend budget, link.
+static void emitBodyEnd(Ctx& C,uint32_t nextPC,int exitReason=EXIT_NORMAL){
+    if(!JitCfg::kChain){ emitExitToC(C,nextPC,exitReason); return; }
+    JitBlock* t=lookupValid(nextPC,C.cpuIdx,C.thumb);
+    if(!t){ emitLinkOrExit(C,nextPC); return; }
+    C.E(lwz(TB,FRAME_BUDGET,1));
+    C.E(addi(TB,TB,-(int16_t)C.cyc));
+    C.E(stw(TB,FRAME_BUDGET,1));
+    C.E(cmpi(0,TB,0));
+    size_t over=C.sz(); C.E(bc(4,crLT(0),0));           // budget exhausted -> exit
+    size_t site=C.sz(); C.E(b(0));
+    C.base[site]=b((intptr_t)((t->body)-(C.base+site)));
+    t->addLink(C.base+site,nullptr);
+    patchOne(C,over);
+    emitExitToC(C,nextPC,EXIT_BUDGET);
+}
+static void unlinkIncoming(JitBlock* b){
+    for(uint8_t i=0;i<b->linkCount;i++){
+        LinkSite& l=b->links[i];
+        uint32_t* dst = b->valid? b->body : l.stub;
+        if(!dst) dst = b->code;
+        *l.site = b((intptr_t)(dst-l.site));
+    }
+    if(!b->valid) b->linkCount=0;
+}
+
+// ============================================================================
+//  ARM data processing — P5 (R15 operand) and P6a (write to PC)
+// ============================================================================
+enum DPo { DP_AND=0,DP_EOR,DP_SUB,DP_RSB,DP_ADD,DP_ADC,DP_SBC,DP_RSC,
+           DP_TST,DP_TEQ,DP_CMP,DP_CMN,DP_ORR,DP_MOV,DP_BIC,DP_MVN };
+
+static bool emitShifter(Ctx& C,uint32_t op,uint8_t dst,bool sc,uint32_t curPC){
+    if((op>>25)&1){
+        uint32_t v=op&0xFF, rot=((op>>8)&0xF)*2;
+        if(rot) v=(v>>rot)|(v<<(32-rot));
+        C.li(dst,v);
+        if(sc&&rot){ C.E(rlwinm(TC,dst,1,31,31)); return true; }
         return false;
     }
-    uint8_t rm=op&0xF;
-    if(rm==15)return false;
-    uint8_t st=(op>>5)&3;
-    if(!((op>>4)&1)){                          // immediate shift
+    const uint8_t rm=op&0xF, rs=(op>>8)&0xF, st=(op>>5)&3;
+    const bool regShift=(op>>4)&1;
+    uint8_t src;
+    if(rm==15){ C.li(TE,curPC+(regShift?12u:8u)); src=TE; }   // P5
+    else src=RA[rm];
+    if(!regShift){
         int sa=(op>>7)&0x1F;
         switch(st){
-            case 0:sLslI(ctx,dst,RA[rm],sa,sc);break;
-            case 1:sLsrI(ctx,dst,RA[rm],sa?sa:32,sc);break;
-            case 2:sAsrI(ctx,dst,RA[rm],sa?sa:32,sc);break;
-            default:sRorI(ctx,dst,RA[rm],sa,sc);break;
+            case 0: sLslI(C,dst,src,sa,sc); break;
+            case 1: sLsrI(C,dst,src,sa?sa:32,sc); break;
+            case 2: sAsrI(C,dst,src,sa?sa:32,sc); break;
+            default:sRorI(C,dst,src,sa,sc); break;
         }
         return sc;
     }
-    // register-specified shift (F5)
-    uint8_t rs=(op>>8)&0xF;
-    if(rs==15)return false;
-#if JIT_REG_SHIFT_CARRY
-    emitRegShiftCarry(ctx,st,dst,RA[rm],RA[rs]);
-    return true;                                // carry (or "keep C" for amount 0) is in RSHC
-#else
-    return false;                               // bisect: let the interpreter do it
-#endif
+    uint8_t amt;
+    if(rs==15){ C.li(TD,curPC+8u); amt=TD; }                  // P5
+    else amt=RA[rs];
+    emitShiftReg(C,st,dst,src,amt,sc);
+    return false;                                            // C handled by that path
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// ARM data-processing
-// ═══════════════════════════════════════════════════════════════════════
-enum DP{AND=0,EOR,SUB,RSB,ADD,ADC,SBC,RSC,TST,TEQ,CMP,CMN,ORR,MOV,BIC,MVN};
+static bool emitDP(Ctx& C,uint32_t op,uint32_t curPC){
+    const uint8_t cond=(op>>28)&0xF, dop=(op>>21)&0xF;
+    const bool s=(op>>20)&1;
+    const uint8_t rn=(op>>16)&0xF, rd=(op>>12)&0xF;
+    const bool isTest=(dop==DP_TST||dop==DP_TEQ||dop==DP_CMP||dop==DP_CMN);
+    if(cond==15) return false;
+    if(isTest&&!s) return false;                 // S=0 with a test opcode is the
+                                                 // MRS/MSR/CLZ/misc encoding space
+    const bool dpPC = (!isTest && rd==15);
+    if(dpPC && s) return false;                  // S=1 with Rd=PC: exception return
+    if(dpPC && !JitCfg::kPcWrites) return false;
+    const bool immForm=(op>>25)&1, regShift=!immForm&&((op>>4)&1);
+    if(rn==15 && regShift) return false;         // rare: rn=R15 with register shift
 
-static bool emitDP(Ctx& ctx,uint32_t op,uint32_t curPC){
-    uint8_t cond=(op>>28)&0xF,dop=(op>>21)&0xF;
-    bool s=(op>>20)&1;
-    uint8_t rn=(op>>16)&0xF,rd=(op>>12)&0xF;
-    if(cond==15||rd==15)return false;
-    bool immForm=(op>>25)&1,regShift=(op>>4)&1;
-    if(!immForm){if((op&0xF)==15)return false;if(regShift&&((op>>8)&0xF)==15)return false;}
-    if(rn==15&&regShift&&!immForm)return false;
-    if(rn==15&&!immForm)return false;                       // R15 as a shifted source: rare, keep in the interpreter
-
-#if JIT_NO_S
-    if(s)return false;                                      // bisect #1
-#endif
-    // ADC/SBC/RSC need the incoming carry in XER.CA, but the register-shift sequence
-    // itself clobbers the very registers/XER state involved; keep that combination in
-    // the interpreter rather than pretending.
-    if(regShift&&!immForm&&(dop==ADC||dop==SBC||dop==RSC))return false;
-
-    int si=openCondSkip(ctx,cond);
-    if(rn==15){ctx.li(TD,curPC+(ctx.thumb?4u:8u));ctx.E(ppc_stw(TD,FRAME_SCR2,1));}
-    if(dop==ADC||dop==SBC||dop==RSC)primeCarry(ctx);
-
-    bool logC=(s&&(dop==AND||dop==EOR||dop==TST||dop==TEQ||dop==ORR||dop==MOV||dop==BIC||dop==MVN));
-    bool cset=emitShifter(ctx,op,TA,logC);
-
+    C.cyc += 1;
+    Skip si = emitCondSkip(C,cond);
+    const bool logC = s && (dop==DP_AND||dop==DP_EOR||dop==DP_TST||dop==DP_TEQ||
+                            dop==DP_ORR||dop==DP_MOV||dop==DP_BIC||dop==DP_MVN);
+    bool cset = emitShifter(C,op,TA,logC,curPC);
     uint8_t srcRn;
-    if(rn==15){ctx.E(ppc_lwz(TD,FRAME_SCR2,1));srcRn=TD;}else srcRn=RA[rn];
-    bool needV=(s&&(dop==ADD||dop==SUB||dop==RSB||dop==CMN||dop==CMP||dop==ADC||dop==SBC||dop==RSC));
-    if(needV){ctx.E(ppc_stw(TA,FRAME_SCR0,1));ctx.E(ppc_stw(srcRn,FRAME_SCR1,1));}
-    bool isTest=(dop==TST||dop==TEQ||dop==CMP||dop==CMN);
-    uint8_t res=isTest?TC:RA[rd];
-    switch((DP)dop){
-        case AND:case TST:ctx.E(ppc_and  (res,srcRn,TA));break;
-        case EOR:case TEQ:ctx.E(ppc_xor  (res,srcRn,TA));break;
-        case SUB:case CMP:ctx.E(ppc_subfc(res,TA,srcRn));break;
-        case RSB:         ctx.E(ppc_subfc(res,srcRn,TA));break;
-        case ADD:case CMN:ctx.E(ppc_addc (res,srcRn,TA));break;
-        case ADC:         ctx.E(ppc_adde (res,srcRn,TA));break;
-        case SBC:         ctx.E(ppc_subfe(res,TA,srcRn));break;
-        case RSC:         ctx.E(ppc_subfe(res,srcRn,TA));break;
-        case ORR:         ctx.E(ppc_or   (res,srcRn,TA));break;
-        case MOV:         if(res!=TA)ctx.E(ppc_mr(res,TA));break;
-        case BIC:         ctx.E(ppc_andc (res,srcRn,TA));break;
-        case MVN:         ctx.E(ppc_nor  (res,TA,TA));   break;
+    if(rn==15){ C.li(TD,curPC+8u); srcRn=TD; } else srcRn=RA[rn];
+    if(dop==DP_ADC||dop==DP_SBC||dop==DP_RSC) primeCarry(C);
+    const bool needV = s && (dop==DP_ADD||dop==DP_SUB||dop==DP_RSB||dop==DP_CMN||
+                             dop==DP_CMP||dop==DP_ADC||dop==DP_SBC||dop==DP_RSC);
+    if(needV){ C.E(stw(TA,FRAME_SCR0,1)); C.E(stw(srcRn,FRAME_SCR1,1)); }
+    uint8_t res = (isTest||dpPC)?TR:RA[rd];
+    switch((DPo)dop){
+        case DP_AND: case DP_TST: C.E(and_(res,srcRn,TA)); break;
+        case DP_EOR: case DP_TEQ: C.E(xor_(res,srcRn,TA)); break;
+        case DP_SUB: case DP_CMP: C.E(subfc(res,TA,srcRn)); break;
+        case DP_RSB:              C.E(subfc(res,srcRn,TA)); break;
+        case DP_ADD: case DP_CMN: C.E(addc(res,srcRn,TA)); break;
+        case DP_ADC:              C.E(adde(res,srcRn,TA)); break;
+        case DP_SBC:              C.E(subfe(res,TA,srcRn)); break;
+        case DP_RSC:              C.E(subfe(res,srcRn,TA)); break;
+        case DP_ORR:              C.E(or_(res,srcRn,TA)); break;
+        case DP_MOV:              if(res!=TA) C.E(mr(res,TA)); break;
+        case DP_BIC:              C.E(andc(res,srcRn,TA)); break;
+        case DP_MVN:              C.E(nor(res,TA,TA)); break;
+        default: break;
     }
     if(s){
-        uint8_t opA=srcRn,opB=TA;
-        if(needV){ctx.E(ppc_lwz(TA,FRAME_SCR0,1));opB=TA;ctx.E(ppc_lwz(TD,FRAME_SCR1,1));opA=TD;}
-        switch((DP)dop){
-            case ADD:case CMN:case ADC:setNZ(ctx,res);
-                                       setC_xer(ctx);
-                                       setV_add(ctx,res,opA,opB);break;
-            case SUB:case CMP:case SBC:setNZ(ctx,res);
-                                       setC_xer(ctx);
-                                       setV_sub(ctx,res,opA,opB);break;
-            case RSB:case RSC:         setNZ(ctx,res);
-                                       setC_xer(ctx);
-                                       setV_sub(ctx,res,opB,opA);break;
-            default:setNZ(ctx,res);
-                    if(cset)setC_imm(ctx,RSHC);         // F6b: carry lives in RSHC, not TC
-                    break;
+        uint8_t opA=srcRn, opB=TA;
+        if(needV){ C.E(lwz(TA,FRAME_SCR0,1)); opB=TA; C.E(lwz(TD,FRAME_SCR1,1)); opA=TD; }
+        switch((DPo)dop){
+            case DP_ADD: case DP_CMN: case DP_ADC: setNZ(C,res); setC_xer(C); setV_add(C,res,opA,opB); break;
+            case DP_SUB: case DP_CMP: case DP_SBC: setNZ(C,res); setC_xer(C); setV_sub(C,res,opA,opB); break;
+            case DP_RSB: case DP_RSC:              setNZ(C,res); setC_xer(C); setV_sub(C,res,opB,opA); break;
+            default: setNZ(C,res); if(cset) setC_bit0(C,TC); break;
         }
     }
-    closeCondSkip(ctx,si);
+    if(dpPC){                                    // P6a: no interworking, PC aligned
+        C.E(rlwinm(TR,TR,0,0,29));
+        C.E(stw(TR,FRAME_PC,1));
+        C.E(rlwinm(RCPSR,RCPSR,0,27,25));        // stays in ARM state
+        emitExitToCDyn(C,EXIT_NORMAL);
+        C.done=true;
+    }
+    patchSkip(C,si);
     return true;
 }
 
-static void emitBX_target(Ctx& ctx){
-    ctx.E(ppc_lwz(TA,FRAME_SCR0,1));
-    ctx.E(ppc_rlwinm(TB,TA,0,0,30));ctx.E(ppc_stw(TB,FRAME_PC,1));
-    ctx.E(ppc_rlwinm(TC,TA,0,31,31));ctx.E(ppc_rlwinm(TC,TC,5,26,26));
-    ctx.li(TA,~(1u<<5));ctx.E(ppc_and(RCPSR,RCPSR,TA));ctx.E(ppc_or(RCPSR,RCPSR,TC));
-    emitCommitExitDyn(ctx,EXIT_NORMAL);
-}
-static bool emitBX(Ctx& ctx,uint32_t op,uint32_t curPC){
-    uint8_t cond=(op>>28)&0xF,rm=op&0xF;
-    if(rm==15||cond==15)return false;
-    int si=openCondSkip(ctx,cond);
-    ctx.E(ppc_stw(RA[rm],FRAME_SCR0,1));
-    emitBX_target(ctx);
-    if(si>=0){ctx.SETMARK(si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);ctx.RESOLVE();}
-    ctx.done=true;return true;
-}
-static bool emitBranch(Ctx& ctx,uint32_t op,uint32_t curPC){
-    if((op&0x0FFFFFF0)==0x012FFF10)return emitBX(ctx,op,curPC);
-    if((op&0x0FFFFFF0)==0x012FFF30)return false;
-    if((op&0x0E000000)!=0x0A000000)return false;
-    uint8_t cond=(op>>28)&0xF;
-    if(cond==15)return false;
-    bool lk=(op>>24)&1;
-    int32_t off=(int32_t)(op<<8)>>6;
-    uint32_t tgt=curPC+8u+(uint32_t)off;
-    int si=openCondSkip(ctx,cond);
-    if(lk)ctx.li(RA[14],curPC+4);
-    emitCommitExit(ctx,tgt,EXIT_NORMAL);
-    if(si>=0){ctx.SETMARK(si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);ctx.RESOLVE();}
-    ctx.done=true;return true;
-}
+// ============================================================================
+//  ARM single load/store — P6b/P6c (PC destination, conditional writeback)
+// ============================================================================
+static bool emitInlineLdr32(Ctx& C,uint8_t addr,uint8_t dst);
+static bool emitLS(Ctx& C,uint32_t op,uint32_t curPC){
+    const uint8_t cond=(op>>28)&0xF;
+    if(cond==15) return false;
+    const bool ld=(op>>20)&1, by=(op>>22)&1, up=(op>>23)&1, pre=(op>>24)&1, wb=(op>>21)&1, immO=!((op>>25)&1);
+    const uint8_t rn=(op>>16)&0xF, rd=(op>>12)&0xF;
+    const bool toPC = (rd==15&&ld);
+    if(rd==15&&!ld) return false;                       // storing PC: rare, interpreter
+    if(toPC&&!JitCfg::kPcWrites) return false;
+    if(rn==15&&(!immO||!pre||wb)) return false;
+    if(!immO&&(((op&0xF)==15)||((op>>4)&1))) return false;
 
-// F7: writeback handling for rd == rn, and correct base for post-index.
-static bool emitLS(Ctx& ctx,uint32_t op,uint32_t curPC){
-    uint8_t cond=(op>>28)&0xF;
-    if(cond==15)return false;
-    bool ld=(op>>20)&1,by=(op>>22)&1,up=(op>>23)&1,pre=(op>>24)&1,wb=(op>>21)&1,immO=!((op>>25)&1);
-    uint8_t rn=(op>>16)&0xF,rd=(op>>12)&0xF;
-    if(rd==15)return false;
-    if(rn==15&&(!immO||!pre||wb))return false;
-    if(!immO&&((((op>>4)&1))||((op&0xF)==15))){ /* handled by the reg-shift path below */ }
-    int si=openCondSkip(ctx,cond);
-    if(immO){
-        ctx.li(TA,op&0xFFF);
-    }else{
-        uint8_t rm=op&0xF;uint8_t sh=(op>>5)&3;
-        if(rm==15){closeCondSkip(ctx,si);return false;}
-        if(!((op>>4)&1)){                        // immediate shift
-            int sa=(op>>7)&0x1F;
-            if(sh==0)sLslI(ctx,TA,RA[rm],sa,false);
-            else if(sh==1)sLsrI(ctx,TA,RA[rm],sa?sa:32,false);
-            else if(sh==2)sAsrI(ctx,TA,RA[rm],sa?sa:32,false);
-            else sRorI(ctx,TA,RA[rm],sa,false);
-        }else{                                   // register shift (F5 for free, no flags)
-            uint8_t rs=(op>>8)&0xF;
-            if(rs==15){closeCondSkip(ctx,si);return false;}
-            emitRegShiftCarry(ctx,sh,TA,RA[rm],RA[rs]);
-        }
+    C.cyc += 2;
+    const bool condPC = toPC && cond!=14;
+    if(condPC) emitSetPCFlag(C,0);
+    Skip si = emitCondSkip(C,cond);
+    // offset -> TA ; address -> TB
+    if(immO) C.li(TA,op&0xFFF);
+    else {
+        uint8_t rm=op&0xF, sh=(op>>5)&3; int sa=(op>>7)&0x1F;
+        if(sh==0) sLslI(C,TA,RA[rm],sa,false);
+        else if(sh==1) sLsrI(C,TA,RA[rm],sa?sa:32,false);
+        else if(sh==2) sAsrI(C,TA,RA[rm],sa?sa:32,false);
+        else sRorI(C,TA,RA[rm],sa,false);
     }
     if(rn==15){
-        // PC-relative literal: the guards above guarantee immediate, pre-index, no W
-        uint32_t base=ctx.thumb?(curPC+4):(curPC+8);
-        if(!by)base&=~3u;
-        uint32_t addr=up?base+(op&0xFFF):base-(op&0xFFF);
-        ctx.E(ppc_stw(TA,FRAME_SCR0,1));
-        ctx.li(TB,addr);
-        ctx.E(ppc_stw(TB,FRAME_SCR1,1));
-    }else{
-        if(pre){if(up)ctx.E(ppc_add(TB,RA[rn],TA));else ctx.E(ppc_subf(TB,TA,RA[rn]));}
-        else   ctx.E(ppc_mr(TB,RA[rn]));
-        ctx.E(ppc_stw(TA,FRAME_SCR0,1));
-        ctx.E(ppc_stw(TB,FRAME_SCR1,1));
+        uint32_t base=curPC+8u;
+        C.li(TB, up? base+(op&0xFFF) : base-(op&0xFFF));
     }
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));
-    ctx.E(ppc_lwz(TC,FRAME_SCR1,1));            // address (always materialised into SCR1)
-    if(!ld){ctx.E(ppc_mr(TD,RA[rd]));ctx.hasStore=true;}
-    ctx.call(ld?(by?(void*)JitHelp_r8:(void*)JitHelp_r32):(by?(void*)JitHelp_w8:(void*)JitHelp_w32));
-    if(ld)ctx.E(ppc_mr(RA[rd],TA));
+    else if(pre){ if(up) C.E(add(TB,RA[rn],TA)); else C.E(subf(TB,TA,RA[rn])); }
+    else C.E(mr(TB,RA[rn]));
+
+    bool inlined=false;
+    // P12b is word loads only, and never for a PC destination: guest r15 has no
+    // host register (RA[] covers r0..r14 only) — PC writes go through FRAME_PC.
+    if(ld&&!by&&pre&&!toPC&&JitCfg::kInlineRam){
+        C.E(stw(TB,FRAME_SCR0,1));                       // address survives the fast path
+        inlined=emitInlineLdr32(C,TB,RA[rd]);
+        if(inlined) C.E(mr(TA,RA[rd]));                  // TA becomes the value temp
+    }
+    if(!inlined){
+        C.E(stw(TB,FRAME_SCR0,1));
+        C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.E(lwz(TC,FRAME_SCR0,1));
+        if(!ld) C.E(mr(TD,RA[rd]));
+        void* fn = ld ? (by?(void*)&JitHelp_r8:(void*)&JitHelp_ldr32)
+                      : (by?(void*)&JitHelp_w8:(void*)&JitHelp_w32);
+        C.call(fn);
+    }
+    if(ld){
+        if(toPC){
+            C.E(stw(TA,FRAME_PC,1));
+            if(condPC){ emitSetPCFlag(C,1); }
+        } else C.E(mr(RA[rd],TA));
+    }
+    // writeback (unconditional for post-index: I4)
     if(rn!=15){
-        ctx.E(ppc_lwz(TA,FRAME_SCR0,1));
+        const bool wbOK = !(ld&&rd==rn);
         if(!pre){
-            // post-index: writeback = ORIGINAL base +/- offset (RA[rn] may have been
-            // overwritten by the load when rd == rn, so use the saved base in SCR1)
-            ctx.E(ppc_lwz(TB,FRAME_SCR1,1));
-            if(up)ctx.E(ppc_add(RA[rn],TB,TA));
-            else  ctx.E(ppc_subf(RA[rn],TA,TB));
-        }else if(wb){
-            // pre-index writeback wins, even when rd == rn (ARM discards the load)
-            ctx.E(ppc_lwz(RA[rn],FRAME_SCR1,1));
+            if(wbOK){
+                C.E(lwz(TA,FRAME_SCR0,1));
+                if(up) C.E(add(RA[rn],RA[rn],TA)); else C.E(subf(RA[rn],TA,RA[rn]));
+            }
+        } else if(wb&&wbOK){
+            if(ld&&rd!=rn) C.E(lwz(RA[rn],FRAME_SCR0,1));
+            else { C.E(lwz(TA,FRAME_SCR0,1)); C.E(mr(RA[rn],TA)); }
         }
     }
-    closeCondSkip(ctx,si);
+    patchSkip(C,si);
+    if(toPC){
+        if(condPC) emitPCFlagGate(C);                    // exits only when PC was written
+        else { emitPCWriteDyn(C); C.done=true; }
+    }
     return true;
 }
 
-static bool emitLSExtra(Ctx& ctx,uint32_t op,uint32_t){
-    if((op&0x0E000090)!=0x00000090)return false;
-    if(((op>>25)&7)!=0)return false;
-    uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
-    bool p=(op>>24)&1,u=(op>>23)&1,w=(op>>21)&1,l=(op>>20)&1,imm=(op>>22)&1;
-    uint8_t rn=(op>>16)&0xF,rd=(op>>12)&0xF,sh=(op>>5)&3;
-    if(rd==15||rn==15||sh==0)return false;
-    int si=openCondSkip(ctx,cond);
-    if(imm){ctx.li(TA,((op>>4)&0xF0)|(op&0xF));}
-    else if((op&0xF)==15){closeCondSkip(ctx,si);return false;}
-    else ctx.E(ppc_mr(TA,RA[op&0xF]));
-    if(p){if(u)ctx.E(ppc_add(TB,RA[rn],TA));else ctx.E(ppc_subf(TB,TA,RA[rn]));}
-    else ctx.E(ppc_mr(TB,RA[rn]));
-    ctx.E(ppc_stw(TA,FRAME_SCR0,1));ctx.E(ppc_stw(TB,FRAME_SCR1,1));
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.E(ppc_lwz(TC,FRAME_SCR1,1));
-    if(!l){
-        if(sh!=1){closeCondSkip(ctx,si);return false;}
-        ctx.E(ppc_mr(TD,RA[rd]));ctx.hasStore=true;ctx.call((void*)JitHelp_w16);
-    }else{
-        if(sh==1)ctx.call((void*)JitHelp_r16);
-        else if(sh==2)ctx.call((void*)JitHelp_r8);
-        else ctx.call((void*)JitHelp_r16);
-        if(sh==2)ctx.E(ppc_extsb(RA[rd],TA));
-        else if(sh==3)ctx.E(ppc_extsh(RA[rd],TA));
-        else ctx.E(ppc_mr(RA[rd],TA));
-    }
-    ctx.E(ppc_lwz(TA,FRAME_SCR0,1));
-    if(!p){
-        ctx.E(ppc_lwz(TB,FRAME_SCR1,1));                  // F7: same post-index fix
-        if(u)ctx.E(ppc_add(RA[rn],TB,TA));else ctx.E(ppc_subf(RA[rn],TA,TB));
-    }else if(w)ctx.E(ppc_lwz(RA[rn],FRAME_SCR1,1));
-    closeCondSkip(ctx,si);return true;
+// extra load/store (halfword / signed byte / doubleword)
+static bool emitLSExtra(Ctx& C,uint32_t op,uint32_t){
+    if((op&0x0E000090)!=0x00000090) return false;
+    const uint8_t cond=(op>>28)&0xF; if(cond==15) return false;
+    const bool p=(op>>24)&1,u=(op>>23)&1,w=(op>>21)&1,l=(op>>20)&1,imm=(op>>22)&1;
+    const uint8_t rn=(op>>16)&0xF, rd=(op>>12)&0xF, sh=(op>>5)&3;
+    if(rd==15||rn==15) return false;
+    if(sh==0) return false;                  // P11: LDRD/STRD -> interpreter (no miscompile)
+    if(!l&&sh!=1) return false;
+    if(!imm&&(op&0xF)==15) return false;
+    C.cyc += 2;
+    Skip si = emitCondSkip(C,cond);
+    if(imm) C.li(TA,((op>>4)&0xF0)|(op&0xF));
+    else C.E(mr(TA,RA[op&0xF]));
+    if(p){ if(u) C.E(add(TB,RA[rn],TA)); else C.E(subf(TB,TA,RA[rn])); }
+    else C.E(mr(TB,RA[rn]));
+    C.E(stw(TA,FRAME_SCR0,1)); C.E(stw(TB,FRAME_SCR1,1));
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.E(lwz(TC,FRAME_SCR1,1));
+    if(!l){ C.E(mr(TD,RA[rd])); C.call((void*)&JitHelp_w16); }
+    else if(sh==1){ C.call((void*)&JitHelp_ldrh); C.E(mr(RA[rd],TA)); }
+    else if(sh==2){ C.call((void*)&JitHelp_r8);   C.E(extsb(RA[rd],TA)); }
+    else          { C.call((void*)&JitHelp_ldrsh); C.E(mr(RA[rd],TA)); }
+    const bool wbOK=!(l&&rd==rn);
+    if(!p){ if(wbOK){ C.E(lwz(TA,FRAME_SCR0,1)); if(u) C.E(add(RA[rn],RA[rn],TA)); else C.E(subf(RA[rn],TA,RA[rn])); } }
+    else if(w&&wbOK){ C.E(lwz(TA,FRAME_SCR1,1)); C.E(mr(RA[rn],TA)); }
+    patchSkip(C,si);
+    return true;
 }
 
-static bool emitMul(Ctx& ctx,uint32_t op){
-    uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
-    bool s=(op>>20)&1,acc=(op>>21)&1,lng=(op>>23)&1;
-    uint8_t rd=(op>>16)&0xF,rn=(op>>12)&0xF,rs=(op>>8)&0xF,rm=op&0xF;
-    if(lng||rd==15||rm==15||rs==15||(acc&&rn==15))return false;
-#if JIT_NO_S
-    if(s)return false;
-#endif
-    int si=openCondSkip(ctx,cond);
-    if(acc){ctx.E(ppc_mullw(TA,RA[rm],RA[rs]));ctx.E(ppc_add(RA[rd],TA,RA[rn]));}
-    else ctx.E(ppc_mullw(RA[rd],RA[rm],RA[rs]));
-    if(s)setNZ(ctx,RA[rd]);
-    closeCondSkip(ctx,si);return true;
+static bool emitMul(Ctx& C,uint32_t op){
+    const uint8_t cond=(op>>28)&0xF; if(cond==15) return false;
+    const bool s=(op>>20)&1, acc=(op>>21)&1, lng=(op>>23)&1;
+    const uint8_t rd=(op>>16)&0xF, rn=(op>>12)&0xF, rs=(op>>8)&0xF, rm=op&0xF;
+    if(lng||rd==15||rm==15||rs==15||(acc&&rn==15)) return false;
+    C.cyc += 2;
+    Skip si = emitCondSkip(C,cond);
+    if(acc){ C.E(mullw(TA,RA[rm],RA[rs])); C.E(add(RA[rd],TA,RA[rn])); }
+    else C.E(mullw(RA[rd],RA[rm],RA[rs]));
+    if(s) setNZ(C,RA[rd]);
+    patchSkip(C,si);
+    return true;
 }
 
-static bool emitMrsMsr(Ctx& ctx,uint32_t op,uint32_t){
-    uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
-
-    if((op&0x0FBF0FFF)==0x010F0000){                 // MRS Rd, CPSR
-        uint8_t rd=(op>>12)&0xF;if(rd==15)return false;
-        int si=openCondSkip(ctx,cond);
-        ctx.E(ppc_mr(RA[rd],RCPSR));
-        closeCondSkip(ctx,si);
+// MRS/MSR (flags-only inline; mode/I/F and SPSR go to the interpreter)
+static bool emitMrsMsr(Ctx& C,uint32_t op,uint32_t){
+    const uint8_t cond=(op>>28)&0xF; if(cond==15) return false;
+    if((op&0x0FBF0FFF)==0x010F0000){                                  // MRS
+        if(op&(1u<<22)) return false;
+        const uint8_t rd=(op>>12)&0xF; if(rd==15) return false;
+        C.cyc += 1;
+        Skip si=emitCondSkip(C,cond);
+        C.E(mr(RA[rd],RCPSR));
+        patchSkip(C,si);
         return true;
     }
-    if((op&0x0FBF0FFF)==0x014F0000)return false;     // MRS Rd, SPSR
-
-    uint8_t mask=(op>>16)&0xF;
-    if(mask&0x7)return false;                        // control bits: interpreter (mode switch)
-
-    if((op&0x0DB0F000)==0x0320F000){                 // MSR CPSR_f, #imm
-        uint32_t imm=op&0xFF,rot=((op>>8)&0xF)*2;
-        if(rot)imm=(imm>>rot)|(imm<<(32-rot));
-        imm&=0xFF000000u;
-        int si=openCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
-        ctx.li(TA,imm);
-        ctx.E(ppc_or(RCPSR,RCPSR,TA));
-        closeCondSkip(ctx,si);
-        return true;
+    const bool imm=(op>>25)&1;
+    if(imm){ if((op&0x0FB0F000)!=0x0320F000) return false; }
+    else   { if((op&0x0FB0FFF0)!=0x0120F000) return false; }
+    if(op&(1u<<22)) return false;                                     // SPSR
+    if(((op>>16)&0xF)!=0x8) return false;                             // flags field only
+    C.cyc += 1;
+    Skip si=emitCondSkip(C,cond);
+    if(imm){
+        uint32_t v=op&0xFF, rot=((op>>8)&0xF)*2;
+        if(rot) v=(v>>rot)|(v<<(32-rot));
+        v&=0xFF000000u;
+        C.E(rlwinm(RCPSR,RCPSR,0,8,31));
+        C.li(TA,v); C.E(or_(RCPSR,RCPSR,TA));
+    } else {
+        const uint8_t rm=op&0xF;
+        if(rm==15){ patchSkip(C,si); return false; }
+        C.E(rlwinm(RCPSR,RCPSR,0,8,31));   // clear the flags byte
+        C.E(rlwinm(TA,RA[rm],0,0,7));      // take N,Z,C,V from Rm
+        C.E(or_(RCPSR,RCPSR,TA));
     }
-    if((op&0x0DB0FFF0)==0x0120F000){                 // MSR CPSR_f, Rm
-        uint8_t rm=op&0xF;if(rm==15)return false;
-        int si=openCondSkip(ctx,cond);
-        ctx.E(ppc_rlwinm(RCPSR,RCPSR,0,8,31));
-        ctx.E(ppc_rlwinm(TA,RA[rm],0,0,7));
-        ctx.E(ppc_or(RCPSR,RCPSR,TA));
-        closeCondSkip(ctx,si);
-        return true;
-    }
-    return false;
+    patchSkip(C,si);
+    return true;
 }
 
-static bool emitBlockXfer(Ctx& ctx,uint32_t op,uint32_t curPC){
-#if JIT_NO_BLOCKXFER
-    (void)op;(void)curPC;(void)ctx;return false;
-#endif
-    uint8_t cond=(op>>28)&0xF;
-    if(cond==15||((op>>22)&1))return false;
-    uint8_t rn=(op>>16)&0xF;uint16_t list=(uint16_t)(op&0xFFFF);
-    if(rn>14||!list)return false;
-    bool load=(op>>20)&1,loadPC=load&&(list&0x8000);
-    if(!load)ctx.hasStore=true;
-    int si=openCondSkip(ctx,cond);
-    emitSpill(ctx);
-    ctx.li(TA,curPC+8);ctx.E(ppc_stw(TA,FRAME_SCR2,1));
-    ctx.li(TA,curPC+4);ctx.E(ppc_stw(TA,FRAME_PC,1));
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));
-    ctx.li(TC,op);ctx.E(ppc_addi(TD,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_lwz(TE,FRAME_SCR2,1));
-    ctx.E(ppc_addi(TF,1,(int16_t)FRAME_PC));ctx.E(ppc_addi(TG,1,(int16_t)FRAME_CPSR));
-    ctx.call((void*)JitHelp_armBlock);
+// ============================================================================
+//  P7 — coprocessor / CP15
+// ============================================================================
+static bool emitCoproc(Ctx& C,uint32_t op,uint32_t){
+    if(!JitCfg::kCp15) return false;
+    const uint8_t cond=(op>>28)&0xF; if(cond==15) return false;
+    const uint8_t cp=(op>>8)&0xF, rd=(op>>12)&0xF;
+    const bool isRead=((op>>20)&1)!=0;
+    if(cp!=15||rd==15) return false;
+    C.cyc += 2;
+    Skip si=emitCondSkip(C,cond);
+    C.ldCore();
+    C.E(addi(TB,0,C.arm7?1:0));
+    C.li(TC,op);
+    C.E(mr(TD,RA[rd]));
+    C.call((void*)&JitHelp_cp15);
+    if(isRead) C.E(mr(RA[rd],TA));
+    patchSkip(C,si);
+    return true;
+}
 
-    ctx.E(ppc_cmpi(0,TA,0));
-    size_t bGe=ctx.sz();
-    ctx.E(ppc_bc(4,0,0));                            // bge cr0 : success path
-    emitReload(ctx);
-    emitCommitExit(ctx,curPC,EXIT_FALLBACK);
-    {int32_t d=(int32_t)((ctx.sz()-bGe)*4);ctx.base[bGe]=ppc_bc(4,0,(int16_t)d);}
-    emitReload(ctx);
+// ============================================================================
+//  ARM block transfer (LDM/STM), incl. PC in the list
+// ============================================================================
+static bool emitBlockXfer(Ctx& C,uint32_t op,uint32_t curPC){
+    const uint8_t cond=(op>>28)&0xF;
+    if(cond==15||((op>>22)&1)) return false;             // S bit -> interpreter
+    const uint8_t rn=(op>>16)&0xF;
+    const uint16_t list=(uint16_t)(op&0xFFFF);
+    if(rn>14||!list) return false;
+    const bool load=(op>>20)&1, loadPC=load&&(list&0x8000);
+    if(loadPC&&!JitCfg::kPcWrites) return false;
+    int n=0; for(int i=0;i<16;i++) if(list&(1u<<i)) n++;
+    C.cyc += 1u+(uint32_t)n;
 
+    const bool condPC = loadPC && cond!=14;
+    if(condPC) emitSetPCFlag(C,0);
+    Skip si=emitCondSkip(C,cond);
+
+    // helper args: core=TA arm7=TB op=TC regs=TD pcForR15=TE pcOut=TF cpsrInOut=TG
+    C.ldShadowTo(TS);                                    // TS = shadow (scratch, arg8 free)
+    C.E(addi(TD,TS,SH_REGS));
+    C.li(TE,curPC+8u); C.E(stw(TE,FRAME_PC,1));
+    C.E(addi(TF,TS,SH_PC));
+    C.E(addi(TG,TS,SH_CPSR));
+    C.ldCore();
+    C.E(addi(TB,0,C.arm7?1:0));
+    C.li(TC,op);
+    C.call((void*)&JitHelp_armBlock);                    // -1 error, 0 ok, 1 wrote PC
+
+    C.E(cmpi(0,TA,0));
+    size_t bad=C.sz(); C.E(bc(4,crLT(0),0));             // <0 -> interpreter fallback
     if(loadPC){
-        ctx.E(ppc_cmpi(0,TA,1));
-        size_t bEq=ctx.sz();
-        ctx.E(ppc_bc(12,2,0));                       // beq : PC was written
-        emitCommitExit(ctx,curPC+4,EXIT_NORMAL);
-        {int32_t d=(int32_t)((ctx.sz()-bEq)*4);ctx.base[bEq]=ppc_bc(12,2,(int16_t)d);}
-        emitCommitExitDyn(ctx,EXIT_NORMAL);
-        if(si>=0){ctx.SETMARK(si);emitCommitExit(ctx,curPC+4,EXIT_NORMAL);}
-        ctx.RESOLVE();
-        ctx.done=true;
+        C.E(cmpi(0,TA,1));
+        size_t noPC=C.sz(); C.E(bc(12,crEQ(0),0));       // 0 -> no PC write
+        if(condPC) emitSetPCFlag(C,1);
+        else { emitPCWriteDyn(C); C.done=true; }         // PC + T already in the shadow
+        patchOne(C,noPC);
+    }
+    patchSkip(C,si);
+    if(condPC) emitPCFlagGate(C);                        // exits only if PC was written
+    patchOne(C,bad);
+    emitExitToC(C,loadPC&&!condPC?(curPC+4u):curPC,EXIT_FALLBACK);
+    return true;
+}
+// ============================================================================
+//  P12b — inline word load through the fast window (optional, kInlineRam)
+//  Window policy in r30 (guest base) / r31 (size-1).  rlwnm provides the
+//  rotate a misaligned ARM LDR needs, so no alignment branch is necessary:
+//      offset = addr - base ; if (offset > size-1) -> helper
+//      host   = *(uint8_t**)(&g_win[cpu].host) + offset
+//      rot    = (addr & 3) * 8      -> rlwnm rotate-left by (32-rot)&31
+// ============================================================================
+static inline uint32_t cmplw(uint8_t cr,uint8_t ra,uint8_t rb){
+    return (31u<<26)|((uint32_t)(cr&7u)<<23)|((uint32_t)ra<<16)|((uint32_t)rb<<11)|(32u<<1); }
+
+static bool emitInlineLdr32(Ctx& C,uint8_t addr,uint8_t dst){
+    if(!JitCfg::kInlineRam) return false;
+    C.E(subf(TD,RWINB,addr));                    // offset candidate
+    C.E(cmplw(6,TD,RWINM));                      // CR6.GT => outside window
+    size_t slow=C.sz(); C.E(bc(4,crGT(6),0));
+    C.li(TF,(uint32_t)(uintptr_t)&g_win[C.cpuIdx].host);
+    C.E(lwz(TF,0,TF));
+    C.E(add(TF,TF,TD));
+    C.E(lwz(TC,0,TF));                           // aligned word
+    C.E(rlwinm(TE,addr,0,29,30));                // (addr & 6) in bits 1..2
+    C.E(rlwinm(TE,TE,3,0,28));                   // <<3  -> low5 = (addr & 3)*8
+    C.E(subfic(TE,TE,32));                       // (32-rot) & 31 for rlwnm
+    C.E(rlwnm(dst,TC,TE,0,31));                  // rotate right by rot
+    size_t doneSlot=C.sz(); C.E(b(0));
+    patchTo(C,slow,C.sz());                      // ---- slow path ----
+    C.E(mr(TC,addr));
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0));
+    C.call((void*)&JitHelp_ldr32);
+    C.E(mr(dst,TA));
+    C.base[doneSlot]=b((intptr_t)((C.sz()-doneSlot)*4));
+    return true;
+}
+
+// ============================================================================
+//  ARM branches
+// ============================================================================
+static bool emitBX(Ctx& C,uint32_t op,uint32_t){
+    const uint8_t cond=(op>>28)&0xF, rm=op&0xF;
+    if(rm==15||cond==15) return false;
+    C.cyc += 3;
+    Skip si=emitCondSkip(C,cond);
+    C.E(stw(RA[rm],FRAME_SCR0,1));
+    emitBXTarget(C);
+    if(si.a!=SIZE_MAX){ patchSkip(C,si); emitExitToC(C,0,EXIT_NORMAL); }   // cond false: fall through
+    C.done=true;
+    return true;
+}
+// chaining variant that may also switch instruction sets (Thumb BL/BLX, ARM BLX)
+static void emitBodyEndMode(Ctx& C,uint32_t targetPC,bool targetThumb,int reason){
+    if(!JitCfg::kChain){ emitExitToC(C,targetPC,reason); return; }
+    JitBlock* t=lookupValid(targetPC,C.cpuIdx,targetThumb);
+    if(!t){
+        size_t site=C.sz(); C.E(b(0));
+        size_t stub=C.sz(); emitExitToC(C,targetPC,EXIT_NORMAL);
+        C.base[site]=b((intptr_t)((stub-site)*4));
+        g_pending.push_back({C.base+site,C.base+stub,targetPC,(uint8_t)C.cpuIdx,targetThumb});
+        return;
+    }
+    C.E(lwz(TB,FRAME_BUDGET,1));
+    C.E(addi(TB,TB,-(int16_t)C.cyc));
+    C.E(stw(TB,FRAME_BUDGET,1));
+    C.E(cmpi(0,TB,0));
+    size_t over=C.sz(); C.E(bc(4,crLT(0),0));
+    size_t site=C.sz(); C.E(b(0));
+    C.base[site]=b((intptr_t)((t->body)-(C.base+site)));
+    t->addLink(C.base+site,nullptr);
+    patchOne(C,over);
+    emitExitToC(C,targetPC,EXIT_BUDGET);
+}
+static bool emitBranch(Ctx& C,uint32_t op,uint32_t curPC){
+    if((op&0x0FFFFFF0)==0x012FFF10) return emitBX(C,op,curPC);
+    if((op&0x0FFFFFF0)==0x012FFF30){
+        // BLX (register): interworking call.  lr = pc+4 | (T ? 1 : 0) is the
+        // ARMv5 rule for a *BLX to ARM*: return address keeps the state bit.
+        const uint8_t cond=(op>>28)&0xF, rm=op&0xF;
+        if(rm==15||cond==15) return false;
+        C.cyc += 3;
+        Skip si=emitCondSkip(C,cond);
+        C.li(RA[14],curPC+4u);
+        C.E(stw(RA[rm],FRAME_SCR0,1));
+        emitBXTarget(C);
+        if(si.a!=SIZE_MAX){ patchSkip(C,si); emitExitToC(C,curPC+4u,EXIT_NORMAL); }
+        C.done=true;
         return true;
     }
-    closeCondSkip(ctx,si);
+    if((op&0x0E000000)!=0x0A000000) return false;
+    const uint8_t cond=(op>>28)&0xF;
+    if(cond==15) return false;                                 // BLX immediate: interpreter
+    const bool lk=(op>>24)&1;
+    const int32_t off=((int32_t)(op<<8))>>6;
+    const uint32_t tgt=curPC+8u+(uint32_t)off;
+    C.cyc += lk?3:2;
+    if(cond==14){
+        if(lk) C.li(RA[14],curPC+4u);
+        emitBodyEnd(C,tgt,EXIT_NORMAL);
+        C.done=true;
+        return true;
+    }
+    Skip si=emitCondSkip(C,cond);
+    if(lk) C.li(RA[14],curPC+4u);
+    emitBodyEndMode(C,tgt,C.thumb,EXIT_NORMAL);
+    patchSkip(C,si);
+    emitBodyEnd(C,curPC+4u,EXIT_NORMAL);
+    C.done=true;
     return true;
 }
 
-static bool dispARM(Ctx& ctx,uint32_t op,uint32_t curPC){
-    uint8_t cond=(op>>28)&0xF;if(cond==15)return false;
-    if((op&0x0F000000)==0x0F000000)return false;
-    if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30)return emitBranch(ctx,op,curPC);
-    if((op&0x0F900000)==0x01000000){if(emitMrsMsr(ctx,op,curPC))return true;return false;}
-    uint32_t it=(op>>25)&7;
-    switch(it){
-        case 0:
-            if((op&0x0FC000F0)==0x00000090)return emitMul(ctx,op);
-            if((op&0x0E000090)==0x00000090)return emitLSExtra(ctx,op,curPC);
-            return emitDP(ctx,op,curPC);
-        case 1:return emitDP(ctx,op,curPC);
-        case 2:case 3:return emitLS(ctx,op,curPC);
-        case 4:return emitBlockXfer(ctx,op,curPC);
-        case 5:return emitBranch(ctx,op,curPC);
-        default:return false;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Thumb emitters
-// ═══════════════════════════════════════════════════════════════════════
-static bool emitT_shifts(Ctx& ctx,uint16_t op){
-    if(JIT_NO_S)return false;                       // bisect #1
-    uint8_t ty=(op>>11)&3,rd=op&7,rs=(op>>3)&7;int i=(op>>6)&0x1F;
+// ============================================================================
+//  Thumb emitters
+// ============================================================================
+static void emitThumbPushPop(Ctx& C,uint16_t op,uint32_t curPC);
+static bool emitT_shifts(Ctx& C,uint16_t op){
+    const uint8_t ty=(op>>11)&3, rd=op&7, rs=(op>>3)&7; const int i=(op>>6)&0x1F;
     switch(ty){
-        case 0:sLslI(ctx,RA[rd],RA[rs],i,true);break;
-        case 1:sLsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;
-        case 2:sAsrI(ctx,RA[rd],RA[rs],i?i:32,true);break;
-        default:return false;
+        case 0: sLslI(C,RA[rd],RA[rs],i,true); break;
+        case 1: sLsrI(C,RA[rd],RA[rs],i?i:32,true); break;
+        case 2: sAsrI(C,RA[rd],RA[rs],i?i:32,true); break;
+        default: return false;
     }
-    setNZ(ctx,RA[rd]);setC_imm(ctx,RSHC);return true;
-}
-static bool emitT_addSub3(Ctx& ctx,uint16_t op){
-    uint8_t rd=op&7,rs=(op>>3)&7;bool sub=(op>>9)&1,imm3=(op>>10)&1;
-    if(imm3)ctx.li(TA,(op>>6)&7);else ctx.E(ppc_mr(TA,RA[(op>>6)&7]));
-    ctx.E(ppc_mr(TB,RA[rs]));
-    if(sub){ctx.E(ppc_subfc(RA[rd],TA,TB));setNZ(ctx,RA[rd]);setC_xer(ctx);setV_sub(ctx,RA[rd],TB,TA);}
-    else   {ctx.E(ppc_addc (RA[rd],TB,TA));setNZ(ctx,RA[rd]);setC_xer(ctx);setV_add(ctx,RA[rd],TB,TA);}
+    setNZ(C,RA[rd]); setC_bit0(C,TC);
     return true;
 }
-static bool emitT_imm8(Ctx& ctx,uint16_t op){
-    uint8_t ty=(op>>11)&3,rd=(op>>8)&7;uint32_t imm=op&0xFF;uint8_t p=RA[rd];
+static bool emitT_addSub3(Ctx& C,uint16_t op){
+    const uint8_t rd=op&7, rs=(op>>3)&7;
+    const bool sub=(op>>9)&1, imm3=(op>>10)&1;
+    if(imm3) C.li(TA,(op>>6)&7); else C.E(mr(TA,RA[(op>>6)&7]));
+    C.E(mr(TB,RA[rs]));
+    if(sub){ C.E(subfc(RA[rd],TA,TB)); setNZ(C,RA[rd]); setC_xer(C); setV_sub(C,RA[rd],TB,TA); }
+    else   { C.E(addc (RA[rd],TB,TA)); setNZ(C,RA[rd]); setC_xer(C); setV_add(C,RA[rd],TB,TA); }
+    return true;
+}
+static bool emitT_imm8(Ctx& C,uint16_t op){
+    const uint8_t ty=(op>>11)&3, rd=(op>>8)&7; const uint32_t imm=op&0xFF; const uint8_t p=RA[rd];
     switch(ty){
-        case 0:ctx.li(p,imm);setNZ(ctx,p);return true;
-        case 1:ctx.li(TA,imm);ctx.E(ppc_mr(TB,p));ctx.E(ppc_subfc(TC,TA,TB));
-               setNZ(ctx,TC);setC_xer(ctx);setV_sub(ctx,TC,TB,TA);return true;
-        case 2:ctx.li(TA,imm);ctx.E(ppc_mr(TB,p));ctx.E(ppc_addc(p,TB,TA));
-               setNZ(ctx,p);setC_xer(ctx);setV_add(ctx,p,TB,TA);return true;
-        case 3:ctx.li(TA,imm);ctx.E(ppc_mr(TB,p));ctx.E(ppc_subfc(p,TA,TB));
-               setNZ(ctx,p);setC_xer(ctx);setV_sub(ctx,p,TB,TA);return true;
+    case 0: C.li(p,imm); setNZ(C,p); return true;
+    case 1: C.li(TA,imm); C.E(mr(TB,p)); C.E(subfc(TC,TA,TB)); setNZ(C,TC); setC_xer(C); setV_sub(C,TC,TB,TA); return true;
+    case 2: C.li(TA,imm); C.E(mr(TB,p)); C.E(addc (p,TB,TA));  setNZ(C,p);  setC_xer(C); setV_add(C,p,TB,TA);  return true;
+    default:C.li(TA,imm); C.E(mr(TB,p)); C.E(subfc(p,TA,TB));  setNZ(C,p);  setC_xer(C); setV_sub(C,p,TB,TA);  return true;
     }
-    return false;
 }
-static bool emitT_alu(Ctx& ctx,uint16_t op){
-    if(JIT_NO_S)return false;                       // bisect #1: every ALU op sets flags
-    uint8_t rd=op&7,rs=(op>>3)&7,o=(op>>6)&0xF;uint8_t d=RA[rd],s=RA[rs];
+static bool emitT_alu(Ctx& C,uint16_t op){
+    const uint8_t rd=op&7, rs=(op>>3)&7, o=(op>>6)&0xF;
+    const uint8_t d=RA[rd], s=RA[rs];
     switch(o){
-        case 0:ctx.E(ppc_and(d,d,s));setNZ(ctx,d);break;
-        case 1:ctx.E(ppc_xor(d,d,s));setNZ(ctx,d);break;
-#if JIT_THUMB_ALU_CARRY
-        case 2:case 3:case 4:                       // LSL/LSR/ASR (F6)
-            emitRegShiftCarry(ctx,o-2,d,d,s);       // amount 0 keeps C, >=32 handled
-            setNZ(ctx,d);
-            setC_imm(ctx,RSHC);
-            break;
-#else
-        case 2:case 3:case 4:return false;          // bisect: interpreter does the flags
-#endif
-        case 5:primeCarry(ctx);ctx.E(ppc_mr(TB,d));ctx.E(ppc_adde(d,TB,s));
-               setNZ(ctx,d);setC_xer(ctx);setV_add(ctx,d,TB,s);break;
-        case 6:primeCarry(ctx);ctx.E(ppc_mr(TB,d));ctx.E(ppc_subfe(d,s,TB));
-               setNZ(ctx,d);setC_xer(ctx);setV_sub(ctx,d,TB,s);break;
-        case 7:                                     // ROR (F6)
-#if JIT_THUMB_ALU_CARRY
-            emitRegShiftCarry(ctx,3,d,d,s);
-            setNZ(ctx,d);
-            setC_imm(ctx,RSHC);
-#else
-            return false;
-#endif
-            break;
-        case 8:ctx.E(ppc_and(TA,d,s));setNZ(ctx,TA);break;
-        case 9:ctx.E(ppc_addi(TA,0,0));ctx.E(ppc_subfc(d,s,TA));
-               setNZ(ctx,d);setC_xer(ctx);setV_sub(ctx,d,TA,s);break;
-        case 10:ctx.E(ppc_mr(TB,d));ctx.E(ppc_subfc(TA,s,TB));
-                setNZ(ctx,TA);setC_xer(ctx);setV_sub(ctx,TA,TB,s);break;
-        case 11:ctx.E(ppc_mr(TB,d));ctx.E(ppc_addc(TA,TB,s));
-                setNZ(ctx,TA);setC_xer(ctx);setV_add(ctx,TA,TB,s);break;
-        case 12:ctx.E(ppc_or(d,d,s));setNZ(ctx,d);break;
-        case 13:ctx.E(ppc_mullw(d,d,s));setNZ(ctx,d);break;
-        case 14:ctx.E(ppc_andc(d,d,s));setNZ(ctx,d);break;
-        case 15:ctx.E(ppc_nor(d,s,s));setNZ(ctx,d);break;
-        default:return false;
+    case 0:  C.E(and_(d,d,s)); setNZ(C,d); break;
+    case 1:  C.E(xor_(d,d,s)); setNZ(C,d); break;
+    case 2:  emitShiftReg(C,0,d,d,s,true); setNZ(C,d); break;
+    case 3:  emitShiftReg(C,1,d,d,s,true); setNZ(C,d); break;
+    case 4:  emitShiftReg(C,2,d,d,s,true); setNZ(C,d); break;
+    case 5:  primeCarry(C); C.E(mr(TB,d)); C.E(adde(d,TB,s));   setNZ(C,d); setC_xer(C); setV_add(C,d,TB,s); break;
+    case 6:  primeCarry(C); C.E(mr(TB,d)); C.E(subfe(d,s,TB));  setNZ(C,d); setC_xer(C); setV_sub(C,d,TB,s); break;
+    case 7:  emitShiftReg(C,3,d,d,s,true); setNZ(C,d); break;
+    case 8:  C.E(and_(TA,d,s)); setNZ(C,TA); break;                       // TST
+    case 9:  C.E(addi(TA,0,0)); C.E(subfc(d,s,TA)); setNZ(C,d); setC_xer(C); setV_sub(C,d,TA,s); break;  // NEG
+    case 10: C.E(mr(TB,d)); C.E(subfc(TA,s,TB)); setNZ(C,TA); setC_xer(C); setV_sub(C,TA,TB,s); break;   // CMP
+    case 11: C.E(mr(TB,d)); C.E(addc (TA,TB,s)); setNZ(C,TA); setC_xer(C); setV_add(C,TA,TB,s); break;   // CMN
+    case 12: C.E(or_(d,d,s)); setNZ(C,d); break;
+    case 13: C.E(mullw(d,d,s)); setNZ(C,d); break;
+    case 14: C.E(andc(d,d,s)); setNZ(C,d); break;
+    default: C.E(nor(d,s,s)); setNZ(C,d); break;
     }
     return true;
 }
-static bool emitT_hiReg(Ctx& ctx,uint16_t op,uint32_t curPC){
-    uint8_t o=(op>>8)&3,rs=((op>>3)&7)|(((op>>6)&1)<<3),rd=(op&7)|(((op>>7)&1)<<3);
-    if(o==3){                                        // BX/BLX Rs
-        if(rs==15)ctx.li(TA,(curPC+4)&~1u);else ctx.E(ppc_mr(TA,RA[rs]));
-        ctx.E(ppc_stw(TA,FRAME_SCR0,1));emitBX_target(ctx);ctx.done=true;return true;
+static bool emitT_hiReg(Ctx& C,uint16_t op,uint32_t curPC){
+    const uint8_t o=(op>>8)&3, rs=(op>>3)&0xF, rd=(uint8_t)((op&7)|((op>>4)&8));
+    if(o==3){                                              // BX / BLX Rm
+        const bool link=(op>>7)&1;
+        if(link&&C.arm7) return false;                     // BLX (reg) is ARMv5+
+        C.cyc += 3;
+        if(rs==15) C.li(TA,(curPC+4)&~3u); else C.E(mr(TA,RA[rs]));
+        C.E(stw(TA,FRAME_SCR0,1));
+        if(link) C.li(RA[14],(curPC+2)|1u);
+        emitBXTarget(C); C.done=true; return true;
     }
-    if(rd==15){                                      // ADD/MOV pc,Rs  (tail call)
-        if(o==1)return false;
-        if(rs==15)ctx.li(TA,curPC+4);else ctx.E(ppc_mr(TA,RA[rs]));
-        if(o==0){ctx.li(TB,curPC+4);ctx.E(ppc_add(TA,TB,TA));}
-        ctx.E(ppc_stw(TA,FRAME_SCR0,1));emitBX_target(ctx);ctx.done=true;return true;
+    if(rd==15){                                            // ADD/MOV pc: stays in Thumb
+        if(o==1) return false;
+        if(rs==15) C.li(TA,curPC+4); else C.E(mr(TA,RA[rs]));
+        if(o==0){ C.li(TB,curPC+4); C.E(add(TA,TB,TA)); }
+        C.E(ori(TA,TA,1u));
+        C.E(stw(TA,FRAME_SCR0,1));
+        emitBXTarget(C); C.done=true; return true;
     }
-    if(rs==15)ctx.li(TA,curPC+4);else ctx.E(ppc_mr(TA,RA[rs]));
+    if(rs==15) C.li(TA,curPC+4); else C.E(mr(TA,RA[rs]));
     switch(o){
-        case 0:ctx.E(ppc_add(RA[rd],RA[rd],TA));break;
-        case 1:ctx.E(ppc_mr(TB,RA[rd]));ctx.E(ppc_subfc(TC,TA,TB));
-               setNZ(ctx,TC);setC_xer(ctx);setV_sub(ctx,TC,TB,TA);break;
-        case 2:ctx.E(ppc_mr(RA[rd],TA));break;
+    case 0: C.E(add(RA[rd],RA[rd],TA)); break;
+    case 1: C.E(mr(TB,RA[rd])); C.E(subfc(TC,TA,TB)); setNZ(C,TC); setC_xer(C); setV_sub(C,TC,TB,TA); break;
+    default:C.E(mr(RA[rd],TA)); break;
     }
     return true;
 }
-static bool emitT_ldrPc(Ctx& ctx,uint16_t op,uint32_t curPC){
-    uint8_t rd=(op>>8)&7;uint32_t addr=((curPC+4)&~3u)+((uint32_t)(op&0xFF)<<2);
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.li(TC,addr);ctx.call((void*)JitHelp_r32);
-    ctx.E(ppc_mr(RA[rd],TA));return true;
+static bool emitT_ldrPc(Ctx& C,uint16_t op,uint32_t curPC){
+    const uint8_t rd=(op>>8)&7;
+    const uint32_t addr=((curPC+4)&~3u)+((uint32_t)(op&0xFF)<<2);
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.li(TC,addr);
+    C.call((void*)&JitHelp_ldr32); C.E(mr(RA[rd],TA));
+    return true;
 }
-static bool emitT_memReg(Ctx& ctx,uint16_t op){
-    uint8_t rd=op&7,rb=(op>>3)&7,ro=(op>>6)&7,k=(op>>9)&7;
-    void* fn=nullptr;bool ld=true,sxb=false,sxh=false;
+static bool emitT_memReg(Ctx& C,uint16_t op){
+    const uint8_t rd=op&7, rb=(op>>3)&7, ro=(op>>6)&7, k=(op>>9)&7;
+    void* fn=nullptr; bool ld=true, sxb=false;
     switch(k){
-        case 0:fn=(void*)JitHelp_w32;ld=false;ctx.hasStore=true;break;
-        case 1:fn=(void*)JitHelp_w16;ld=false;ctx.hasStore=true;break;
-        case 2:fn=(void*)JitHelp_w8; ld=false;ctx.hasStore=true;break;
-        case 3:fn=(void*)JitHelp_r8; sxb=true;break;
-        case 4:fn=(void*)JitHelp_r32;break;
-        case 5:fn=(void*)JitHelp_r16;break;
-        case 6:fn=(void*)JitHelp_r8; break;
-        case 7:fn=(void*)JitHelp_r16;sxh=true;break;
-        default:return false;
+    case 0: fn=(void*)&JitHelp_w32;   ld=false; break;
+    case 1: fn=(void*)&JitHelp_w16;   ld=false; break;
+    case 2: fn=(void*)&JitHelp_w8;    ld=false; break;
+    case 3: fn=(void*)&JitHelp_r8;    sxb=true;  break;
+    case 4: fn=(void*)&JitHelp_ldr32; break;
+    case 5: fn=(void*)&JitHelp_ldrh;  break;
+    case 6: fn=(void*)&JitHelp_r8;    break;
+    default:fn=(void*)&JitHelp_ldrsh; break;
     }
-    ctx.E(ppc_add(TC,RA[rb],RA[ro]));ctx.E(ppc_stw(TC,FRAME_SCR0,1));
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.E(ppc_lwz(TC,FRAME_SCR0,1));
-    if(!ld)ctx.E(ppc_mr(TD,RA[rd]));ctx.call(fn);
-    if(ld){if(sxb)ctx.E(ppc_extsb(RA[rd],TA));else if(sxh)ctx.E(ppc_extsh(RA[rd],TA));else ctx.E(ppc_mr(RA[rd],TA));}
+    C.E(add(TC,RA[rb],RA[ro])); C.E(stw(TC,FRAME_SCR0,1));
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.E(lwz(TC,FRAME_SCR0,1));
+    if(!ld) C.E(mr(TD,RA[rd]));
+    C.call(fn);
+    if(ld){ if(sxb) C.E(extsb(RA[rd],TA)); else C.E(mr(RA[rd],TA)); }
     return true;
 }
-static bool emitT_memImm(Ctx& ctx,uint16_t op){
-    uint8_t rd=op&7,rb=(op>>3)&7;bool ld=(op>>11)&1;
-    uint8_t h=(op>>12)&0xF;bool by=(h==7),hw=(h==8);
-    uint32_t off=((op>>6)&0x1F)*(hw?2u:by?1u:4u);
-    if(!ld)ctx.hasStore=true;
-    ctx.li(TC,off);ctx.E(ppc_add(TC,RA[rb],TC));ctx.E(ppc_stw(TC,FRAME_SCR0,1));
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.E(ppc_lwz(TC,FRAME_SCR0,1));
-    if(!ld)ctx.E(ppc_mr(TD,RA[rd]));
-    void* fn=ld?(hw?(void*)JitHelp_r16:by?(void*)JitHelp_r8:(void*)JitHelp_r32)
-               :(hw?(void*)JitHelp_w16:by?(void*)JitHelp_w8:(void*)JitHelp_w32);
-    ctx.call(fn);if(ld)ctx.E(ppc_mr(RA[rd],TA));return true;
+static bool emitT_memImm(Ctx& C,uint16_t op){
+    const uint8_t rd=op&7, rb=(op>>3)&7; const bool ld=(op>>11)&1;
+    const uint8_t h=(op>>12)&0xF; const bool by=(h==7), hw=(h==8);
+    const uint32_t off=(uint32_t)((op>>6)&0x1F)*(hw?2u:by?1u:4u);
+    C.li(TC,off); C.E(add(TC,RA[rb],TC)); C.E(stw(TC,FRAME_SCR0,1));
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.E(lwz(TC,FRAME_SCR0,1));
+    if(!ld) C.E(mr(TD,RA[rd]));
+    void* fn = ld ? (hw?(void*)&JitHelp_ldrh:by?(void*)&JitHelp_r8:(void*)&JitHelp_ldr32)
+                  : (hw?(void*)&JitHelp_w16:by?(void*)&JitHelp_w8:(void*)&JitHelp_w32);
+    C.call(fn);
+    if(ld) C.E(mr(RA[rd],TA));
+    return true;
 }
-static bool emitT_spLoad(Ctx& ctx,uint16_t op,uint32_t curPC){
-    bool ld=(op>>11)&1;uint8_t rd=(op>>8)&7;bool sp=(((op>>12)&0xF)==0x9);
-    uint32_t off=(uint32_t)(op&0xFF)<<2;
-    if(sp){ctx.li(TA,off);ctx.E(ppc_add(TC,RA[13],TA));}else ctx.li(TC,((curPC+4)&~3u)+off);
-    if(!ld)ctx.hasStore=true;
-    ctx.E(ppc_stw(TC,FRAME_SCR0,1));
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));ctx.E(ppc_lwz(TC,FRAME_SCR0,1));
-    if(!ld)ctx.E(ppc_mr(TD,RA[rd]));ctx.call(ld?(void*)JitHelp_r32:(void*)JitHelp_w32);
-    if(ld)ctx.E(ppc_mr(RA[rd],TA));return true;
+static bool emitT_spLoad(Ctx& C,uint16_t op){
+    const bool ld=(op>>11)&1; const uint8_t rd=(op>>8)&7;
+    C.li(TA,(uint32_t)(op&0xFF)<<2); C.E(add(TC,RA[13],TA));
+    C.E(stw(TC,FRAME_SCR0,1));
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.E(lwz(TC,FRAME_SCR0,1));
+    if(!ld) C.E(mr(TD,RA[rd]));
+    C.call(ld?(void*)&JitHelp_ldr32:(void*)&JitHelp_w32);
+    if(ld) C.E(mr(RA[rd],TA));
+    return true;
 }
-static bool emitT_addSpPc(Ctx& ctx,uint16_t op,uint32_t curPC){
-    uint8_t h=(op>>12)&0xF;
+static bool emitT_addSpPc(Ctx& C,uint16_t op,uint32_t curPC){
+    const uint8_t h=(op>>12)&0xF;
     if(h==0xA){
-        uint8_t rd=(op>>8)&7;bool sp=(op>>11)&1;uint32_t imm=(uint32_t)(op&0xFF)<<2;
-        if(sp){ctx.li(TA,imm);ctx.E(ppc_add(RA[rd],RA[13],TA));}
-        else ctx.li(RA[rd],((curPC+4)&~3u)+imm);
+        const uint8_t rd=(op>>8)&7; const bool sp=(op>>11)&1;
+        const uint32_t imm=(uint32_t)(op&0xFF)<<2;
+        if(sp){ C.li(TA,imm); C.E(add(RA[rd],RA[13],TA)); }
+        else C.li(RA[rd],((curPC+4)&~3u)+imm);
         return true;
     }
-    if(h==0xB){
-        uint8_t s=(op>>8)&0xF;
-        if(s==0){ctx.li(TA,(uint32_t)(op&0x7F)<<2);ctx.E(ppc_add(RA[13],RA[13],TA));return true;}
-        if(s==1){ctx.li(TA,(uint32_t)(op&0x7F)<<2);ctx.E(ppc_subf(RA[13],TA,RA[13]));return true;}
+    if((op&0xFF00)==0xB000){
+        const uint32_t imm=(uint32_t)(op&0x7F)<<2;
+        C.li(TA,imm);
+        if(op&0x80) C.E(subf(RA[13],TA,RA[13]));
+        else        C.E(add(RA[13],RA[13],TA));
+        return true;
     }
     return false;
 }
-static bool emitT_pushPop(Ctx& ctx,uint16_t op,uint32_t curPC){
-    uint8_t opA=(op>>9)&7;if(opA!=2&&opA!=6)return false;
-    bool isStore=(opA==2);
-    if(isStore)ctx.hasStore=true;
-    emitSpill(ctx);
-    ctx.li(TA,curPC+2);ctx.E(ppc_stw(TA,FRAME_PC,1));
-    ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));
-    ctx.li(TC,(uint32_t)(uint16_t)op);ctx.E(ppc_addi(TD,1,(int16_t)FRAME_REGSYNC));
-    ctx.E(ppc_addi(TE,1,(int16_t)FRAME_PC));ctx.E(ppc_addi(TF,1,(int16_t)FRAME_CPSR));
-    ctx.call((void*)JitHelp_thumbPushPop);ctx.E(ppc_stw(TA,FRAME_SCR0,1));
-    emitReload(ctx);
-    bool isPop=((op>>11)&1),hasR=((op>>8)&1);
+static void emitThumbPushPop(Ctx& C,uint16_t op,uint32_t curPC){
+    // args: core=TA arm7=TB op=TC regs=TD pcOut=TE cpsr=TF
+    C.ldShadowTo(TS);
+    C.E(addi(TD,TS,SH_REGS));
+    C.E(addi(TE,TS,SH_PC));
+    C.E(addi(TF,TS,SH_CPSR));
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.li(TC,(uint32_t)op);
+    C.call((void*)&JitHelp_thumbPushPop);
+    C.E(stw(TA,FRAME_SCR0,1));
+    const bool isPop=((op>>11)&1)!=0, hasR=((op>>8)&1)!=0;
     if(isPop&&hasR){
-        ctx.E(ppc_lwz(TA,FRAME_SCR0,1));ctx.E(ppc_cmpi(0,TA,1));
-        size_t b=ctx.sz();ctx.E(ppc_bc(12,2,0));
-        emitCommitExit(ctx,curPC+2,EXIT_NORMAL);
-        {int32_t d=(int32_t)((ctx.sz()-b)*4);ctx.base[b]=ppc_bc(12,2,(int16_t)d);}
-        emitCommitExitDyn(ctx,EXIT_NORMAL);ctx.done=true;
+        C.E(lwz(TA,FRAME_SCR0,1)); C.E(cmpi(0,TA,1));
+        size_t noPC=C.sz(); C.E(bc(12,crEQ(0),0));
+        emitPCWriteDyn(C);                                   // PC + T set by the helper
+        C.done=true;
+        patchOne(C,noPC);
     }
+    (void)curPC;
+}
+static bool emitT_pushPop(Ctx& C,uint16_t op,uint32_t curPC){
+    bool isPop=((op>>11)&1)!=0;
+    int n=0; for(int i=0;i<8;i++) if(op&(1u<<i)) n++;
+    if(op&0x100) n++;
+    C.cyc += 1u+(uint32_t)n;
+    bool pcInList = isPop && (op&0x100);
+    Skip si=emitCondSkip(C,14);                              // unconditional
+    (void)si;
+    emitThumbPushPop(C,op,curPC);
     return true;
 }
-static bool emitT_ldmStm(Ctx& ctx,uint16_t op){
-#if JIT_NO_BLOCKXFER
-    (void)op;(void)ctx;return false;
-#endif
-    bool load=((op>>11)&1)!=0;
-    if(!load)ctx.hasStore=true;
-    emitSpill(ctx);ctx.ldCore();ctx.E(ppc_addi(TB,0,ctx.arm7?1:0));
-    ctx.li(TC,(uint32_t)(uint16_t)op);ctx.E(ppc_addi(TD,1,(int16_t)FRAME_REGSYNC));
-    ctx.call((void*)JitHelp_thumbBlock);emitReload(ctx);return true;
+static bool emitT_ldmStm(Ctx& C,uint16_t op){
+    int n=0; for(int i=0;i<8;i++) if(op&(1u<<i)) n++;
+    C.cyc += 1u+(uint32_t)n;
+    C.ldShadowTo(TS);
+    C.E(addi(TD,TS,SH_REGS));
+    C.ldCore(); C.E(addi(TB,0,C.arm7?1:0)); C.li(TC,(uint32_t)op);
+    C.call((void*)&JitHelp_thumbBlock);
+    return true;
 }
-static bool emitT_branch(Ctx& ctx,uint16_t op,uint32_t curPC){
-    uint8_t h=(op>>12)&0xF;
+static bool emitT_branch(Ctx& C,uint16_t op,uint32_t curPC){
+    const uint8_t h=(op>>12)&0xF;
     if(h==0xE){
-        if(((op>>11)&1)!=0)return false;
-        int32_t off=(int32_t)((int16_t)(op<<5))>>4;
-        emitCommitExit(ctx,(uint32_t)(curPC+4+off),EXIT_NORMAL);
-        ctx.done=true;return true;
+        if(((op>>11)&1)!=0) return false;                    // lone BL/BLX suffix
+        const int32_t off=((int32_t)(int16_t)(op<<5))>>4;
+        C.cyc += 3;
+        emitBodyEnd(C,(uint32_t)(curPC+4+off),EXIT_NORMAL);
+        C.done=true;
+        return true;
     }
     if(h==0xD){
-        uint8_t cond=(op>>8)&0xF;if(cond==0xF||cond==0xE)return false;
-        int32_t off=((int32_t)(int8_t)(op&0xFF))<<1;
-        int si=openCondSkip(ctx,cond);
-        if(si<0)return false;
-        emitCommitExit(ctx,(uint32_t)(curPC+4+off),EXIT_NORMAL);
-        ctx.SETMARK(si);emitCommitExit(ctx,curPC+2,EXIT_NORMAL);ctx.RESOLVE();
-        ctx.done=true;return true;
+        const uint8_t cond=(op>>8)&0xF;
+        if(cond==0xF||cond==0xE) return false;               // SWI / undefined
+        const int32_t off=((int32_t)(int8_t)(op&0xFF))<<1;
+        C.cyc += 3;
+        Skip si=emitCondSkip(C,cond);
+        if(si.a==SIZE_MAX) return false;
+        emitBodyEndMode(C,(uint32_t)(curPC+4+off),true,EXIT_NORMAL);
+        patchSkip(C,si);
+        emitBodyEnd(C,curPC+2,EXIT_NORMAL);
+        C.done=true;
+        return true;
     }
     return false;
 }
-static bool emitT_bl(Ctx& ctx,uint16_t op1,uint16_t op2,uint32_t curPC){
-    int32_t hi=(int32_t)((op1&0x7FF)<<21)>>9,lo=(op2&0x7FF)<<1;
-    uint32_t tgt=(uint32_t)(curPC+4+hi+lo);
-    bool blx=((op2>>11)&0x1F)==0x1C;
-    ctx.li(RA[14],(curPC+4)|1u);
-    if(blx){tgt&=~3u;ctx.li(TA,~(1u<<5));ctx.E(ppc_and(RCPSR,RCPSR,TA));}
-    emitCommitExit(ctx,tgt&~1u,EXIT_NORMAL);ctx.done=true;return true;
-}
-static bool dispThumb(Ctx& ctx,uint16_t op,uint32_t curPC){
-    uint8_t h=(op>>12)&0xF;
-    if(JIT_NO_S){
-        // bisect #1: shifts (0x0), imm8 ALU (0x1) and the ALU/hi-reg group (0x2) all write flags
-        if(h==0x0||h==0x1||h==0x2)return false;
+static bool emitT_bl(Ctx& C,uint16_t op1,uint16_t op2,uint32_t curPC,bool blx){
+    const int S=(op1>>10)&1, J1=(op2>>13)&1, J2=(op2>>11)&1;
+    const int I1=(J1^S)?0:1, I2=(J2^S)?0:1;                  // P11: ARMv5 J1/J2
+    uint32_t off=((uint32_t)(S?0xFF000000u:0))|((uint32_t)I1<<23)|((uint32_t)I2<<22)
+                |((uint32_t)(op1&0x3FF)<<12)|((uint32_t)(op2&0x7FF)<<1);
+    uint32_t tgt=(uint32_t)(curPC+4u+off);
+    C.li(RA[14],(curPC+4u)|1u);                              // Thumb return address
+    C.cyc += 4;
+    if(blx){
+        tgt&=~3u;
+        C.E(rlwinm(RCPSR,RCPSR,0,27,25));                    // leave Thumb state
     }
-    switch(h){
-        case 0x0:if(((op>>11)&3)<3)return emitT_shifts(ctx,op);return emitT_addSub3(ctx,op);
-        case 0x1:return emitT_imm8(ctx,op);
-        case 0x2:{uint8_t b=(op>>10)&3;if(b==0)return emitT_alu(ctx,op);if(b==1)return emitT_hiReg(ctx,op,curPC);return emitT_ldrPc(ctx,op,curPC);}
-        case 0x3:case 0x4:case 0x5:return emitT_memReg(ctx,op);
-        case 0x6:case 0x7:case 0x8:return emitT_memImm(ctx,op);
-        case 0x9:return emitT_spLoad(ctx,op,curPC);
-        case 0xA:return emitT_addSpPc(ctx,op,curPC);
-        case 0xB:
-            if(((op>>8)&0xF)<=1)return emitT_addSpPc(ctx,op,curPC);
-            if(((op>>9)&7)==2||((op>>9)&7)==6)return emitT_pushPop(ctx,op,curPC);
-            return false;
-        case 0xC:return emitT_ldmStm(ctx,op);
-        case 0xD:case 0xE:return emitT_branch(ctx,op,curPC);
-        default:return false;
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Address validation
-// ═══════════════════════════════════════════════════════════════════════
-static bool validPC(uint32_t pc, bool gba) {
-    pc &= ~1u;
-    if (pc >= 0x80000000u) return false;
-    if (gba) {
-        return (pc <= 0x00003FFFu) ||
-               (pc >= 0x02000000u && pc < 0x02040000u) ||
-               (pc >= 0x03000000u && pc < 0x03008000u) ||
-               (pc >= 0x06000000u && pc < 0x06018000u) ||
-               (pc >= 0x08000000u && pc < 0x0E000000u);
-    }
-    return (pc < 0x00008000u) ||
-           (pc >= 0x01000000u && pc < 0x02000000u) ||
-           (pc >= 0x02000000u && pc < 0x02400000u) ||
-           (pc >= 0x03000000u && pc < 0x03810000u) ||
-           (pc >= 0x06000000u && pc < 0x07000000u) ||
-           (pc >= 0x08000000u && pc < 0x0A000000u) ||
-           (pc >= 0xFFFF0000u);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Compile
-// ═══════════════════════════════════════════════════════════════════════
-#if JIT_LONG_BLOCKS
-static const size_t REM_GUARD = 400;      // worst case: one long reg-shift-S + commit
-#else
-static const size_t REM_GUARD = 200;
-#endif
-
-static JitBlock* compile(Interpreter* interp,Core* core,
-                          uint32_t armPC,bool arm7,int cpuIdx){
-    if(!codeBuf||!g_jitLive||!interp||!core)return nullptr;
-    if(!interp->isReady())return nullptr;
-    if(!validPC(armPC,core->gbaMode))return nullptr;
-#if JIT_NO_THUMB
-    if(interp->isThumb())return nullptr;               // bisect #2
-#endif
-    bool thumb=interp->isThumb();
-    size_t b=bucketOf(armPC);
-
-    for(int w=0;w<2;w++){
-        JitBlock& s=cache[b+w];
-        if(s.valid&&s.armPC==armPC&&s.thumb==thumb&&s.gen==cacheGen&&s.nW>=16){
-            s.use=++g_useCounter;
-            return &s;
-        }
-    }
-    // victim: the unused way, else the least recently used way
-    int victim=0;
-    if(cache[b+0].valid&&!cache[b+1].valid)victim=1;
-    else if(cache[b+0].valid&&cache[b+1].valid)
-        victim=(cache[b+0].use<=cache[b+1].use)?0:1;
-    cache[b+victim].valid=false;
-
-    if(codePos+BLK_WDS>=JIT_WORDS)flushJitCache();
-
-    Ctx ctx;memset(&ctx,0,sizeof(ctx));
-    ctx.base=codeBuf+codePos;ctx.cur=ctx.base;
-    ctx.cap=JIT_WORDS-codePos;if(ctx.cap>BLK_WDS)ctx.cap=BLK_WDS;
-    ctx.thumb=thumb;ctx.arm7=arm7;ctx.blockPC=armPC;
-    ctx.cpuIdx=cpuIdx;ctx.interp=interp;ctx.core=core;ctx.insnCount=0;
-    ctx.hasStore=false;ctx.nFix=0;ctx.nextMark=0;
-    emitPrologue(ctx);emitSyncFrom(ctx);
-    uint32_t curPC=armPC;int n=0;
-    while(n<(int)BLK_ARMS&&!ctx.done&&!ctx.overflow){
-        if(ctx.rem()<REM_GUARD){emitCommitExit(ctx,curPC,EXIT_NORMAL);ctx.done=true;break;}
-        if(!validPC(curPC,core->gbaMode)){emitCommitExit(ctx,curPC,EXIT_FALLBACK);ctx.done=true;break;}
-        if(thumb){
-            uint16_t op=core->memory.read<uint16_t>(arm7,curPC);
-            if(((op>>11)&0x1F)==0x1E){
-                if(!validPC(curPC+2,core->gbaMode)){emitCommitExit(ctx,curPC,EXIT_FALLBACK);ctx.done=true;break;}
-                uint16_t op2=core->memory.read<uint16_t>(arm7,curPC+2);
-                uint8_t bb=(op2>>11)&0x1F;
-                if(bb==0x1F||bb==0x1C){emitT_bl(ctx,op,op2,curPC);curPC+=4;n+=2;ctx.insnCount+=2;continue;}
-            }
-            if(!dispThumb(ctx,op,curPC)){
-                fbLogOnce(true,cpuIdx,curPC,(uint32_t)op);
-                emitCommitExit(ctx,curPC,EXIT_FALLBACK);ctx.done=true;
-            }else{curPC+=2;n++;ctx.insnCount++;}
-        }else{
-            uint32_t op=core->memory.read<uint32_t>(arm7,curPC);
-            if(!dispARM(ctx,op,curPC)){
-                fbLogOnce(false,cpuIdx,curPC,op);
-                emitCommitExit(ctx,curPC,EXIT_FALLBACK);ctx.done=true;
-            }else{
-                curPC+=4;n++;ctx.insnCount++;
-#if !JIT_LONG_BLOCKS
-                if(((op>>25)&7)==5)ctx.done=true;
-                if((op&0x0FFFFFF0)==0x012FFF10)ctx.done=true;
-                if((op&0x0E000000)==0x0A000000)ctx.done=true;
-#endif
-            }
-        }
-    }
-    if(!ctx.done&&!ctx.overflow)emitCommitExit(ctx,curPC,EXIT_NORMAL);
-    if(ctx.overflow||ctx.sz()<16){
-        DebugLog("[JIT] compile FAIL pc=%08X overflow=%d sz=%zu\n",armPC,(int)ctx.overflow,ctx.sz());
-        return nullptr;
-    }
-    if(ctx.base[ctx.sz()-1]!=ppc_blr()){
-        DebugLog("[JIT] compile no-BLR pc=%08X\n",armPC);
-        return nullptr;
-    }
-    size_t wds=ctx.sz();flushICache(ctx.base,wds);
-    JitBlock& slot=cache[b+victim];
-    slot.armPC=armPC;slot.endPC=curPC;slot.code=ctx.base;slot.nW=(uint32_t)wds;
-    slot.gen=cacheGen;slot.thumb=thumb;slot.insnCount=(uint32_t)ctx.insnCount;
-    slot.hasStore=ctx.hasStore;slot.use=++g_useCounter;slot.valid=true;
-    markPage(armPC);
-    codePos+=wds;
-    return &slot;
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Inline scheduler tick  (F9: dispatch counters)
-// ═══════════════════════════════════════════════════════════════════════
-static inline void tickInline(Core& core,uint32_t cycles){
-    core.globalCycles+=cycles;
-    while(!core.events.empty()&&
-          core.globalCycles>=core.events.front().cycles){
-        SchedEvent e=core.events.front();
-        core.events.erase(core.events.begin());
-        if(e.task>=0&&e.task<MAX_TASKS&&core.tasks[e.task].fn){
-#if JIT_EV_COUNTERS
-            g_evCount[e.task]++;
-#endif
-            core.tasks[e.task]();
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// F10: stuck-PC watchdog
-// ═══════════════════════════════════════════════════════════════════════
-#if JIT_WATCHDOG
-struct BlkRec {
-    uint32_t pc,cpsr,ops[4];
-    int cpu,thumb,insns,reason;
-};
-static BlkRec   g_ring[32];
-static int      g_ringIdx=0;
-static uint32_t g_samePC[2]={~0u,~0u};
-static uint32_t g_sameCount[2]={0,0};
-
-static void traceBlock(Core& core,int cpu,const JitBlock* b,int reason,uint32_t cpsr){
-    BlkRec& r=g_ring[g_ringIdx++ & 31];
-    r.pc=b->armPC;r.cpsr=cpsr;r.cpu=cpu;r.thumb=(int)b->thumb;
-    r.insns=(int)b->insnCount;r.reason=reason;
-    if(b->thumb){ for(int i=0;i<4;i++) r.ops[i]=core.memory.read<uint16_t>((bool)cpu==1,b->armPC+i*2); }
-    else        { for(int i=0;i<4;i++) r.ops[i]=core.memory.read<uint32_t>((bool)cpu==1,b->armPC+i*4); }
-
-    if(b->armPC==g_samePC[cpu]){
-        if(++g_sameCount[cpu]>=4000){
-            DebugLog("[WATCH] cpu%d pinned at %08X cpsr=%08X lastExit=%d insns=%d thumb=%d\n",
-                     cpu,b->armPC,cpsr,reason,(int)b->insnCount,(int)b->thumb);
-            for(int i=16;i<32;i++){
-                const BlkRec& x=g_ring[(g_ringIdx+i)&31];
-                DebugLog("  [WATCH] cpu%d pc=%08X thumb=%d n=%2d exit=%d cpsr=%08X ops=%08X %08X %08X %08X\n",
-                         x.cpu,x.pc,x.thumb,x.insns,x.reason,x.cpsr,x.ops[0],x.ops[1],x.ops[2],x.ops[3]);
-            }
-            DebugLog("[WATCH] hint: exit=0 with the same PC => a predicate never flips (check CPSR C/V).\n"
-                     "[WATCH] hint: exit=1 with the same PC => missing emitter for the opcode at that PC.\n");
-            g_sameCount[cpu]=0;
-        }
-    }else{g_samePC[cpu]=b->armPC;g_sameCount[cpu]=0;}
-}
-#endif
-
-// ═══════════════════════════════════════════════════════════════════════
-// F11: differential harness (JIT vs interpreter, store-free blocks only)
-// ═══════════════════════════════════════════════════════════════════════
-#if JIT_DIFF
-static const int JIT_DIFF_BLOCKS = 4000;
-
-struct Snap { uint32_t r[15]; uint32_t cpsr; uint32_t pc; };
-
-static bool snapOf(Interpreter& in,Snap& s){
-    if(!in.isReady())return false;
-    uint32_t** p=in.getRegisters();
-    if(!p)return false;
-    for(int k=0;k<15;k++){ if(!p[k])return false; s.r[k]=*p[k]; }
-    s.cpsr=in.getCpsrRef();
-    s.pc=in.getActualPC();
+    emitBodyEndMode(C,tgt&~1u,!blx,EXIT_NORMAL);
+    C.done=true;
     return true;
 }
-static void restoreOf(Interpreter& in,const Snap& s){
-    uint32_t** p=in.getRegisters();
-    for(int k=0;k<15;k++)*p[k]=s.r[k];
-    in.getCpsrRef()=s.cpsr;
-    in.setPC(s.pc);            // cpsr is restored first, so the T bit selects the right pipeline
+
+// ============================================================================
+//  Dispatchers + per-instruction cost
+// ============================================================================
+static uint32_t armCycles(uint32_t op){
+    switch((op>>25)&7){
+        case 0: return ((op&0x0E000090)==0x00000090)?2u:1u;
+        case 1: return 1u;
+        case 2: case 3: return 2u;
+        case 4: { uint32_t n=0; for(int i=0;i<16;i++) if(op&(1u<<i)) n++; return 1u+n; }
+        case 5: { uint32_t n=0; for(int i=0;i<16;i++) if(op&(1u<<i)) n++; return 1u+n; }
+        default: return 1u;
+    }
 }
-static void diffBlock(Core& core,int cpu,Interpreter& interp,JitBlock* b){
-    if(b->hasStore)return;     // stores cannot be replayed
-    Snap before,afterJit,afterInt;
-    if(!snapOf(interp,before))return;
-    uint32_t jitExitPC=g_exitPC[cpu];
-    int      jitReason=g_exitReason[cpu];
-    if(!snapOf(interp,afterJit))return;
+static uint32_t thumbCycles(uint16_t op){
+    switch((op>>12)&0xF){
+        case 0x4: return ((op>>11)&1)?2u:1u;
+        case 0x5: case 0x6: case 0x7: case 0x8: case 0x9: return 2u;
+        case 0xB: return ((op&0xF600)==0xB400)?1u+((op&0x100)?1u:0u):1u;
+        case 0xC: return 1u;
+        case 0xD: case 0xE: return 3u;
+        default: return 1u;
+    }
+}
+static bool dispARM(Ctx& C,uint32_t op,uint32_t curPC){
+    const uint8_t cond=(op>>28)&0xF; if(cond==15) return false;
+    if((op&0x0F000000)==0x0F000000) return false;                   // SWI -> interpreter
+    if((op&0x0FB00FF0)==0x01000090) return false;                   // SWP/SWPB -> interpreter
+    if((op&0x0FFFFFF0)==0x012FFF10||(op&0x0FFFFFF0)==0x012FFF30) return emitBranch(C,op,curPC);
+    if((op&0x0F900000)==0x01000000||(op&0x0FB00000)==0x03200000) return emitMrsMsr(C,op,curPC);
+    if((op&0x0F000000)==0x0E000000) return emitCoproc(C,op,curPC);
+    switch((op>>25)&7){
+        case 0:
+            if((op&0x0FC000F0)==0x00000090) return emitMul(C,op);
+            if((op&0x0E000090)==0x00000090) return emitLSExtra(C,op,curPC);
+            return emitDP(C,op,curPC);
+        case 1: return emitDP(C,op,curPC);
+        case 2: case 3: return emitLS(C,op,curPC);
+        case 4: return emitBlockXfer(C,op,curPC);
+        case 5: return emitBranch(C,op,curPC);
+        default: return false;
+    }
+}
+static bool dispThumb(Ctx& C,uint16_t op,uint32_t curPC){
+    switch((op>>12)&0xF){
+        case 0x0: return emitT_shifts(C,op);
+        case 0x1: if(!((op>>11)&1)) return emitT_shifts(C,op);
+                  return emitT_addSub3(C,op);
+        case 0x2: case 0x3: return emitT_imm8(C,op);
+        case 0x4: {
+            const uint8_t b=(op>>10)&3;
+            if(b==0) return emitT_alu(C,op);
+            if(b==1) return emitT_hiReg(C,op,curPC);
+            return emitT_ldrPc(C,op,curPC);
+        }
+        case 0x5: return emitT_memReg(C,op);
+        case 0x6: case 0x7: case 0x8: return emitT_memImm(C,op);
+        case 0x9: return emitT_spLoad(C,op);
+        case 0xA: return emitT_addSpPc(C,op,curPC);
+        case 0xB:
+            if((op&0xFF00)==0xB000) return emitT_addSpPc(C,op,curPC);
+            if((op&0xF600)==0xB400) return emitT_pushPop(C,op,curPC);
+            return false;
+        case 0xC: return emitT_ldmStm(C,op);
+        case 0xD: case 0xE: return emitT_branch(C,op,curPC);
+        default: return false;
+    }
+}
+static bool validPC(uint32_t pc,bool gba){
+    pc&=~1u;
+    if(pc>=0x80000000u&&pc<0xFFFF0000u) return false;
+    if(gba){
+        return (pc<=0x00003FFFu)||(pc>=0x02000000u&&pc<0x02040000u)||
+               (pc>=0x03000000u&&pc<0x03008000u)||(pc>=0x06000000u&&pc<0x06018000u)||
+               (pc>=0x08000000u&&pc<0x0E000000u);
+    }
+    return (pc<0x00008000u)||(pc>=0x01000000u&&pc<0x02000000u)||
+           (pc>=0x02000000u&&pc<0x02400000u)||(pc>=0x03000000u&&pc<0x03810000u)||
+           (pc>=0x06000000u&&pc<0x07000000u)||(pc>=0x08000000u&&pc<0x0A000000u)||
+           (pc>=0xFFFF0000u);
+}
 
-    restoreOf(interp,before);
-    for(uint32_t k=0;k<b->insnCount;k++)interp.jitRunOpcode();
-    if(!snapOf(interp,afterInt))return;
+// ============================================================================
+//  Prologue + compile
+// ============================================================================
+static void emitReload(Ctx& C);            // defined above? -> forward
+static void emitPrologue(Ctx& C){
+    C.E(mflr(0));
+    C.E(stwu(1,-(int16_t)FRAME_SIZE,1));
+    C.E(stw(0,FRAME_LR_OFF,1));
+    for(int r=14;r<=31;r++) C.E(stw(r,FRAME_SAVE+(r-14)*4,1));
+    C.li(TA,(uint32_t)(uintptr_t)&g_state[C.cpuIdx]); C.E(stw(TA,FRAME_SHADOW,1));
+    C.li(TB,(uint32_t)(uintptr_t)C.core);            C.E(stw(TB,FRAME_CORE,1));
+    C.li(TB,(uint32_t)(uintptr_t)C.interp);          C.E(stw(TB,FRAME_INTERP,1));
+    C.E(addi(TB,0,(int16_t)C.cpuIdx));               C.E(stw(TB,FRAME_CPUIDX,1));
+    C.E(lwz(TB,SH_BUDGET,TA));                       C.E(stw(TB,FRAME_BUDGET,1));
+    size_t validCheck=SIZE_MAX;
+    if(JitCfg::kSafeEntry){                          // I5: defensive, cheap, once per C trip
+        C.E(lwz(TB,SH_VALID,TA)); C.E(cmpi(0,TB,0));
+        validCheck=C.sz(); C.E(bc(4,crEQ(0),0));     // valid!=0 -> reload
+        C.li(TC,(uint32_t)(uintptr_t)C.interp); C.E(mr(TD,TA));
+        C.call((void*)&JitHelp_takeOver);
+    }
+    size_t reloadAt=C.sz();
+    patchOne(C,validCheck);
+    emitReloadFromShadow(C);
+    (void)reloadAt;
+}
+static JitBlock* compile(Interpreter* interp,Core* core,uint32_t armPC,bool arm7,int cpuIdx){
+    if(!codeBuf||!g_live||!interp||!core) return nullptr;
+    if(!interp->isReady()) return nullptr;
+    if(!validPC(armPC,core->gbaMode)) return nullptr;
+    const bool thumb=interp->isThumb();
 
-    uint32_t cpsrDiff=afterJit.cpsr^afterInt.cpsr;
-    bool bad=(cpsrDiff!=0)||(afterJit.pc!=afterInt.pc);
-    int badReg=-1;
-    if(!bad) for(int k=0;k<15;k++) if(afterJit.r[k]!=afterInt.r[k]){bad=true;badReg=k;break;}
+    JitBlock* cached=lookupValid(armPC,cpuIdx,thumb);
+    if(cached) return cached;
 
-    if(bad){
-        DebugLog("[DIFF] cpu%d pc=%08X thumb=%d insns=%u exit=%d\n",
-                 cpu,b->armPC,(int)b->thumb,b->insnCount,jitReason);
-        DebugLog("[DIFF]   pc   jit=%08X int=%08X\n",afterJit.pc,afterInt.pc);
-        DebugLog("[DIFF]   cpsr jit=%08X int=%08X xor=%08X N%c Z%c C%c V%c T%c\n",
-                 afterJit.cpsr,afterInt.cpsr,cpsrDiff,
-                 (cpsrDiff&0x80000000u)?'!':'.',(cpsrDiff&0x40000000u)?'!':'.',
-                 (cpsrDiff&0x20000000u)?'!':'.',(cpsrDiff&0x10000000u)?'!':'.',
-                 (cpsrDiff&0x20u)?'!':'.');
-        if(badReg>=0)
-            DebugLog("[DIFF]   r%d jit=%08X int=%08X\n",badReg,afterJit.r[badReg],afterInt.r[badReg]);
-        for(int i=0;i<4;i++){
-            if(b->thumb)DebugLog("[DIFF]   op%d=%04X\n",i,core.memory.read<uint16_t>((bool)cpu==1,b->armPC+i*2));
-            else        DebugLog("[DIFF]   op%d=%08X\n",i,core.memory.read<uint32_t>((bool)cpu==1,b->armPC+i*4));
+    const size_t bkt=hashPC(armPC,cpuIdx);
+    JitBlock& slot=cache[bkt];
+    if(slot.valid){ pageSub(slot.armPC,slot.endPC); unlinkIncoming(&slot); slot.valid=false; }
+    if(codePos+4096>=JIT_WORDS) flushJitCache();            // codeBuf reset -> recompute base
+
+    Ctx C;
+    C.base=codeBuf+codePos; C.cur=C.base;
+    C.cap=JIT_WORDS-codePos; if(C.cap>4096) C.cap=4096;
+    C.thumb=thumb; C.arm7=arm7; C.blockPC=armPC;
+    C.cpuIdx=cpuIdx; C.interp=interp; C.core=core;
+
+    emitPrologue(C);
+    uint32_t* const bodyPtr=C.cur;                          // chained entry point
+    uint32_t curPC=armPC; int n=0;
+    while(n<JitCfg::kBlkInsnsMax&&!C.done&&!C.overflow){
+        if(C.rem()<512){ C.done=true; emitExitToC(C,curPC,EXIT_NORMAL); break; }
+        if(!validPC(curPC,core->gbaMode)){ C.done=true; emitExitToC(C,curPC,EXIT_FALLBACK); break; }
+        if(thumb){
+            uint16_t op=core->memory.read<uint16_t>(arm7,curPC);
+            if(((op>>11)&0x1F)==0x1E){                      // BL / BLX prefix
+                if(!validPC(curPC+2,core->gbaMode)){ C.done=true; emitExitToC(C,curPC,EXIT_FALLBACK); break; }
+                uint16_t op2=core->memory.read<uint16_t>(arm7,curPC+2);
+                const uint8_t bb=(op2>>11)&0x1F;
+                if(bb==0x1F||(bb==0x1D&&!arm7)){            // P11: 0x1D == BLX
+                    emitT_bl(C,op,op2,curPC,bb==0x1D);
+                    curPC+=4; n+=2; C.insnCount+=2;
+                    continue;
+                }
+            }
+            if(!dispThumb(C,op,curPC)){
+                JHOT("[JIT] thumb FB cpu%d pc=%08X op=%04X\n",cpuIdx,curPC,(unsigned)op);
+                C.done=true; emitExitToC(C,curPC,EXIT_FALLBACK);
+            } else { C.cyc+=thumbCycles(op); curPC+=2; n++; C.insnCount++; }
+        } else {
+            uint32_t op=core->memory.read<uint32_t>(arm7,curPC);
+            if(!dispARM(C,op,curPC)){
+                JHOT("[JIT] arm   FB cpu%d pc=%08X op=%08X\n",cpuIdx,curPC,op);
+                C.done=true; emitExitToC(C,curPC,EXIT_FALLBACK);
+            } else {
+                C.cyc+=armCycles(op); curPC+=4; n++; C.insnCount++;
+            }
         }
     }
-    // always continue from the JIT's committed state
-    restoreOf(interp,afterJit);
-    g_exitPC[cpu]=jitExitPC;
-    g_exitReason[cpu]=jitReason;
-}
+    if(!C.done&&!C.overflow) emitBodyEnd(C,curPC,EXIT_NORMAL);
 
-static int g_diffBudget=JIT_DIFF_BLOCKS;
+    if(C.overflow||C.sz()<24){
+        g_stats.compileFail++;
+        JHOT("[JIT] compile FAIL pc=%08X overflow=%d sz=%u\n",armPC,(int)C.overflow,(unsigned)C.sz());
+        return nullptr;
+    }
+    if(C.base[C.sz()-1]!=0x4E800020u){                       // must end in blr
+        g_stats.compileFail++;
+        JHOT("[JIT] compile no-BLR pc=%08X\n",armPC);
+        return nullptr;
+    }
+    const size_t wds=C.sz();
+    flushICache(C.base,wds);
+
+    slot.armPC=armPC; slot.endPC=curPC>armPC?curPC:armPC+(thumb?2u:4u);
+    slot.code=C.base; slot.body=bodyPtr; slot.nW=(uint32_t)wds;
+    slot.gen=cacheGen; slot.thumb=thumb; slot.cpu=(uint8_t)cpuIdx;
+    slot.insnCount=(uint32_t)C.insnCount; slot.cycles=C.cyc;
+    slot.linkCount=0; slot.valid=true;
+    slot.sig=JitHelp_sigBlock(core,arm7?1:0,armPC,thumb?1u:0u,(uint32_t)C.insnCount);
+    pageAdd(slot.armPC,slot.endPC);
+    codePos+=wds;
+    g_stats.blocksLive++;
+    resolvePendingFor(&slot);
+    return &slot;
+}
+// ============================================================================
+//  Scheduler access (P9).  Both shapes are supported; set JIT_HAVE_FIXED_SCHED
+//  to 1 once you apply the fixed-array companion patch (see the bottom).
+// ============================================================================
+#ifndef JIT_HAVE_FIXED_SCHED
+#define JIT_HAVE_FIXED_SCHED 0
 #endif
 
-// ═══════════════════════════════════════════════════════════════════════
-// Per-CPU runner (single block, no blocking spin loops)
-// ═══════════════════════════════════════════════════════════════════════
+static inline uint32_t nextEventCycles(Core& core){
+#if JIT_HAVE_FIXED_SCHED
+    return core.evCount? core.events[0].cycles : 0xFFFFFFFFu;
+#else
+    return core.events.empty()? 0xFFFFFFFFu : core.events.front().cycles;
+#endif
+}
+static inline void runDueTasks(Core& core){
+#if JIT_HAVE_FIXED_SCHED
+    while(core.evCount && core.events[0].cycles<=core.globalCycles){
+        const SchedTask t=core.events[0].task;
+        --core.evCount;
+        for(int i=0;i<core.evCount;i++) core.events[i]=core.events[i+1];
+        if(core.tasks[t].fn) core.tasks[t]();
+    }
+#else
+    while(!core.events.empty() && core.events.front().cycles<=core.globalCycles){
+        const SchedTask t=core.events.front().task;
+        core.events.erase(core.events.begin());
+        if(core.tasks[t].fn) core.tasks[t]();
+    }
+#endif
+}
+// P9: the chain budget *is* the interrupt deadline.  A chain can therefore
+// never delay a scanline/SPU/timer task or an ARMx_INTERRUPT delivery beyond
+// the same bound the interpreter had — this is what makes chaining safe.
+static uint32_t chainBudget(Core& core,int cpu){
+    const uint32_t due=nextEventCycles(core);
+    if(due==0xFFFFFFFFu) return 512u;
+    uint32_t d=(due>core.globalCycles)?(due-core.globalCycles):64u;
+    if(cpu==1) d>>=1;                       // ARM7 time runs at half rate globally
+    if(d<64u) d=64u;
+    if(d>4096u) d=4096u;
+    return d;
+}
+
+static inline uint32_t interpStep(Interpreter& in){
+    const int c=in.jitRunOpcode();
+    return c>0?(uint32_t)c:1u;
+}
+static inline uint32_t interpStep(Core& core,int cpu){
+    // The interpreter executes exactly one instruction, so the shadow is dead
+    // afterwards: hand the state over first, drop ownership after (I5).
+    Interpreter& in=core.interpreter[cpu];
+    JitCpuState& sh=g_state[cpu];
+    JitHelp_release(&in,&sh);
+    const uint32_t c=interpStep(in);
+    sh.valid=0;
+    return c;
+}
+
 static uint32_t runCpu(Core& core,int cpu,bool gba){
     Interpreter& interp=core.interpreter[cpu];
+    JitCpuState& sh=g_state[cpu];
     if(interp.halted) return 0;
+    const bool arm7=(cpu==1);
 
-    const bool     arm7      =(cpu==1)||gba;
-    const uint32_t cycPerInsn=arm7?CYCLES_PER_INSN_ARM7:CYCLES_PER_INSN_ARM9;
+    if(!sh.valid) JitHelp_takeOver(&interp,&sh);
+    if(!sh.valid) return interpStep(core,cpu);            // interpreter owns state
 
-    if(!interp.isReady()){
-        interp.jitRunOpcode();
-        return cycPerInsn;
+    const uint32_t pc=sh.pendingPC;
+    if(!validPC(pc,gba)){
+        g_stats.badPC[cpu]++;
+        JHOT("[JIT] cpu%d PC out of range %08X -> interpreter\n",cpu,pc);
+        return interpStep(core,cpu);
     }
-
-    uint32_t pc=interp.getActualPC();
-
-    if(pc==0xFFFFFFFFu||!validPC(pc,gba)){
-        static uint32_t lastBadPC[2]={~0u,~0u};
-        if(pc!=lastBadPC[cpu]){
-            DebugLog("[JIT] cpu%d bad PC %08X\n",cpu,pc);
-            lastBadPC[cpu]=pc;
-        }
-        interp.jitRunOpcode();
-        return cycPerInsn;
-    }
-
-    g_exitReason[cpu]=EXIT_FALLBACK;
-    g_exitPC[cpu]    =pc;
+    if(badPCBit(cpu,pc)) return interpStep(core,cpu);     // P13: no recompile churn
 
     JitBlock* b=compile(&interp,&core,pc,arm7,cpu);
-    if(!b||!b->code||b->nW<16||
-       b->code<codeBuf||b->code+b->nW>codeBuf+JIT_WORDS){
-        interp.jitRunOpcode();
-        return cycPerInsn;
+    if(!b||!b->insnCount){ markBadPC(cpu,pc); return interpStep(core,cpu); }
+
+    if(JitCfg::kVerifyBlocks &&                                    // P10
+       JitHelp_sigBlock(&core,arm7?1:0,pc,b->thumb?1u:0u,b->insnCount)!=b->sig){
+        g_stats.stale[cpu]++;
+        JHOT("[JIT] STALE cpu%d pc=%08X -> invalidate\n",cpu,pc);
+        invalidateJitRange(pc,pc+0x1000u);
+        return interpStep(core,cpu);
     }
+
+    sh.cycles     = 0;
+    sh.reason     = EXIT_NORMAL;
+    sh.pendingPC  = pc;
+    sh.budget     = chainBudget(core,cpu);
+    g_stats.cTrips[cpu]++;
 
     executeBlock_asm(b->code);
 
-    const int reason=g_exitReason[cpu];
-    g_totalJIT[cpu]++;
+    uint32_t cyc=sh.cycles;
+    g_stats.guestCycles[cpu]+=cyc;
+    if(cyc==0) cyc=1u;
 
-#if JIT_WATCHDOG
-    traceBlock(core,cpu,b,reason,interp.getCpsrRef());
-#endif
-#if JIT_DIFF
-    if(g_diffBudget>0){
-        g_diffBudget--;
-        diffBlock(core,cpu,interp,b);
+    if(sh.reason==EXIT_FALLBACK){
+        // The block committed at the instruction it could not emit, so that one
+        // instruction is what the interpreter must retire next (I6).
+        g_stats.insnInterp[cpu]++;
+        markBadPC(cpu,sh.pendingPC);                     // never re-attempt compiling here
+        return cyc+interpStep(core,cpu);
     }
-#endif
+    g_stats.insnJit[cpu]+=b->insnCount;
+    if(sh.reason<=3) g_stats.exits[sh.reason]++;
 
-    // F8: charge for the work the block actually retired.  A fallback block already
-    // executed b->insnCount instructions and committed at the faulting PC, so that
-    // work must be charged in addition to the one interpreter instruction we run now.
-    uint32_t n=b->insnCount>0?b->insnCount:1u;
-    if(reason==EXIT_FALLBACK){
-        interp.jitRunOpcode();
-        return n*cycPerInsn+cycPerInsn;
+    if(JitCfg::kStormDump){                              // P10
+        static uint32_t lastPC[2]={~0u,~0u};
+        static uint16_t same[2]={0,0};
+        static bool     said[2]={false,false};
+        const uint32_t after=sh.pendingPC;
+        if(after==lastPC[cpu]){
+            if(++same[cpu]==64 && !said[cpu]){
+                said[cpu]=true; g_stats.storm[cpu]++;
+                ringAdd("[JIT] STORM cpu%d pc=%08X cpsr=%08X T=%d ime=%u ie=%08X irf=%08X\n",
+                        cpu,after,sh.cpsr,(int)((sh.cpsr>>5)&1u),
+                        interp.readIme(),interp.readIe(),interp.readIrf());
+                ringAdd("[JIT] STORM pcReg=%08X halted=%d exit=%d\n",
+                        interp.getPC(),(int)interp.halted,sh.reason);
+            }
+        } else { lastPC[cpu]=after; same[cpu]=0; said[cpu]=false; }
     }
-    return n*cycPerInsn;
+    return cyc;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Status log
-// ═══════════════════════════════════════════════════════════════════════
-static uint32_t g_statusTick=0;
-static void logStatus(Core& core){
-    g_statusTick++;
-    if((g_statusTick&0xFF)!=0)return;
-    DebugLog("[JIT] STATUS jit0=%u fb0=%u jit1=%u fb1=%u pos=%zu gen=%u ev<reset=%u line256=%u spu=%u irq9=%u irq7=%u>\n",
-             g_totalJIT[0],g_totalFB[0],g_totalJIT[1],g_totalFB[1],codePos,cacheGen,
-             g_evCount[RESET_CYCLES],g_evCount[NDS_SCANLINE256],g_evCount[NDS_SPU_SAMPLE],
-             g_evCount[ARM9_INTERRUPT],g_evCount[ARM7_INTERRUPT]);
-    DebugLog("[JIT] STATUS pc0=%08X pc1=%08X h0=%d h1=%d fps=%d cyc=%u\n",
-             core.interpreter[0].isReady()?core.interpreter[0].getActualPC():0u,
-             core.interpreter[1].isReady()?core.interpreter[1].getActualPC():0u,
-             (int)core.interpreter[0].halted,
-             (int)core.interpreter[1].halted,
-             core.fps,core.globalCycles);
+} // namespace (anon)
+
+// ============================================================================
+//  Public API
+// ============================================================================
+void invalidateJitRange(uint32_t start,uint32_t end){
+    if(!g_live||end<=start) return;
+    bool hit=false;
+    for(uint32_t p=start&~0xFFFu;p<end&&!hit;p+=0x1000u){
+        if(g_pageBlocks[pageIdx(p)]) hit=true;
+        if(p>0xFFFFF000u) break;
+    }
+    if(!hit) return;
+    for(size_t i=0;i<CSIZ;i++){
+        JitBlock& b=cache[i];
+        if(b.valid&&b.armPC<end&&b.endPC>start){
+            pageSub(b.armPC,b.endPC);
+            unlinkIncoming(&b);
+            b.valid=false;
+            if(g_stats.blocksLive) g_stats.blocksLive--;
+        }
+    }
+    // pending links whose target just died must not dangle: point them at their
+    // own stub, which exits to C with the intended PC.
+    for(size_t i=0;i<g_pending.size();){
+        PendingLink& l=g_pending[i];
+        if(l.targetPC>=start&&l.targetPC<end){
+            *l.site = b((intptr_t)(l.stub-l.site));
+            g_pending[i]=g_pending.back(); g_pending.pop_back();
+        } else ++i;
+    }
+    for(uint32_t a=start;a<end;a+=4) markBadPC(0,a), markBadPC(1,a);   // re-examine code
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Run functions
-// ═══════════════════════════════════════════════════════════════════════
-void runJitNds(Core& core){
-    if(!g_jitLive||!codeBuf){Interpreter::runCoreNds(core);return;}
+void flushJitCache(){
+    // Note: invalidating everything is correct but blunt (2 MB..4 MB of code).
+    // Prefer invalidateJitRange() where you know the affected pages; this is the
+    // safe default for CP15 control/cache writes, map changes and loadStates.
+    codePos=0; ++cacheGen;
+    for(size_t i=0;i<CSIZ;i++){ cache[i].valid=false; cache[i].linkCount=0; }
+    memset(g_pageBlocks,0,sizeof g_pageBlocks);
+    memset(g_badPC,0,sizeof g_badPC);
+    g_pending.clear();
+    g_stats.blocksLive=0;
+    // The shadow may describe memory attributes that no longer exist: drop
+    // ownership so the next block entry re-reads the interpreter (I5).
+    g_state[0].valid=0; g_state[1].valid=0;
+}
+// P12: Memory::updateMap9/updateMap7 must call this (see companion patch).
+// Both the window policy registers and the helper fast path read it, and the
+// values are baked into emitted blocks, so a call here must be followed by a
+// flush (which updateMap* does anyway when the map changes).
+void setMemWindow(int cpu,uint8_t* host,uint32_t base,uint32_t size){
+    if(cpu<0||cpu>1) return;
+    g_win[cpu].host=host;
+    g_win[cpu].base=base;
+    g_win[cpu].mask=size?size-1u:0u;
+    g_state[cpu].fastBase=base;
+    g_state[cpu].fastMask=g_win[cpu].mask;
+}
+// I5: any C code that mutates the Interpreter directly must say so.
+void invalidateInterpreterView(int cpu){
+    if(cpu<0||cpu>1) return;
+    g_state[cpu].valid=0;
+}
+void invalidateInterpreterViewAll(){ invalidateInterpreterView(0); invalidateInterpreterView(1); }
 
-    for(int i=0;i<ITERS_NDS;i++){
-        uint32_t c0 = runCpu(core, 0, false);   // ARM9
-        uint32_t c1 = runCpu(core, 1, false);   // ARM7
-
-        uint32_t cyc7_in_9 = c1 * 2;
-#if JIT_CHARGE_MAX
-        uint32_t charge = (c0 > cyc7_in_9) ? c0 : cyc7_in_9;
+void flushLog(){
+    if(!g_ringLen) return;
+#if JIT_LOG_ENABLE
+    for(size_t i=0;i<g_ringLen;i+=1024){
+        char tmp[1025]; size_t n=g_ringLen-i; if(n>1024) n=1024;
+        memcpy(tmp,g_ring+i,n); tmp[n]=0; DebugLog("%s",tmp);
+    }
 #else
-        uint32_t charge = c0 + cyc7_in_9;       // serialized work = elapsed emulated time
+    (void)g_ring;
 #endif
-        if(charge == 0) charge = 8;             // both halted: idle step
-        tickInline(core, charge);
-
-        if(!core.running) return;               // updateRun()/endFrame() stopped us
+    if(g_ringDrops){
+#if JIT_LOG_ENABLE
+        DebugLog("[JIT] log ring dropped %u lines\n",g_ringDrops);
+#endif
+        g_ringDrops=0;
     }
+    g_ringLen=0;
+}
+const void* getStats(){ return &g_stats; }
 
-    logStatus(core);
+// ============================================================================
+//  Run functions — same contract as Interpreter::runCoreNds / runCoreSingle:
+//  run until core.running is cleared, then return.
+// ============================================================================
+void runJitNds(Core& core){
+    if(!g_live||!codeBuf){ Interpreter::runCoreNds(core); return; }
+
+    Interpreter& arm9=core.interpreter[0];
+    Interpreter& arm7=core.interpreter[1];
+    const bool dsi=core.dsiMode;
+    uint32_t t9=core.globalCycles, t7=core.globalCycles, dsiOdd=0;
+
+    core.running=1;
+    while(core.running){
+        uint32_t due=nextEventCycles(core);
+        bool early=false;
+        while(core.globalCycles<due){
+            bool any=false;
+            if(!arm9.halted){
+                any=true;
+                if(core.globalCycles>=t9){
+                    uint32_t c=runCpu(core,0,false);
+                    if(dsi){ c+=dsiOdd; dsiOdd=c&1u; c>>=1; }
+                    t9=core.globalCycles+c;
+                }
+            }
+            if(!arm7.halted){
+                any=true;
+                if(core.globalCycles>=t7) t7=core.globalCycles+(runCpu(core,1,false)<<1);
+            }
+            if(!any){ core.globalCycles=due; break; }        // both halted
+            const uint32_t n9=arm9.halted?0xFFFFFFFFu:t9;
+            const uint32_t n7=arm7.halted?0xFFFFFFFFu:t7;
+            const uint32_t next=(n9<n7)?n9:n7;
+            if(next>core.globalCycles) core.globalCycles=next;
+            if(!core.running){ early=true; break; }          // updateRun() inside a block
+        }
+        if(early) break;
+        if(due==0xFFFFFFFFu) break;
+        core.globalCycles=due;
+        runDueTasks(core);
+        // RESET_CYCLES rebased everything: rebase our local targets too.
+        if(core.globalCycles<due){
+            const uint32_t d=due-core.globalCycles;
+            t9=(t9>d)?t9-d:0u;
+            t7=(t7>d)?t7-d:0u;
+        }
+    }
 }
 
 void runJitGba(Core& core){
-    if(!g_jitLive||!codeBuf){Interpreter::runCoreSingle<true,0>(core);return;}
+    if(!g_live||!codeBuf){ Interpreter::runCoreSingle<true,0>(core); return; }
+    Interpreter& cpu=core.interpreter[1];
 
-    for(int i=0;i<ITERS_GBA;i++){
-        uint32_t c = runCpu(core, 1, true);
-        if(c == 0) c = 8;                       // halted: idle step so VBlank can fire
-        tickInline(core, c);
-        if(!core.running) return;
+    core.running=1;
+    while(core.running){
+        const uint32_t due=nextEventCycles(core);
+        bool early=false;
+        while(!cpu.halted && core.globalCycles<due){
+            core.globalCycles+=runCpu(core,1,true);
+            if(!core.running){ early=true; break; }
+        }
+        if(early) break;
+        if(due==0xFFFFFFFFu) break;
+        core.globalCycles=due;
+        runDueTasks(core);
     }
-
-    logStatus(core);
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Init / shutdown
-// ═══════════════════════════════════════════════════════════════════════
+// ============================================================================
+//  Init / shutdown
+// ============================================================================
 bool initJit(Core* core){
-    g_jitLive=false;codeBuf=nullptr;
+    g_live=false; codeBuf=nullptr;
     void* raw=memalign(32,JIT_BYTES);
-    if(!raw){printf("[JIT] memalign failed\n");return false;}
+    if(!raw){ printf("[JIT] memalign failed\n"); return false; }
     uintptr_t addr=(uintptr_t)raw;
-    bool ok=(addr>=0x80000000u&&addr+JIT_BYTES<=0x81800000u);
-    if(!ok&&addr<0x01800000u){addr|=0x80000000u;ok=(addr+JIT_BYTES<=0x81800000u);}
-    else if(!ok&&addr>=0xC0000000u&&addr<0xC1800000u){addr-=0x40000000u;ok=(addr+JIT_BYTES<=0x81800000u);}
-    if(!ok){printf("[JIT] not in MEM1: %p\n",raw);free(raw);return false;}
+    bool ok=(addr>=0x80000000u && addr+JIT_BYTES<=0x81800000u);
+    if(!ok && addr<0x01800000u){ addr|=0x80000000u; ok=(addr+JIT_BYTES<=0x81800000u); }
+    else if(!ok && addr>=0xC0000000u && addr<0xC1800000u){ addr-=0x40000000u; ok=(addr+JIT_BYTES<=0x81800000u); }
+    if(!ok){ printf("[JIT] buffer not in MEM1: %p\n",raw); free(raw); return false; }
     uintptr_t tr=(uintptr_t)(void*)executeBlock_asm;
-    if(tr<0x80000000u||tr>=0x81800000u){printf("[JIT] bad trampoline %p\n",(void*)tr);free(raw);return false;}
-    codeBuf=(uint32_t*)addr;codePos=0;cacheGen=0;
-    g_fbLogCount=0;
-    g_totalFB[0]=g_totalFB[1]=0;
-    g_totalJIT[0]=g_totalJIT[1]=0;
-    g_statusTick=0;
-    g_useCounter=0;
-    memset(g_evCount,0,sizeof(g_evCount));
-    g_irqCount[0]=g_irqCount[1]=0;
-    for(size_t i=0;i<CSIZ*2;i++)cache[i].valid=false;
-    memset(g_pageSeen,0,sizeof(g_pageSeen));
-    memset(g_exitPC,  0,sizeof g_exitPC);
-    memset(g_exitCPSR,0,sizeof g_exitCPSR);
-    g_exitReason[0]=g_exitReason[1]=EXIT_FALLBACK;
-#if JIT_WATCHDOG
-    g_ringIdx=0;
-    g_samePC[0]=g_samePC[1]=~0u;
-    g_sameCount[0]=g_sameCount[1]=0;
-#endif
-#if JIT_DIFF
-    g_diffBudget=JIT_DIFF_BLOCKS;
-#endif
+    if(tr<0x80000000u||tr>=0x81800000u){ printf("[JIT] bad trampoline %p\n",(void*)tr); free(raw); return false; }
+
+    codeBuf=(uint32_t*)addr; codePos=0; cacheGen=1;
     memset(codeBuf,0,JIT_BYTES);
-    DCFlushRange(codeBuf,JIT_BYTES);
-    ICInvalidateRange(codeBuf,JIT_BYTES);
-    g_jitLive=true;
-    printf("[JIT] ready buf=%p (%zuKB) tramp=%p BLK_ARMS=%zu\n",
-           (void*)codeBuf,JIT_BYTES>>10,(void*)tr,BLK_ARMS);
-    DebugLog("[JIT] init buf=%p tramp=%p BLK_ARMS=%zu long=%d regShiftC=%d thumbAluC=%d diff=%d\n",
-             (void*)codeBuf,(void*)tr,BLK_ARMS,JIT_LONG_BLOCKS,JIT_REG_SHIFT_CARRY,
-             JIT_THUMB_ALU_CARRY,JIT_DIFF);
-    if(core)core->setRunFunc(core->gbaMode?runJitGba:runJitNds);
+    DCFlushRange(codeBuf,JIT_BYTES); ICInvalidateRange(codeBuf,JIT_BYTES);
+    flushJitCache();
+    memset(&g_stats,0,sizeof g_stats);
+    g_ringLen=0; g_ringDrops=0;
+    for(int i=0;i<2;i++){
+        memset(&g_state[i],0,sizeof g_state[i]);
+        g_state[i].valid=0;
+        g_state[i].reason=EXIT_FALLBACK;
+        g_state[i].budget=512;
+    }
+    g_live=true;
+    printf("[JIT] ready buf=%p (%uKB) tramp=%p chain=%d shadow=%d inline=%d\n",
+           (void*)codeBuf,(unsigned)(JIT_BYTES>>10),(void*)tr,
+           (int)JitCfg::kChain,(int)JitCfg::kShadow,(int)JitCfg::kInlineCond);
+    if(core) core->setRunFunc(core->gbaMode?runJitGba:runJitNds);
     return true;
 }
-
 void shutdownJit(Core* core){
-    DebugLog("[JIT] shutdown fb0=%u fb1=%u jit0=%u jit1=%u\n",
-             g_totalFB[0],g_totalFB[1],g_totalJIT[0],g_totalJIT[1]);
-    g_jitLive=false;
-    if(core)core->setRunFunc(core->gbaMode
-        ?static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true,0>)
-        :&Interpreter::runCoreNds);
-    codeBuf=nullptr;codePos=0;
-    for(size_t i=0;i<CSIZ*2;i++)cache[i].valid=false;
-    memset(g_pageSeen,0,sizeof(g_pageSeen));
+    g_live=false;
+    if(core) core->setRunFunc(core->gbaMode
+        ? static_cast<void(*)(Core&)>(&Interpreter::runCoreSingle<true,0>)
+        : &Interpreter::runCoreNds);
+    codeBuf=nullptr; codePos=0;
+    for(size_t i=0;i<CSIZ;i++){ cache[i].valid=false; cache[i].linkCount=0; }
+    memset(g_pageBlocks,0,sizeof g_pageBlocks);
+    g_pending.clear();
+    invalidateInterpreterViewAll();
 }
-
-// F8: invalidation is O(1) unless the page ever held compiled code.
-void invalidateJitRange(uint32_t start,uint32_t end){
-#if JIT_INVALIDATE
-    if(start>=PAGE_BITS_BYTES)return;
-    if(end>PAGE_BITS_BYTES)end=PAGE_BITS_BYTES;
-    bool any=false;
-    for(uint32_t p=start&~0xFFFu;p<end;p+=0x1000u)
-        if(g_pageSeen[pageIdx(p)]){any=true;g_pageSeen[pageIdx(p)]=0;}
-    if(!any)return;
-    for(size_t i=0;i<CSIZ*2;i++){
-        JitBlock& s=cache[i];
-        if(s.valid&&s.armPC<end&&s.endPC>start)s.valid=false;
-    }
-#else
-    (void)start;(void)end;
-#endif
-}
-
 } // namespace JitPpc
+
+/* ============================================================================
+ *  COMPANION PATCHES — the only edits needed outside this file
+ * ============================================================================
+ *
+ * 1) jit_ppc.h — add:
+ *      namespace JitPpc {
+ *          void setMemWindow(int cpu, uint8_t* host, uint32_t base, uint32_t size);
+ *          void invalidateInterpreterView(int cpu);
+ *          void invalidateInterpreterViewAll();
+ *          void flushLog();
+ *          const void* getStats();
+ *      }
+ *
+ * 2) cp15.cpp — P7b, the half that stops stale blocks and IRQ livelocks:
+ *      void Cp15::write(int op1, int crn, int crm, uint32_t value){
+ *          switch (crn) {
+ *              case 1: case 2: case 3: case 5: case 6: case 9:   // control, TTB,
+ *              case 7:                                          // DAC, PU, TCM,
+ *                  JitPpc::flushJitCache();                     // cache maint.
+ *                  break;
+ *              default: break;
+ *          }
+ *          ...existing body...
+ *      }
+ *    Rationale: MCR p15,0,Rt,c7,c5,0 is the guest saying "I just wrote code"
+ *    (that is exactly the op right before your IRQ storm's SWI stub).
+ *
+ * 3) memory.cpp — P12 window + invalidation coverage:
+ *      // in Memory::updateMap9 / updateMap7, after rebuilding the map:
+ *      JitPpc::setMemWindow(0, mainRamHostPtr9, 0x02000000u, 0x00400000u);
+ *      JitPpc::setMemWindow(1, wramHostPtr7, 0x03000000u, 0x00800000u);
+ *      JitPpc::flushJitCache();          // the window is baked into blocks (I7)
+ *      // and in every guest-visible write path that is not already covered:
+ *      Core::invalidateJitPage(addr);    // DMA, ITCM/DTCM, cart writes,
+ *                                        // HLE/BIOS patching, save loading
+ *
+ * 4) core.cpp — logging + shadow ownership hygiene:
+ *      void Core::endFrame(){ ... JitPpc::flushLog(); ... }        // P10
+ *      void Core::enterGbaMode(){ ... JitPpc::invalidateInterpreterViewAll();
+ *                                      JitPpc::flushJitCache(); ... }
+ *      void Core::loadState(FILE* f){ ... JitPpc::invalidateInterpreterViewAll(); }
+ *      // also anywhere else C mutates Interpreter directly (HLE, directBoot).
+ *
+ * 5) P9 optional (removes std::vector traffic from the hot loop):
+ *      in core.h:  static const size_t MAX_EVENTS = MAX_TASKS + 4;
+ *                  SchedEvent events[MAX_EVENTS]; int evCount = 0;
+ *      Core::schedule(): shift-insert keeping insertion order for ties;
+ *      runDueTasks():    head-pop, bounded by evCount;
+ *      saveState/loadState: count + first evCount entries.
+ *      Then build with -DJIT_HAVE_FIXED_SCHED=1.
+ *
+ * 6) P10 signature verification: build with kVerifyBlocks=true and play for a
+ *    minute.  Any [JIT] STALE line names a PC whose block survived a guest code
+ *    write, i.e. a hole in (3).  Zero STALE lines = coverage is complete.
+ *
+ * 7) Arm7 HLE: hleArm7 runs guest ARM7 code; it must call
+ *    JitPpc::invalidateInterpreterView(1) whenever it touches Interpreter[1].
+ *
+ * HOW TO READ THE GENERATED CODE (when it misbehaves)
+ *    - entry from C: [prologue][valid check -> takeOver][reload][body]... [exit]
+ *    - entry from a chain: jumps straight to a body label; only the head of the
+ *      chain has a frame, and only the head's epilogue returns.
+ *    - every body ends in one of: link `b`, budget bb, exit-to-C (stores the
+ *      whole shadow and blr).
+ *    - a conditional PC write compiles to: flag=0, skip-over-body, body,
+ *      writeback, flag test (outside the skip), exit-or-continue.
+ * ============================================================================ */
