@@ -1,3 +1,7 @@
 Interesting version by deepseek-v4pt1-flash released sep 9 2026. matches claude opus 5 in terminal bench v2.v1 with a 90/100 score.
 
 Gets 50-60 fps in rockwrestler.nds but it does not display the entire screen properly. also, gba roms don't load, although the black screen is 60fps. neat results. 
+*review of jrec7 above
+
+jrec13 review below (13 opus "fixed" by deepseek v4.1-flash-max on code variant
+worse than jrec7 in all ways. only 4 fps and doesn't even load rockwrestler.nds
