@@ -2542,7 +2542,7 @@ static JitBlock* compile(Interpreter* interp, Core* core,
     if (ctx.base[ctx.sz() - 1] != ppc_blr()) return nullptr;   // frame not balanced
 
     const size_t wds = ctx.sz();
-    flushICache(ctx.base, wds);
+    flushJitCache(ctx.base, wds);
 
     slot.armPC  = pc0;
     slot.endPC  = ctx.endPC;
