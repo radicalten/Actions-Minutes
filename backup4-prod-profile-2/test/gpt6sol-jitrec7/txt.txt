@@ -1,1 +1,1 @@
-
+refused to produce any program at all for jitrec7, made one fo jitrec13opus but asked me to implement the changes myself.
