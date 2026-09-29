@@ -1,3 +1,9 @@
+Result of round 1 of prompt2 in agent mode in lmarena ai 9-29-26. seems to run forever this took 30m then let me continue the prompt. 
+
+prompt2:
+I would like to add an armv4 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
+
+
 # ARM→PowerPC recompiler: status and continuation notes
 
 This file tracks the state of the JIT work in this directory. It is meant to be
