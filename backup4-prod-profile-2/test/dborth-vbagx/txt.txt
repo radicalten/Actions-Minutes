@@ -20,3 +20,7 @@ trouble is there is no easy way to download everything at once, but its ok. will
 
 the second round produced nothing after 38 minutes. asked it to:
 please continue to complete the jit_compiler.cpp and associated files. kindly bundle the changed files in a single location
+
+third round produced nothing after another 38 minutes. (likely need to borrow mayo1990's claude skills.md) however now I can download the zip file of the entire workspace by x ing out the current view file and it lets me download the workspace itself. on round 1 it was 20MB in size now it is 23.4MB. it says 23.4/128.0MB which must mean the largest size is 128.0MB. 
+
+Trying a fourth round now. 
