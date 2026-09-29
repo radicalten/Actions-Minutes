@@ -11,3 +11,9 @@ prompt2:
 I would like to add an armv4 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
 
 using "agent mode" on prompt2 in lm arena ai. It does not specify which model is being used 9-29-26. 
+
+
+using agent mode in arena ai seems to have no token limit. apparently it was introduced june 5 2026. 
+on prompt2 it worked on the prompt for 30min then provided some jit files, but not all of them. I asked it to continue working and it is. 
+trouble is there is no easy way to download everything at once, but its ok. will just let the program run forever, telling it to continue until everything is sorted out. 
+9-29-26.
