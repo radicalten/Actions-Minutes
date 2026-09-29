@@ -9,3 +9,5 @@ implement-armv4-jit-recompiler folder is the react website by cson4.6 with the a
 
 prompt2:
 I would like to add an armv4 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
+
+using "agent mode" on prompt2 in lm arena ai. It does not specify which model is being used 9-29-26. 
