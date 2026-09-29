@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>JIT Repair | ARM to PPC source patcher</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <style>
+    :root { color-scheme: dark; --bg: #111513; --surface: #1a201c; --line: #354039; --text: #eef2e9; --muted: #a7b5a9; --accent: #c7ed6c; }
+    * { box-sizing: border-box; }
+    body { margin: 0; background: var(--bg); color: var(--text); font-family: Arial, Helvetica, sans-serif; }
+    body::before { content: ''; position: fixed; inset: 0; pointer-events: none; opacity: .16; background-image: linear-gradient(to right, transparent 99.8%, #5b715e 100%); background-size: 80px 80px; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    .shell { max-width: 1380px; margin: 0 auto; padding: 0 48px; }
+    .mast { border-bottom: 1px solid var(--line); }
+    .brandmark { display: inline-grid; place-items: center; width: 38px; height: 38px; border: 1px solid var(--accent); color: var(--accent); font-weight: 800; font-size: 16px; letter-spacing: -.1em; }
+    .eyebrow { color: var(--accent); font-size: 11px; letter-spacing: .2em; font-weight: 700; text-transform: uppercase; }
+    .hero-title { font-size: clamp(58px, 8.5vw, 132px); font-weight: 800; line-height: .84; letter-spacing: -.085em; margin: 22px 0 24px; }
+    .hero-title span { color: var(--accent); }
+    .lead { color: var(--muted); font-size: clamp(17px, 1.6vw, 21px); line-height: 1.55; max-width: 710px; }
+    .notice { border-left: 2px solid var(--accent); padding: 4px 0 4px 18px; color: #d4ded0; font-size: 14px; line-height: 1.6; max-width: 820px; }
+    .divider { height: 1px; background: var(--line); }
+    .workbench { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 22px; }
+    .editor { display: flex; flex-direction: column; min-width: 0; border: 1px solid var(--line); background: #171d19; }
+    .editor-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 16px 18px; border-bottom: 1px solid var(--line); }
+    textarea { width: 100%; min-height: 480px; resize: vertical; padding: 22px; border: 0; outline: none; background: transparent; color: #dce8d8; font-size: 12px; line-height: 1.65; tab-size: 4; white-space: pre; }
+    textarea::placeholder { color: #718475; }
+    textarea:focus-visible { box-shadow: inset 0 0 0 1px var(--accent); }
+    .button { border: 1px solid var(--accent); background: var(--accent); color: #162012; min-height: 46px; padding: 0 22px; font-weight: 800; font-size: 12px; text-transform: uppercase; letter-spacing: .09em; cursor: pointer; transition: transform .18s, background .18s, color .18s; }
+    .button:hover:not(:disabled) { transform: translateY(-2px); background: #e0ffa0; }
+    .button:disabled { cursor: not-allowed; opacity: .45; }
+    .button.secondary { background: transparent; color: var(--accent); }
+    .button.secondary:hover:not(:disabled) { background: #243024; }
+    .toggle { display: inline-flex; align-items: flex-start; gap: 12px; cursor: pointer; color: #d1ded0; font-size: 14px; line-height: 1.5; }
+    .toggle input { width: 18px; height: 18px; margin: 2px 0 0; accent-color: var(--accent); flex: none; }
+    .finding { display: grid; grid-template-columns: 36px 1fr auto; gap: 18px; padding: 20px 0; border-top: 1px solid var(--line); align-items: start; }
+    .finding-num { color: var(--accent); font-size: 12px; }
+    .finding h3 { font-weight: 700; font-size: 16px; margin: 0 0 5px; }
+    .finding p { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+    .tag { color: var(--accent); font-size: 11px; text-transform: uppercase; letter-spacing: .12em; white-space: nowrap; }
+    .tag.warn { color: #f5c48a; }
+    .status { min-height: 23px; color: var(--muted); font-size: 13px; }
+    .status.error { color: #ffc093; }
+    .status.good { color: var(--accent); }
+    .reveal { animation: arrive .7s both; }
+    .reveal-late { animation: arrive .85s .12s both; }
+    .result-flash { animation: flash .8s ease-out; }
+    .progress { height: 2px; width: 0; background: var(--accent); transition: width .65s ease; }
+    @keyframes arrive { from { opacity: 0; transform: translateY(18px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes flash { 0% { box-shadow: 0 0 0 2px var(--accent); } 100% { box-shadow: 0 0 0 0 transparent; } }
+    @media (max-width: 800px) { .shell { padding: 0 22px; } .workbench { grid-template-columns: 1fr; } textarea { min-height: 330px; } .hero-title { letter-spacing: -.07em; } .finding { grid-template-columns: 28px 1fr; } .tag { grid-column: 2; } }
+    @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation-duration: .01ms !important; transition-duration: .01ms !important; } }
+  </style>
+</head>
+<body>
+  <header class="mast">
+    <div class="shell flex items-center justify-between py-5 gap-4">
+      <div class="flex items-center gap-3"><span class="brandmark mono">J/</span><span class="mono text-sm font-bold tracking-widest">JIT REPAIR</span></div>
+      <span class="mono text-[11px] tracking-widest text-[#a7b5a9] hidden sm:inline">ARM7 / ARM9 &rarr; BROADWAY PPC</span>
+      <a href="#workbench" class="mono text-xs text-[#c7ed6c] hover:underline">OPEN WORKBENCH &darr;</a>
+    </div>
+  </header>
+
+  <main>
+    <section class="shell pt-16 pb-14 md:pt-24 md:pb-20 reveal">
+      <div class="eyebrow mono">Correctness before throughput / 01</div>
+      <h1 class="hero-title">JIT<span> / </span>REPAIR</h1>
+      <p class="lead">A focused source patcher for your Wii ARM-to-PPC recompiler. Keep the working GBA JIT, isolate the unstable NDS path, and fix three concrete instruction bugs.</p>
+      <p class="notice mt-8">The original <code class="mono">jit_ppc.cpp</code> is not present in this workspace. Paste your complete file below to generate a patched <code class="mono">jit_ppc.cpp</code>. No source is uploaded; transformation happens in your browser.</p>
+    </section>
+
+    <div class="divider"></div>
+
+    <section id="workbench" class="shell py-12 md:py-16 reveal-late">
+      <div class="flex flex-wrap items-end justify-between gap-4 mb-8">
+        <div><div class="eyebrow mono mb-3">Source transformation / 02</div><h2 class="text-3xl md:text-4xl font-bold tracking-tight">Patch workbench</h2></div>
+        <span class="mono text-xs text-[#a7b5a9]">INPUT: jit_ppc.cpp &nbsp; / &nbsp; OUTPUT: jit_ppc.cpp</span>
+      </div>
+
+      <div class="workbench">
+        <div class="editor">
+          <div class="editor-head"><label for="source" class="mono text-xs tracking-wider font-bold">01 / ORIGINAL SOURCE</label><span id="inputCount" class="mono text-xs text-[#a7b5a9]">0 lines</span></div>
+          <textarea id="source" class="mono" spellcheck="false" aria-label="Original jit_ppc.cpp source" placeholder="Paste the complete contents of jit_ppc.cpp here..." ></textarea>
+        </div>
+        <div class="editor" id="resultPanel">
+          <div class="editor-head"><label for="output" class="mono text-xs tracking-wider font-bold">02 / PATCHED SOURCE</label><span id="outputCount" class="mono text-xs text-[#a7b5a9]">Waiting for source</span></div>
+          <textarea id="output" class="mono" spellcheck="false" readonly aria-label="Patched jit_ppc.cpp source" placeholder="Validated output will appear here..."></textarea>
+        </div>
+      </div>
+      <div id="progress" class="progress" aria-hidden="true"></div>
+
+      <div class="flex flex-col lg:flex-row lg:items-center justify-between gap-6 mt-7">
+        <label class="toggle max-w-2xl"><input id="safeNds" type="checkbox" checked><span><strong>Safe NDS mode</strong> (recommended): run both NDS CPUs through the existing interpreter scheduler. GBA still uses the JIT. This sacrifices NDS JIT speed until scheduling and cycle accuracy are validated.</span></label>
+        <div class="flex flex-wrap gap-3 shrink-0">
+          <button id="patchButton" class="button">Apply patches</button>
+          <button id="copyButton" class="button secondary" disabled>Copy output</button>
+          <button id="downloadButton" class="button secondary" disabled>Download .cpp</button>
+        </div>
+      </div>
+      <p id="status" role="status" aria-live="polite" class="status mt-5 mono">Ready. Paste your complete original C++ file to begin.</p>
+      <div id="report" class="mono text-xs leading-relaxed text-[#a7b5a9] whitespace-pre-wrap" aria-live="polite"></div>
+    </section>
+
+    <div class="divider"></div>
+
+    <section class="shell py-14 md:py-20">
+      <div class="eyebrow mono mb-3">Why these changes / 03</div>
+      <h2 class="text-3xl md:text-4xl font-bold tracking-tight mb-8">Failure points</h2>
+      <div class="finding"><span class="finding-num mono">01</span><div><h3>NDS blocks overrun the scheduler</h3><p>A 48-instruction JIT block is accounted for only after it finishes. ARM9, ARM7, DMA, timers, and IRQ events can occur mid-block. The safe path preserves the interpreter's event ordering rather than claiming that a cycle estimate makes the JIT cycle-exact.</p></div><span class="tag warn mono">Safe fallback</span></div>
+      <div class="finding"><span class="finding-num mono">02</span><div><h3>Thumb BL can cross a page boundary</h3><p>A paired halfword can be compiled from the next page, while page coverage only records the first. The patch requires both halves in one page; otherwise the interpreter handles the pair.</p></div><span class="tag mono">Invalidation</span></div>
+      <div class="finding"><span class="finding-num mono">03</span><div><h3>ADC / SBC / NEG flags alias their operands</h3><p>When Thumb source and destination registers are the same, calculating V after writing the result reads the new source value. Snapshot the source before the arithmetic.</p></div><span class="tag mono">NZCV</span></div>
+      <div class="finding"><span class="finding-num mono">04</span><div><h3>Empty Thumb register lists are special</h3><p>The handwritten LDM/STM helper only advances the base register. Let the interpreter handle empty lists, which can also access memory and have architecture-specific behavior.</p></div><span class="tag mono">Fallback</span></div>
+      <p class="text-sm leading-relaxed text-[#a7b5a9] mt-10 max-w-3xl">Next: compare per-instruction registers, CPSR, PC, memory writes and cycle counts against the interpreter; then re-enable NDS JIT with an event-budgeted dispatcher. Also audit <code class="mono">resetCycles()</code> against <code class="mono">g_cpuTime</code>, ARM9 CP15 mapping, IRQ entry, and banked-register mode changes. This patcher deliberately does not claim to solve those unverified paths.</p>
+    </section>
+  </main>
+  <footer class="border-t border-[#354039]"><div class="shell py-7 flex flex-wrap gap-3 justify-between mono text-xs text-[#a7b5a9]"><span>JIT REPAIR / LOCAL-ONLY SOURCE TOOL</span><span>Review the diff and test on hardware before shipping.</span></div></footer>
+
+  <script>
+    const source = document.getElementById('source');
+    const output = document.getElementById('output');
+    const safeNds = document.getElementById('safeNds');
+    const status = document.getElementById('status');
+    const report = document.getElementById('report');
+    const progress = document.getElementById('progress');
+    const resultPanel = document.getElementById('resultPanel');
+    const copyButton = document.getElementById('copyButton');
+    const downloadButton = document.getElementById('downloadButton');
+    const countLines = text => text ? text.split('\n').length.toLocaleString() + ' lines' : '0 lines';
+
+    // Replace exactly once: refusing partial output is safer than silently patching a different revision.
+    function replaceOnce(text, before, after, label) {
+      const first = text.indexOf(before);
+      if (first < 0) throw new Error(label + ': original code not found. Confirm this is the supplied revision.');
+      if (text.indexOf(before, first + before.length) >= 0) throw new Error(label + ': original code appears more than once.');
+      return text.slice(0, first) + after + text.slice(first + before.length);
+    }
+
+    function replaceFunction(text, signature, replacement, label) {
+      const start = text.indexOf(signature);
+      if (start < 0 || text.indexOf(signature, start + signature.length) >= 0) throw new Error(label + ': unique function not found.');
+      const open = text.indexOf('{', start + signature.length);
+      if (open < 0) throw new Error(label + ': function body not found.');
+      let depth = 0, end = -1;
+      for (let i = open; i < text.length; i++) {
+        if (text[i] === '{') depth++;
+        if (text[i] === '}' && --depth === 0) { end = i + 1; break; }
+      }
+      if (end < 0) throw new Error(label + ': unterminated function body.');
+      return text.slice(0, start) + replacement + text.slice(end);
+    }
+
+    function patch(text, safe) {
+      const applied = [];
+      if (!text.includes('namespace JitPpc {') || !text.includes('static uint32_t* compileBlock(') || !text.includes('void runJitNds(Core& core)')) {
+        throw new Error('This does not look like the complete jit_ppc.cpp supplied in the request.');
+      }
+      if (safe) {
+        text = replaceFunction(text, 'void runJitNds(Core& core)',
+          'void runJitNds(Core& core) {\n    // NDS JIT blocks currently cross DMA/IRQ/scheduler deadlines.\n    // Preserve interpreter ordering until cycle-budgeted blocks are implemented.\n    if (core.dsiMode) Interpreter::runCoreDsi(core);\n    else              Interpreter::runCoreNds(core);\n}', 'Safe NDS scheduler');
+        applied.push('Safe NDS dispatch: interpreter for NDS/DSi, GBA JIT unchanged.');
+      }
+
+      text = replaceOnce(text,
+        'if (((op >> 11) & 0x1F) == 0x1E && validPC(curPC + 2, gba, arm7)) {',
+        'if (((op >> 11) & 0x1F) == 0x1E &&\n                (curPC & ~0xFFFu) == ((curPC + 2u) & ~0xFFFu) &&\n                validPC(curPC + 2u, gba, arm7)) {', 'Thumb BL page boundary');
+      applied.push('Thumb BL pairing restricted to the current covered page.');
+
+      text = replaceOnce(text,
+        'case 0xC:  return JC_ON(JC_T_STACK) && emitT_ldmStm(ctx, op, curPC);',
+        'case 0xC:  return (op & 0xFFu) && JC_ON(JC_T_STACK) && emitT_ldmStm(ctx, op, curPC);',
+        'Empty Thumb LDM/STM');
+      applied.push('Empty Thumb LDM/STM list delegated to interpreter.');
+
+      text = replaceOnce(text,
+        'ctx.E(ppc_mr(TB, d)); ctx.E(ppc_adde(d, TB, s));\n            setNZ(ctx, d); setC_xer(ctx); setV_add(ctx, d, TB, s); break;',
+        'ctx.E(ppc_mr(TB, d)); ctx.E(ppc_mr(TA, s)); ctx.E(ppc_adde(d, TB, TA));\n            setNZ(ctx, d); setC_xer(ctx); setV_add(ctx, d, TB, TA); break;',
+        'Thumb ADC V flag');
+      text = replaceOnce(text,
+        'ctx.E(ppc_mr(TB, d)); ctx.E(ppc_subfe(d, s, TB));\n            setNZ(ctx, d); setC_xer(ctx); setV_sub(ctx, d, TB, s); break;',
+        'ctx.E(ppc_mr(TB, d)); ctx.E(ppc_mr(TA, s)); ctx.E(ppc_subfe(d, TA, TB));\n            setNZ(ctx, d); setC_xer(ctx); setV_sub(ctx, d, TB, TA); break;',
+        'Thumb SBC V flag');
+      text = replaceOnce(text,
+        'ctx.E(ppc_addi(TA, 0, 0)); ctx.E(ppc_subfc(d, s, TA));\n            setNZ(ctx, d); setC_xer(ctx); setV_sub(ctx, d, TA, s); break;',
+        'ctx.E(ppc_addi(TA, 0, 0)); ctx.E(ppc_mr(TB, s)); ctx.E(ppc_subfc(d, TB, TA));\n            setNZ(ctx, d); setC_xer(ctx); setV_sub(ctx, d, TA, TB); break;',
+        'Thumb NEG V flag');
+      applied.push('Thumb ADC/SBC/NEG operand snapshots keep overflow flags correct for Rd == Rs.');
+
+      // The safety path uses the interpreter, but this also fixes DSi dispatch if the guard is reached.
+      if (!safe) {
+        text = replaceOnce(text,
+          'if (!g_jitLive || !codeBuf || core.dsiMode) {\n        Interpreter::runCoreNds(core);\n        return;\n    }',
+          'if (core.dsiMode) { Interpreter::runCoreDsi(core); return; }\n    if (!g_jitLive || !codeBuf) { Interpreter::runCoreNds(core); return; }',
+          'DSi fallback');
+        applied.push('DSi fallback dispatch corrected; experimental NDS JIT still not event-safe.');
+      }
+      return { text, applied };
+    }
+
+    function resetOutput() {
+      output.value = '';
+      document.getElementById('outputCount').textContent = 'Waiting for source';
+      copyButton.disabled = downloadButton.disabled = true;
+      progress.style.width = '0';
+    }
+    source.addEventListener('input', () => {
+      document.getElementById('inputCount').textContent = countLines(source.value);
+      resetOutput();
+      report.textContent = '';
+      status.textContent = 'Source changed. Apply patches to regenerate output.';
+      status.className = 'status mt-5 mono';
+    });
+    safeNds.addEventListener('change', () => {
+      resetOutput(); report.textContent = '';
+      status.textContent = 'Mode changed. Apply patches to regenerate output.';
+      status.className = 'status mt-5 mono';
+    });
+
+    document.getElementById('patchButton').addEventListener('click', () => {
+      try {
+        if (!source.value.trim()) throw new Error('Paste the original jit_ppc.cpp before applying patches.');
+        const result = patch(source.value, safeNds.checked);
+        output.value = result.text;
+        document.getElementById('outputCount').textContent = countLines(result.text);
+        copyButton.disabled = downloadButton.disabled = false;
+        status.textContent = result.applied.length + ' changes applied. Review the output, then download jit_ppc.cpp.';
+        status.className = 'status good mt-5 mono';
+        report.textContent = result.applied.map((item, i) => String(i + 1).padStart(2, '0') + '  ' + item).join('\n');
+        progress.style.width = '100%';
+        resultPanel.classList.remove('result-flash');
+        void resultPanel.offsetWidth;
+        resultPanel.classList.add('result-flash');
+      } catch (error) {
+        resetOutput(); report.textContent = '';
+        status.textContent = error.message + ' No partial output was produced.';
+        status.className = 'status error mt-5 mono';
+      }
+    });
+    copyButton.addEventListener('click', async () => {
+      try {
+        await navigator.clipboard.writeText(output.value);
+        status.textContent = 'Patched source copied to clipboard.';
+        status.className = 'status good mt-5 mono';
+      } catch (_) {
+        output.focus(); output.select();
+        status.textContent = 'Clipboard unavailable. Output selected for manual copying.';
+        status.className = 'status mt-5 mono';
+      }
+    });
+    downloadButton.addEventListener('click', () => {
+      const url = URL.createObjectURL(new Blob([output.value], { type: 'text/x-c++src;charset=utf-8' }));
+      const a = document.createElement('a'); a.href = url; a.download = 'jit_ppc.cpp'; a.click();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    });
+  </script>
+</body>
+</html>
