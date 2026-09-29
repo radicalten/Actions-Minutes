@@ -231,3 +231,7 @@ No debugger available. Build a `debug` target and read SD logs:
 - **TA search-path ordering:** `BASEGAME` must stay `"baseq3"`. Setting it to `"missionpack"` puts baseq3 at the head of the search path and its `ui.qvm` (API v4) shadows missionpack's (API v6) — the TA menu never appears.
 - **`r_lodbias`** does not reduce memory use — it only selects an already-loaded LoD tier. It cannot fix the "Memory is low / deferred model" issue.
 
+
+
+======
+Prompt3 with new AGENTS.md file v1:
