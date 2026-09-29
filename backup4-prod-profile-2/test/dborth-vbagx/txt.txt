@@ -1,4 +1,5 @@
 Prompt 9-29-26 for gpt6sol or equivalent code on lmarena ai 
 Using source code for noods-wii v1.5 (equal to noods-wii-9-5-clean-gold3 or backup4-prod-profile)
 
+prompt: (failed on gpt6sol, it refused) (claude-sonnet-4.6 accepts the query:)
 I would like to add an armv4 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba
