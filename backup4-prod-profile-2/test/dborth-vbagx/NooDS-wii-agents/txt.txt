@@ -120,3 +120,8 @@ No debugger available. Build a `debug` target and read SD logs:
 Prompt3 using attached AGENTS.md v1 in lmarena ai agents mode: 
 I would like to add an armv4 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
 Please refer to the attached AGENTS.md file for additional information. 
+
+
+**Note! I did not utilize the hardened skill module Mayo1990 mentioned on GBAtemp, will likely need to redo with that skill included**
+https://gbatemp.net/threads/ioquake3-wii.681264/
+"Hardened code's skill module is mandatory. Without it, AI will hallucinate a lot and will either introduce issues or regressions."
