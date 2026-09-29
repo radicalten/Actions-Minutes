@@ -3,4 +3,4 @@ Plays SMW GBA at 20fps, no problem although it skips the bios for whatever reaso
 
 by the way lm arena made gpt6sol free for one day today sep 29 2026 which is how I am testing. 
 
-putting the bios in and testing all the games, now wolveslayer runs at 7fps. none of the other games do though for nds (and testing all deepseekv4pt1 versions none of those could launch an nds game. however mkds still doesn not run on this one.
+putting the bios in and testing all the games, now wolveslayer runs at 7fps with dolphin fps at 60. My previous best attempt was 6fps wolveslayer 50fps dolphin (not fullspeed). none of the other games do though for nds (and testing all deepseekv4pt1 versions none of those could launch an nds game. however mkds still doesn not run on this one.
