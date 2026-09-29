@@ -114,3 +114,9 @@ No debugger available. Build a `debug` target and read SD logs:
 - **TA also reclaims 1 hunk MB.** `wii_main.c` drops the `-1 MB` JIT bump-headroom margin from `hunk_mb` when `STANDALONETA && !WII_VM_NATIVE`. The interpreter alone was ~192 KB short of loading a mission-pack map; the reclaimed MB covers it.
 - **TA search-path ordering:** `BASEGAME` must stay `"baseq3"`. Setting it to `"missionpack"` puts baseq3 at the head of the search path and its `ui.qvm` (API v4) shadows missionpack's (API v6) — the TA menu never appears.
 - **`r_lodbias`** does not reduce memory use — it only selects an already-loaded LoD tier. It cannot fix the "Memory is low / deferred model" issue.
+
+
+=====
+Prompt3 using attached AGENTS.md v1 in lmarena ai agents mode: 
+I would like to add an armv4 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
+Please refer to the attached AGENTS.md file for additional information. 
