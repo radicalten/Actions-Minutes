@@ -143,3 +143,15 @@ which seems reasonable.
 Prompt5 using attached AGENTS.md (AGENTS-v0-preflight.md aka v2)  and hardened skill's SKILL.md in lmarena ai agents mode: 
 I would like to add an armv4/v5 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Please bundle these all in a convenient location along with a write up of the work you have done. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
 Please refer to the attached AGENTS.md file and SKILL.md for additional information. 
+
+gave up after 13m sadly. will likely need another approach? 
+
+Prompt6 using attached AGENTS.md (AGENTS-v0-preflight.md aka v2)  and hardened skill's SKILL.md in lmarena ai agents mode: 
+I would like to add an armv4/v5 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that exceeds the functionality of dborth's vbagx (thumb only) jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Please bundle these all in a convenient location along with a write up of the work you have done. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
+Please refer to the attached AGENTS.md file and SKILL.md for additional information. SKILL.md has one instruction to not Hand Code in orchestration mode, you may ignore that directive as your sandbox does not allow you to spawn subagents as recommended in SKILL.md. 
+
+====
+detour prompts:
+is it possible for you to install the devkitppc runtime to run code for wii?
+continuation
+can you write a short agents.md file on how to quickly install the devkitppc environment here?
