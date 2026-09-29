@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>JIT Lab | ARM to PPC repair workbench</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <style>
+    :root { color-scheme: dark; --bg:#0b1014; --panel:#111a1f; --line:#29363a; --muted:#8b9b9f; --text:#e5ede8; --mint:#b6f3ce; --orange:#ffb88a; }
+    * { box-sizing:border-box; }
+    html { scroll-behavior:smooth; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:Arial,Helvetica,sans-serif; }
+    .mono, code, pre, textarea { font-family:ui-monospace,SFMono-Regular,Consolas,"Liberation Mono",monospace; }
+    .grid-bg { background-image:linear-gradient(rgba(170,222,195,.035) 1px,transparent 1px),linear-gradient(90deg,rgba(170,222,195,.035) 1px,transparent 1px); background-size:40px 40px; }
+    .rule { border-color:var(--line); }
+    .side-link { display:block; padding:12px 15px; color:#9eadae; border-left:2px solid transparent; font-size:13px; letter-spacing:.01em; transition:color .2s,background .2s,border-color .2s; }
+    .side-link:hover,.side-link.active { color:var(--mint); border-color:var(--mint); background:#b6f3ce0c; }
+    .tag { color:var(--mint); letter-spacing:.15em; font-size:10px; font-weight:700; text-transform:uppercase; }
+    .action { background:var(--mint); color:#0c1a13; border:1px solid var(--mint); font-weight:700; transition:transform .2s,background .2s; }
+    .action:hover { transform:translateY(-2px); background:#d1ffe0; }
+    .quiet { color:var(--text); border:1px solid #53645e; transition:border-color .2s,background .2s; }
+    .quiet:hover { border-color:var(--mint); background:#b6f3ce0b; }
+    textarea { resize:vertical; outline:none; color:#d1dfd8; background:#090e11; border:1px solid var(--line); line-height:1.65; }
+    textarea:focus { border-color:#86bca0; }
+    .tab { border-bottom:2px solid transparent; color:var(--muted); transition:color .2s,border-color .2s; }
+    .tab:hover,.tab.selected { border-color:var(--mint); color:var(--mint); }
+    pre { white-space:pre; overflow:auto; font-size:12px; line-height:1.7; tab-size:4; }
+    .fade-up { animation:rise .7s both; }
+    .fade-late { animation:rise .85s .15s both; }
+    .pulse-dot { animation:glow 2.3s infinite; }
+    @keyframes rise { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:translateY(0); } }
+    @keyframes glow { 50% { box-shadow:0 0 0 7px #b6f3ce08; opacity:.55; } }
+    @media (prefers-reduced-motion:reduce) { *,*:before,*:after { scroll-behavior:auto!important; animation:none!important; transition:none!important; } }
+  </style>
+</head>
+<body>
+  <div class="min-h-screen lg:flex">
+    <aside class="lg:w-[246px] lg:fixed lg:inset-y-0 border-b lg:border-b-0 lg:border-r rule bg-[#0c1317] z-10">
+      <div class="px-6 pt-6 pb-5 lg:pt-9 border-b rule flex lg:block items-center justify-between">
+        <a href="#top" class="block text-[27px] leading-none tracking-[-.075em] font-black">JIT<span class="text-[#b6f3ce]">/</span>LAB</a>
+        <p class="mono text-[10px] text-[#78918a] lg:mt-3 tracking-[.12em]">ARM &rarr; WII PPC / REPAIR 01</p>
+      </div>
+      <nav class="hidden lg:block py-8" aria-label="Workbench sections">
+        <div class="px-6 tag mb-4">Workbench</div>
+        <a class="side-link active" href="#diagnosis">01 &nbsp; Diagnosis</a>
+        <a class="side-link" href="#trace">02 &nbsp; Trace analyzer</a>
+        <a class="side-link" href="#patches">03 &nbsp; Source fixes</a>
+        <a class="side-link" href="#verification">04 &nbsp; Verification</a>
+      </nav>
+      <div class="hidden lg:block absolute bottom-8 left-6 right-6 border-t rule pt-5 mono text-[11px] leading-6 text-[#7e938d]">INPUT: USER-SUPPLIED TRACE<br>STATE: SOURCE FILES NOT MOUNTED<br>OUTPUT: ACTIONABLE PATCHES</div>
+    </aside>
+
+    <main id="top" class="lg:ml-[246px] w-full min-w-0">
+      <header class="grid-bg relative overflow-hidden px-6 md:px-12 xl:px-20 pt-12 md:pt-17 pb-14 border-b rule">
+        <div class="absolute right-[-90px] top-[-140px] h-[420px] w-[420px] rounded-full border border-[#b6f3ce12] pointer-events-none"></div>
+        <div class="absolute right-[-28px] top-[-75px] h-[290px] w-[290px] rounded-full border border-[#b6f3ce1a] pointer-events-none"></div>
+        <div class="relative max-w-[1000px] fade-up">
+          <div class="tag flex items-center gap-3"><span class="pulse-dot inline-block h-2 w-2 rounded-full bg-[#b6f3ce]"></span> NooDS-Wii / CPU investigation</div>
+          <h1 class="font-black tracking-[-.065em] leading-[.98] text-[clamp(48px,7vw,98px)] mt-7">JIT<span class="text-[#b6f3ce]">/</span>LAB</h1>
+          <h2 class="text-[clamp(22px,2.8vw,36px)] tracking-[-.035em] mt-5 max-w-[800px]">The games start. The CPUs keep running.<br><span class="text-[#8fa69a]">The translated instructions are wrong.</span></h2>
+          <p class="max-w-[680px] text-[#aab9b1] mt-5 text-[15px] leading-7">A focused repair workbench for your NDS white-screen and GBA black-screen stalls. The supplied code contains a definite Thumb decoder error and a flag-clobbering error. Fix those before tuning timing.</p>
+          <div class="flex flex-wrap gap-3 mt-8 fade-late"><a href="#patches" class="action px-5 py-3 text-[13px]">Inspect source fixes <span aria-hidden="true">&rarr;</span></a><a href="#trace" class="quiet px-5 py-3 text-[13px]">Analyze a trace</a></div>
+        </div>
+      </header>
+
+      <div class="px-6 md:px-12 xl:px-20 max-w-[1260px]">
+        <section id="diagnosis" class="py-14 md:py-18 border-b rule scroll-mt-8">
+          <div class="tag mb-4">01 / Root cause</div>
+          <h2 class="text-3xl md:text-4xl font-bold tracking-[-.045em]">Two deterministic translation bugs</h2>
+          <p class="text-[#9eb0a7] mt-4 max-w-[750px] leading-7">The trace shows repeated PCs and rising JIT counts, not a crash. That is consistent with an emulated loop waiting on state that never becomes correct. These code paths can produce that behavior directly.</p>
+          <div class="mt-10 border-t rule">
+            <div class="py-6 border-b rule grid md:grid-cols-[58px_1fr] gap-3"><span class="mono text-[#b6f3ce] text-sm">01</span><div><h3 class="font-semibold text-lg">Thumb instruction groups are shifted</h3><p class="text-[#96a9a0] text-sm leading-6 mt-2">In <code class="text-[#e4ebd3]">dispThumb</code>, <code>0x2000-0x3FFF</code> is sent to the wrong emitters, and <code>0x4000</code> is decoded as memory access. GBA boot transitions and ARM7 game code use these instructions constantly.</p></div></div>
+            <div class="py-6 border-b rule grid md:grid-cols-[58px_1fr] gap-3"><span class="mono text-[#b6f3ce] text-sm">02</span><div><h3 class="font-semibold text-lg">Flag updates overwrite operands</h3><p class="text-[#96a9a0] text-sm leading-6 mt-2"><code>setNZ()</code> and <code>setC_xer()</code> overwrite <code>TA</code>, but later overflow calculations still use <code>TA</code>. In <code>emitDP</code>, test instructions also place their result in <code>TC</code>, overwriting the shifter carry stored there. Conditional branches can then take the wrong path.</p></div></div>
+            <div class="py-6 grid md:grid-cols-[58px_1fr] gap-3"><span class="mono text-[#ffb88a] text-sm">03</span><div><h3 class="font-semibold text-lg">Execution accounting and state changes need a second pass</h3><p class="text-[#96a9a0] text-sm leading-6 mt-2">A fallback after translated instructions charges only one instruction. The NDS runner continues its 32-iteration loop even if a scheduler event changes to GBA mode. Also, blocks are cached by PC and Thumb state but not CPU identity.</p></div></div>
+          </div>
+        </section>
+
+        <section id="trace" class="py-14 md:py-18 border-b rule scroll-mt-8">
+          <div class="tag mb-4">02 / Inspect your log</div>
+          <div class="flex flex-wrap items-end justify-between gap-4"><div><h2 class="text-3xl md:text-4xl font-bold tracking-[-.045em]">Trace analyzer</h2><p class="text-[#9eb0a7] mt-3">Paste a status or JIT log. Analysis runs locally in your browser.</p></div><button id="analyze" class="action px-5 py-3 text-[13px]" type="button">Analyze trace &rarr;</button></div>
+          <label for="traceInput" class="block mono text-[11px] text-[#91a99a] mt-8 mb-3 tracking-wider">LOG INPUT</label>
+          <textarea id="traceInput" spellcheck="false" aria-label="JIT trace log" class="block w-full h-[210px] p-5 text-xs rounded-none">[STATUS] fps=5 cycles=16655578 pc0=020001B4 pc1=0380022C halt0=0 halt1=0 gba=0 dsi=0
+[JIT] arm   FB cpu0 pc=02002D34 op=EE110F10
+[JIT] arm   FB cpu1 pc=038002FC op=E121F003
+[JIT] STATUS jit0=32768 fb0=25 jit1=32768 fb1=3 pos=17360 gen=0
+[JIT] STATUS pc0=02000288 pc1=03800728 h0=0 h1=0 fps=0 cyc=242572
+[JIT] STATUS pc0=020001A4 pc1=03800728 h0=0 h1=0 fps=0 cyc=450926
+[JIT] STATUS pc0=020001B4 pc1=03800728 h0=0 h1=0 fps=0 cyc=647536
+[JIT] STATUS pc0=020001B4 pc1=03800728 h0=0 h1=0 fps=0 cyc=844144
+[JIT] STATUS pc0=020001A4 pc1=03800728 h0=0 h1=0 fps=0 cyc=1043044</textarea>
+          <div id="analysisResult" class="mt-6 border-l-2 border-[#b6f3ce] bg-[#b6f3ce08] p-5 text-sm leading-7" role="status" aria-live="polite"></div>
+        </section>
+
+        <section id="patches" class="py-14 md:py-18 border-b rule scroll-mt-8">
+          <div class="tag mb-4">03 / Edit jit_ppc.cpp</div>
+          <h2 class="text-3xl md:text-4xl font-bold tracking-[-.045em]">Targeted source fixes</h2>
+          <p class="text-[#9eb0a7] mt-4 max-w-[760px] leading-7">These are replacement excerpts, not a claim that your Wii build has been patched. The C++ project files were not available in this workspace.</p>
+          <div class="mt-8 border-b rule flex gap-7 overflow-x-auto" role="tablist" aria-label="Source fixes">
+            <button class="tab selected whitespace-nowrap pb-4 text-sm" role="tab" aria-selected="true" data-target="fix-decode">01 Thumb dispatch</button>
+            <button class="tab whitespace-nowrap pb-4 text-sm" role="tab" aria-selected="false" data-target="fix-flags">02 Flags and carry</button>
+            <button class="tab whitespace-nowrap pb-4 text-sm" role="tab" aria-selected="false" data-target="fix-next">03 Next checks</button>
+          </div>
+          <div id="fix-decode" class="fix-panel pt-7" role="tabpanel">
+            <p class="text-sm text-[#afc0b4] leading-6 mb-4">Replace the switch in <code>dispThumb</code>. The top nibble, not the previous misaligned group, selects each Thumb instruction family.</p>
+            <div class="relative bg-[#080d10] border rule"><button class="copy-btn absolute top-3 right-3 quiet px-3 py-1.5 text-xs bg-[#10191c]" data-copy="code-decode" type="button">Copy code</button><pre class="p-5 pt-14"><code id="code-decode">switch (h) {
+    case 0x0:
+        return emitT_shifts(ctx, op);
+    case 0x1:
+        if ((op &amp; 0xF800) == 0x1800)
+            return emitT_addSub3(ctx, op);
+        return emitT_shifts(ctx, op);
+    case 0x2: case 0x3:
+        return emitT_imm8(ctx, op);
+    case 0x4: {
+        uint8_t group = (op >> 10) &amp; 3;
+        if (group == 0) return emitT_alu(ctx, op);
+        if (group == 1) return emitT_hiReg(ctx, op, curPC);
+        return emitT_ldrPc(ctx, op, curPC);
+    }
+    case 0x5: return emitT_memReg(ctx, op);
+    case 0x6: case 0x7: case 0x8:
+        return emitT_memImm(ctx, op);
+    case 0x9: return emitT_spLoad(ctx, op, curPC);
+    case 0xA: return emitT_addSpPc(ctx, op, curPC);
+    case 0xB:
+        if (((op >> 8) &amp; 0xF) <= 1)
+            return emitT_addSpPc(ctx, op, curPC);
+        if (((op >> 9) &amp; 7) == 2 || ((op >> 9) &amp; 7) == 6)
+            return emitT_pushPop(ctx, op, curPC);
+        return false;
+    case 0xC: return emitT_ldmStm(ctx, op);
+    case 0xD: case 0xE: return emitT_branch(ctx, op, curPC);
+    default: return false;
+}</code></pre></div>
+            <p class="text-[#ffb88a] text-xs mt-4 leading-6">Important: <code>0x1800</code> is the add/subtract group; <code>0x1000</code> is still a shift. Check individual Thumb emitters against interpreter results after fixing dispatch.</p>
+          </div>
+          <div id="fix-flags" class="fix-panel pt-7 hidden" role="tabpanel" hidden>
+            <p class="text-sm text-[#afc0b4] leading-6 mb-4">Replace these two helpers. Use <code>TE</code> as scratch so <code>TA</code> survives until the overflow calculation; then change the test-result register in <code>emitDP</code>.</p>
+            <div class="relative bg-[#080d10] border rule"><button class="copy-btn absolute top-3 right-3 quiet px-3 py-1.5 text-xs bg-[#10191c]" data-copy="code-flags" type="button">Copy code</button><pre class="p-5 pt-14"><code id="code-flags">static void setNZ(Ctx&amp; ctx, uint8_t r) {
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 2, 31));
+    ctx.E(ppc_rlwimi(RCPSR, r, 0, 0, 0));
+    ctx.E(ppc_cmpi(6, r, 0));
+    ctx.E(ppc_mfcr(TE));
+    ctx.E(ppc_rlwinm(TE, TE, 25, 1, 1));
+    ctx.E(ppc_or(RCPSR, RCPSR, TE));
+}
+
+static void setC_xer(Ctx&amp; ctx) {
+    ctx.E(ppc_mfxer(TE));
+    ctx.E(ppc_rlwinm(TE, TE, 0, 29, 29));
+    ctx.E(ppc_rlwinm(RCPSR, RCPSR, 0, 3, 1));
+    ctx.E(ppc_or(RCPSR, RCPSR, TE));
+}
+
+// In emitDP, keep TC for the shifter carry:
+uint8_t res = isTest ? TB : RA[rd];</code></pre></div>
+            <p class="text-[#ffb88a] text-xs mt-4 leading-6">Also review ADC/SBC/RSC overflow with carry-in, and Thumb shift-by-register carry semantics. These snippets correct the clobber, not every flag edge case.</p>
+          </div>
+          <div id="fix-next" class="fix-panel pt-7 hidden" role="tabpanel" hidden>
+            <div class="space-y-0 border-t rule">
+              <div class="py-5 border-b rule"><span class="tag">Cache key</span><p class="text-sm leading-6 mt-2 text-[#afc0b4]">Include CPU identity in <code>JitBlock</code> lookup or use separate ARM9/ARM7 caches. The same PC can map to different code on the two CPUs. Invalidate every block whose covered instruction range intersects a write, not just <code>armPC + 32</code> for Thumb and ARM alike.</p></div>
+              <div class="py-5 border-b rule"><span class="tag">PC write</span><p class="text-sm leading-6 mt-2 text-[#afc0b4]"><code>emitBX_target</code> always clears only bit 0. For an ARM destination, also clear bit 1. For Thumb <code>MOV PC</code>/<code>ADD PC</code>, do not treat the write like BX: those operations should not change the T bit.</p></div>
+              <div class="py-5 border-b rule"><span class="tag">Scheduling</span><p class="text-sm leading-6 mt-2 text-[#afc0b4]">Count executed instructions rather than compiled instructions, especially conditional exits and interpreter fallbacks. Stop <code>runJitNds</code> immediately if an event enters GBA mode. The interpreter runner for the GBA fallback must run CPU 1, not <code>runCoreSingle&lt;true,0&gt;</code>.</p></div>
+              <div class="py-5"><span class="tag">Safer bring-up</span><p class="text-sm leading-6 mt-2 text-[#afc0b4]">Temporarily use one translated instruction per block, compare registers/CPSR/PC and memory side effects against the interpreter, then raise the block length. Running more blocks faster will not correct a bad translation.</p></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="verification" class="py-14 md:py-18 scroll-mt-8">
+          <div class="tag mb-4">04 / Verify on hardware</div>
+          <h2 class="text-3xl md:text-4xl font-bold tracking-[-.045em]">A test that can prove progress</h2>
+          <p class="text-[#9eb0a7] mt-4 max-w-[790px] leading-7">First confirm the same ROM boots with JIT disabled. Then compare one instruction at a time on both CPUs, including CPSR and scheduler time. A changed screen alone is not enough evidence of correctness.</p>
+          <ol class="mt-8 space-y-4 text-sm leading-6 text-[#c3d1c7] list-decimal pl-5 marker:text-[#b6f3ce]">
+            <li>Disable JIT and check the NDS and GBA baselines on the same BIOS, ROMs, and save files.</li>
+            <li>Apply the Thumb dispatch fix; log the first PC/opcode where JIT and interpreter register states diverge.</li>
+            <li>Apply the flag fix; compare r0-r15, CPSR N/Z/C/V/T, next PC, memory writes, and elapsed cycles after each instruction.</li>
+            <li>Only after state matches, re-enable multi-instruction blocks and test IRQ/VBlank, self-modifying code, CPU cache separation, and GBA mode switching.</li>
+          </ol>
+          <p class="mono text-[11px] text-[#748d81] mt-12 border-t rule pt-5">JIT/LAB &nbsp; / &nbsp; Diagnostic companion for the supplied NooDS-Wii excerpt. No C++ sources or Wii toolchain were available to build or run.</p>
+        </section>
+      </div>
+    </main>
+  </div>
+  <script>
+    const input = document.getElementById('traceInput');
+    const result = document.getElementById('analysisResult');
+    function escapeHtml(text) {
+      return text.replace(/[&<>"']/g, char => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+    }
+    function analyze() {
+      const text = input.value;
+      const pcs = [new Map(), new Map()];
+      const pcPattern = /\bpc([01])=([0-9a-fA-F]{8})\b/g;
+      for (const match of text.matchAll(pcPattern)) {
+        const map = pcs[Number(match[1])];
+        const pc = match[2].toUpperCase();
+        map.set(pc, (map.get(pc) || 0) + 1);
+      }
+      const fallbacks = [0, 0];
+      for (const match of text.matchAll(/\bFB cpu([01])\b/g)) fallbacks[Number(match[1])]++;
+      const fps = [...text.matchAll(/\bfps=(\d+)\b/g)].map(m => Number(m[1]));
+      const cycles = [...text.matchAll(/\bcyc(?:les)?=(\d+)\b/g)].map(m => Number(m[1]));
+      const hot = pcs.map(map => [...map.entries()].sort((a,b) => b[1]-a[1])[0]);
+      if (!hot[0] && !hot[1] && !fallbacks.some(Boolean) && !fps.length) {
+        result.innerHTML = '<strong class="text-[#b6f3ce]">No recognized trace fields.</strong> Include lines with pc0=/pc1=, FB cpu0/cpu1, or fps=.';
+        return;
+      }
+      const summary = hot.map((item, cpu) => item ? `CPU${cpu} most sampled at <span class="mono text-[#b6f3ce]">${escapeHtml(item[0])}</span> (${item[1]} sample${item[1] === 1 ? '' : 's'})` : `CPU${cpu}: no PC samples`).join('<br>');
+      const moving = cycles.length > 1 && cycles[cycles.length-1] > cycles[0];
+      const hint = moving ? 'Cycle counters advance while PCs recur. Investigate wrong translated state and event timing, not a frozen host thread.' : 'Compare these PCs and CPSR against interpreter-only execution before concluding this is a timing problem.';
+      result.innerHTML = `<div class="tag mb-2">Analysis result</div>${summary}<br>Fallback log entries: CPU0 ${fallbacks[0]}, CPU1 ${fallbacks[1]}. ${fps.length ? `Last logged FPS: ${fps[fps.length-1]}.` : ''}<br><span class="text-[#9eb0a7]">${hint}</span>`;
+    }
+    document.getElementById('analyze').addEventListener('click', analyze);
+    analyze();
+    document.querySelectorAll('.tab').forEach(tab => tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => { t.classList.remove('selected'); t.setAttribute('aria-selected', 'false'); });
+      document.querySelectorAll('.fix-panel').forEach(panel => { panel.classList.add('hidden'); panel.hidden = true; });
+      tab.classList.add('selected'); tab.setAttribute('aria-selected', 'true');
+      const panel = document.getElementById(tab.dataset.target);
+      panel.classList.remove('hidden'); panel.hidden = false;
+    }));
+    document.querySelectorAll('.copy-btn').forEach(button => button.addEventListener('click', async () => {
+      const code = document.getElementById(button.dataset.copy).textContent;
+      try {
+        await navigator.clipboard.writeText(code);
+        button.textContent = 'Copied';
+        setTimeout(() => { button.textContent = 'Copy code'; }, 1800);
+      } catch (_) { button.textContent = 'Clipboard unavailable'; }
+    }));
+    const links = [...document.querySelectorAll('.side-link')];
+    if ('IntersectionObserver' in window) {
+      const observer = new IntersectionObserver(entries => {
+        entries.forEach(entry => {
+          if (!entry.isIntersecting) return;
+          links.forEach(link => link.classList.toggle('active', link.getAttribute('href') === '#' + entry.target.id));
+        });
+      }, { rootMargin: '-20% 0px -65% 0px' });
+      document.querySelectorAll('main section[id]').forEach(section => observer.observe(section));
+    }
+  </script>
+</body>
+</html>
