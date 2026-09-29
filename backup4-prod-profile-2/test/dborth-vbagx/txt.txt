@@ -17,3 +17,6 @@ using agent mode in arena ai seems to have no token limit. apparently it was int
 on prompt2 it worked on the prompt for 30min then provided some jit files, but not all of them. I asked it to continue working and it is. 
 trouble is there is no easy way to download everything at once, but its ok. will just let the program run forever, telling it to continue until everything is sorted out. 
 9-29-26.
+
+the second round produced nothing after 38 minutes. asked it to:
+please continue to complete the jit_compiler.cpp and associated files. kindly bundle the changed files in a single location
