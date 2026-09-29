@@ -157,3 +157,5 @@ continuation
 can you write a short agents.md file on how to quickly install the devkitppc environment here?
 continuation
 I also have this generic SKILL.md file which I will paste here. Can you modify it to work best for you to meet the limitations of your sandbox? I will use the new version for Wii projects like this. SKILL.md:
+continuation
+Thank you. And I have this previous AGENTS.md for a wii project. Can you modify it using what we learned here about this working environment so that next time it will be optimized for this workplace? AGENTS.md: 
