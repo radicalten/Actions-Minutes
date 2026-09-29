@@ -132,7 +132,14 @@ Prompt4 using attached AGENTS.md v1 and hardentd skill's SKILL.md in lmarena ai 
 I would like to add an armv4 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
 Please refer to the attached AGENTS.md file and SKILL.md for additional information. 
 
+continuation after 31m:
+can you make an updated AGENTS.md file and share that using your learnings from this process? 
 
-Prompt5 using attached AGENTS.md v1 and hardened skill's SKILL.md in lmarena ai agents mode: 
+could you make an updated agents.md to utilize before any changes were made in your work? in other words, what agents.md would have been ideal for your work when you first started. share that
+
+produced AGENTS-v0-preflight.md
+which seems reasonable. 
+
+Prompt5 using attached AGENTS.md (AGENTS-v0-preflight.md aka v2)  and hardened skill's SKILL.md in lmarena ai agents mode: 
 I would like to add an armv4/armv5 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that matches or exceeds the functionality of dborth's vbagx jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Please bundle these all in a convenient location along with a write up of the work you have done. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
 Please refer to the attached AGENTS.md file and SKILL.md for additional information. 
