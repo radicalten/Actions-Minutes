@@ -1,2 +1,4 @@
 This version compiles. plays rockwrestler .nds at 10fps (instead of 2-3fps in some versions for 5-6fps in others, but not quite 35fps as I've gotten in others).
 Plays SMW GBA at 20fps, no problem although it skips the bios for whatever reason. (probably need to add it back to my folder. Oh that's another thing I don't have my nds or gba bios in my folder any longer. will add it back and try running nds games again as MKDS and others such as Yoshi's island which both stopped at white screen.
+
+by the way lm arena made gpt6sol free for one day today sep 29 2026 which is how I am testing. 
