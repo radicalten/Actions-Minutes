@@ -159,3 +159,11 @@ continuation
 I also have this generic SKILL.md file which I will paste here. Can you modify it to work best for you to meet the limitations of your sandbox? I will use the new version for Wii projects like this. SKILL.md:
 continuation
 Thank you. And I have this previous AGENTS.md for a wii project. Can you modify it using what we learned here about this working environment so that next time it will be optimized for this workplace? AGENTS.md: 
+
+**The last continuation never completed, kept failing** starting a new agent.md where I will upload SKILL-lmarena-adapted.md and AGENTS-install-dkp-ppc.md and then upload my v1 AGENTS.md then ask it to update my AGENTS.md to meet the standards of the other 2. 
+
+detour 2 prompt:
+Can you update my AGENTS.md file to meet the standards and rules set out in SKILL-lmarena-adapted.md and AGENTS-install-dkp-ppc.md to suit this workspace? 
+
+
+this worked now have new AGENTS.md file which I will pair with SKILL.md (v2). 
