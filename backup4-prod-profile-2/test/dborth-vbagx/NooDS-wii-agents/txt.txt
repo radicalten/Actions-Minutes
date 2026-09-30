@@ -209,3 +209,18 @@ completed stage 7 after 46m.
 
 completed stage 8 after 35m.
 "continue working in your preferred manner. in your write up at the end please include what is complete and what remains to be done. also please enable your jit by default in the main.cpp file."
+
+completed stage 9 after 14m. 
+"continue working in your preferred manner. in your write up at the end please include what is complete and what remains to be done. in your final output also include the compiled .dol file with the jit completely enabled. you may modify or create a new makefile to meet this requirement."
+
+completed stage 10 after 13m.
+continue working in your preferred manner. in your write up at the end please include what is complete and what remains to be done, as well as compile the latest .dol with jit completely enabled just as before.
+
+
+completed stage 11 after 17m.
+continue working in your preferred manner. in your write up at the end please include what is complete and what remains to be done, as well as compile the latest .dol with jit completely enabled just as before. Please name the jit enabled .dol file NooDS-Wii-jit.dol
+
+
+
+completed stage 12 after ?m.
+post debug status log here which proves that the jit never executes. 
