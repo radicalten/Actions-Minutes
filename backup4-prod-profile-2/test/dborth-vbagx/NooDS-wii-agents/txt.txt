@@ -233,3 +233,7 @@ FAT mounted, logging started
 Continue working and do your best to solve this. Thank you. Once again please provide a write up at the end with what is complete, what remains to be done, and the jit.dol output file
 
 This entire thing is a dead end--worse now I am being served weaker models that did not even make a stage 13 commit. time to move on and start over. need a new AGENTS.md SKILL.md and restarrt with the original noods-wii public repo as this is more or less a disaster. 
+
+==
+fresh start questions: prompt1
+Before we get started on a project, tell me about yourself. What should I know about you and your testing environment so I can communicate with you properly. For example I would like to build a project that requires devkitpro's devkitppc for wii. Are you able to do that? Also do you have a name or relevant background info?
