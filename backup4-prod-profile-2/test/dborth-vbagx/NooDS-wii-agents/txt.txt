@@ -173,3 +173,7 @@ this worked now have new AGENTS.md file which I will pair with SKILL.md (v2).
 Prompt7 using lm arena adapted and attached AGENTS.md   and lmarena adapted SKILL.md in lmarena ai agents mode: 
 I would like to add an armv4/v5 (gba/NDS) to PPC (wii/GCN) jit recompiler to the NooDS-wii repo that exceeds the functionality of dborth's vbagx (thumb only) jit recompiler. For the final output I would like the finished relevant .cpp files to add to the NooDS-Wii repo. Please bundle these all in a convenient location along with a write up of the work you have done. Here are the links: https://github.com/radicalten/NooDS-Wii https://github.com/dborth/vbagx/tree/master/source/vba/gba 
 Please refer to the attached AGENTS.md file and SKILL.md for additional information. 
+
+
+**worked for 8min then stopped with a 7 step plan
+say: continue in your preferred order.
