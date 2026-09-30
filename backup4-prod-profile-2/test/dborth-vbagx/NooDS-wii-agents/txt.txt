@@ -194,3 +194,5 @@ Location of files up to stage 3 of plan: https://github.com/radicalten/Actions-M
 Initial Repo of NooDS-Wii before changes: https://github.com/radicalten/NooDS-Wii Initial Repo of vbagx: https://github.com/dborth/vbagx/tree/master/source/vba/gba 
 
 **worked for 36m then failed. will likely need to try again? thinking of making a workspace2 with my prodprofilie2 from here except remember to change jit_ppc.cpp to the best working version. likely fable dynarec16-17pt1? 
+
+**tried prompt again next morning asked 2 verification questions then worked for 4 min. I said continue working, and its been working since, will probably fail after 50m is my guess. 
