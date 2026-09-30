@@ -198,4 +198,7 @@ Initial Repo of NooDS-Wii before changes: https://github.com/radicalten/NooDS-Wi
 **tried prompt again next morning asked 2 verification questions then worked for 4 min. I said continue working, and its been working since, will probably fail after 50m is my guess. 
 worked for 1h52m and did come up with a stage 4 surprisingly. neat. 
 
-**worked on stage for 1h13m then failed before it uploaded the file. 
+**worked on stage 5 for 1h13m then failed before it uploaded the file. 
+
+it uploaded stage 5 after another 1h2m but it also said it failed lol. 
+
