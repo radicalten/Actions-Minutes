@@ -205,3 +205,7 @@ it uploaded stage 5 after another 1h2m but it also said it failed lol.
 completed stage 6 after 47m. 
 "continue working in your preferred manner. in your write up at the end please include what is complete and what remains to be done."
 
+completed stage 7 after 46m. 
+
+completed stage 8 after 35m.
+"continue working in your preferred manner. in your write up at the end please include what is complete and what remains to be done. also please enable your jit by default in the main.cpp file."
