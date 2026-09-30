@@ -221,6 +221,13 @@ completed stage 11 after 17m.
 continue working in your preferred manner. in your write up at the end please include what is complete and what remains to be done, as well as compile the latest .dol with jit completely enabled just as before. Please name the jit enabled .dol file NooDS-Wii-jit.dol
 
 
-
-completed stage 12 after ?m.
-post debug status log here which proves that the jit never executes. 
+completed stage 12 after 22m.
+Here is some info to help you. According to the debug logs, the jit never activates:
+"=== NooDS-Wii JIT/CPU trace log ===
+FAT mounted, logging started
+[EXC] vector=18 pc=00002D62 sp=03007EA4 lr=00002BAF cpsr=0000007F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=2000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F
+[EXC] vector=18 pc=00000348 sp=03007EB0 lr=00000344 cpsr=6000005F" 
+Continue working and do your best to solve this. Thank you. Once again please provide a write up at the end with what is complete, what remains to be done, and the jit.dol output file
