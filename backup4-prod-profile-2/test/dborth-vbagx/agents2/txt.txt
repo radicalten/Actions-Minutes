@@ -6,6 +6,14 @@ AGENTS(5).md v2 process (using modified AGENTS(4).md v3 which integrates the mod
 Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project. 
 
 
+**has worked for 4 hrs total with 3 continuations. on the 4th continuation I asked it to pause and: 
+before you continue with implementing your work, could you write a new AGENTS.md file that would have been perfect for the start of this task?
+
+**it then gave a 623 line AGENTS.md that seemed pretty thorough, which is nice. seems to be a pretty smart AI. so AGENTS(5).md is pretty solid will definitely use it for the next round with the same prompt as AGETNS(5).md v2 process. 
+
+Thank you, let's resume working on the main task.
+
+
 intermission AGENTS_04.md finetune with the hardend skill module as without it, clearly the ai went off the rails. in AGENTS(5).md
 Can you update my SKILL.md module to fit with my current AGENTS.md? It is out of date with the current project guidelines. 
 
