@@ -5,7 +5,11 @@ Before we get started on a project, tell me about yourself. What should I know a
 
 can you summarize what will be needed here in an agents.md? specifically how to quickly create a devkitppc environment and get dolphin up and running
 
+Follow up Q to an entirely new prompt:
+I have an AGENTS.md file can you verify the information in it is correct?
 
+
+Initial AGENTS.md:
 # AGENTS.md — devkitPPC (Wii) + Dolphin in this sandbox
 
 Quick-start reference. Everything here was verified by running it (2026-09-30).
