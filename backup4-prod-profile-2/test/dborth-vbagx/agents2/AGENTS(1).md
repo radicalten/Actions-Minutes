@@ -1,0 +1,94 @@
+# AGENTS.md — devkitPPC (Wii) + Dolphin in this sandbox
+
+Quick-start reference. Everything here was verified by running it (2026-09-30).
+Full write-up with evidence and failure modes: `DKP-ENVIRONMENT.md`.
+
+## Environment facts
+
+- Debian 13, x86_64, **2 cores, ~1.9 GB RAM, no swap** → build with `make -j2`, expect slow emulation.
+- Passwordless sudo. apt works; run `sudo apt-get update` first in a fresh session (stale index 404s).
+- **Persistence model:** only files under `/home/user` survive between sessions.
+  `/opt/*`, apt packages, and file exec bits do NOT. Re-run the setup scripts after a cold start;
+  if "Permission denied", `chmod +x *.sh` (or invoke with `bash script.sh`).
+- **Network:** every `*.devkitpro.org` host returns Cloudflare **403** from this egress IP
+  (UA spoofing doesn't help). `dkp-pacman` is unusable. Reachable mirror with verbatim
+  packages: `https://wii.leseratte10.de/devkitPro/`.
+
+## Quickstart 1 — toolchain (≈15 s, ~450 MB)
+
+```bash
+cd /home/user
+./setup-devkitppc.sh        # idempotent; self-installs curl/zstd; fetches from mirror; extracts to /
+source ./dkp-env.sh         # sets DEVKITPRO, DEVKITPPC, PATH (needed in every build shell)
+```
+
+Installs: devkitppc-gcc **16.1.0**, devkitppc-binutils **2.46.0**, devkitppc-newlib
+**4.6.0.20260123-4**, devkitppc-crtls **2.0.0**, devkitppc-rules **1.2.1**, libogc **3.1.0**,
+gamecube-tools **1.0.3** (`elf2dol`). Script self-checks crt0.o, `libogc_common.ld`,
+`wii_rules`, `libogc.a`, `elf2dol`.
+
+## Quickstart 2 — Dolphin (≈2 min install + ~60 s per run)
+
+```bash
+./run-dolphin.sh <file.dol> [seconds=60] [out.png]
+```
+
+Self-installs `dolphin-emu xvfb imagemagick libgl1-mesa-dri` if missing, starts `Xvfb :99`,
+runs `dolphin-emu-nogui -p x11 -v OGL -a HLE -e <dol>` under
+`LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe`, then captures the emulated framebuffer
+via `import -window root` into the PNG and kills Dolphin. **Read the PNG to verify output.**
+
+Facts that cost time to learn — don't relearn them:
+- `-p headless` fails (`Failed to initialize video backend!`) — it still needs a GL context. Use X11 + Xvfb.
+- llvmpipe reports exactly **OpenGL 4.5** (Dolphin's floor). softpipe caps at 3.3 → unusable.
+- `nogui` has no run-N-frames flag; homebrew loops forever → `timeout -s KILL`, exit **137 is expected**.
+- ALSA errors in the log are harmless (no sound card; audio falls back to null sink).
+- Boot takes ~30–45 s wall clock; keep `seconds` ≥ 60.
+
+## Building a Wii app
+
+- Project Makefile must `include $(DEVKITPPC)/wii_rules` (template: `wii-toolchain-test/Makefile`).
+- `source dkp-env.sh && make -j2` → `<name>.elf` + `<name>.dol`. Clean build = 0 warnings.
+- Sanity: `powerpc-eabi-readelf -h app.elf` → `ELF32, big endian, Machine: PowerPC`, entry in `0x80000000–0x81800000`.
+
+## The version trap (read before touching versions)
+
+libogc ↔ toolchain **generations must match** (check a package's `.BUILDINFO`).
+From r49 the C runtime split out of newlib into `devkitppc-crtls`; `__ppc_excpt_buf`
+exists in **no** `.a` — it's `PROVIDE_HIDDEN(... = 0x800000d0)` inside `libogc_common.ld` (crtls),
+and `_start` comes from `crt0.o` (newlib). Mismatched pairs **compile fine and fail at link** with
+`cannot find entry symbol _start` / `undefined reference to __ppc_excpt_buf`.
+
+| libogc | requires |
+|---|---|
+| 3.1.0 | r49.2-era split: gcc 16.1.0 + binutils 2.46.0 + crtls 2.0.0 (**installed**) |
+| 3.0.0 | r49-4 + crtls 1.0.0.1 |
+| 2.9.0 | monolithic devkitPPC-r45.2 (fallback pair: **r47.1 + 2.9.0** also verified) |
+
+Other packages on the mirror (`portlibs/`, etc.) follow the same rule — match generations.
+
+## Verification loop (the whole point)
+
+```bash
+source ./dkp-env.sh && cd <project> && make -j2 \
+  && cd /home/user && ./run-dolphin.sh <project>/<app>.dol 90 \
+  && # read dolphin-framebuffer.png — it shows the app's actual screen
+```
+
+## Files
+
+| file | role |
+|---|---|
+| `setup-devkitppc.sh` | cold-start toolchain bootstrap (mirror-based, no pacman) |
+| `dkp-env.sh` | env vars for builds (`DEVKITPRO`, `DEVKITPPC`, `PATH`) |
+| `run-dolphin.sh` | headless Dolphin runner + framebuffer capture |
+| `wii-toolchain-test/` | hello-world Wii app + working Makefile template |
+| `DKP-ENVIRONMENT.md` | detailed notes, evidence, failure modes |
+| `dolphin-framebuffer.png` | last captured emulated frame |
+
+## Known gaps
+
+- `devkitppc-mn10200-binutils` 404s on the mirror — only needed for GBA audio coprocessor work.
+- No synthetic Wiimote/BTE input tested yet; TAS/movie or GDB-stub injection unexplored.
+- Mirror packages are verbatim but not signature-verified here.
+- Emulation is a smoke-test rig: far below real-time pacing; don't trust audio/video timing behavior.
