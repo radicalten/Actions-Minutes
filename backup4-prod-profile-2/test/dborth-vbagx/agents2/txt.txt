@@ -17,7 +17,9 @@ worked for 2h15m to arrive at an answer and it in fact could run the program and
 Can you write a new AGENTS.md so that a new agent can quickly create the required environment for this wii build? 1. Install Devkitppc 2. Install Dolphin 3. Download rockwrestler.nds 4. Download NooDS-wii 5. Set up Dolphin to run rockwrestler.nds in NooDS-wii. 6. Any other step you think is necessary and should be enumerated. Keep the all the pertinent details about your working environment in the AGENTS.md file such as the amount of ram etc. 
 **this was rejected, will write a generic one instead**
 Can you write a new AGENTS.md file with everything pertinent you learned. 
-
+**this was rejected too**
+Can you write a new AGENTS.md file based on what you learned. 
+**this was not rejected hopefully it keeps how to run dolphin as an agent**
 
 Initial AGENTS.md:
 # AGENTS.md — devkitPPC (Wii) + Dolphin in this sandbox
