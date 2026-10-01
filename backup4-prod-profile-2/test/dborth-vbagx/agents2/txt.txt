@@ -11,7 +11,7 @@ I have an AGENTS.md file can you verify the information in it is correct?
 can you make a new agents.md based on what you learned for the future?
 
 thanks, are you able to download the rockwrestler.nds rom from here? https://github.com/RockPolish/rockwrestler, then use the NooDS-wii release here to launch it in your environment? https://github.com/radicalten/NooDS-Wii/releases/tag/v1.5
-
+worked for 2h15m to arrive at an answer and it in fact could run the program and take a screenshot.
 
 Initial AGENTS.md:
 # AGENTS.md — devkitPPC (Wii) + Dolphin in this sandbox
