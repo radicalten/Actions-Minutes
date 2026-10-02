@@ -1,0 +1,498 @@
+# AGENTS.md — NooDS-Wii ARMv4/v5 → PowerPC (GCN/Wii) dynamic recompiler
+
+Start-of-task guide written after a completed bring-up (2026-10-01). The prompt defines
+the task; this file defines how to do it without repeating known mistakes.
+§1–§5 are **verified facts** about the pinned tree and the proven toolchain.
+§6–§12 are the method (correctness before speed, deterministic rig, gates, evidence).
+§13 is a trap catalogue: read it before debugging anything.
+Any numbers from an older ledger/handoff/chat are historical; re-run gates to claim them.
+
+## 0. Mission, scope, non-negotiables
+
+- Add a real ARM/THUMB dynamic recompiler for GBA ARM7 and NDS ARM9/ARM7: emit PowerPC
+  instructions and execute them. Renaming an interpreter is not a JIT.
+- JIT must be the **default** for both active CPUs, with the interpreter as fallback for
+  unsupported operations and reference quirks — never an undisclosed whole-CPU bypass.
+- Reproducible devkitPPC build, `.S` assembly support, headless Dolphin test environment.
+- Test the pinned `rockwrestler.nds` and `suite.gba`; compare against a fresh interpreter
+  build from the same source and flags.
+- Deliver `deliverables/jit.dol` (the exact tested bytes, hashed) + `handoff.md`.
+- Compilation, booting, counters or an encoder-byte match are NOT accuracy proof.
+- Report PASS/FAIL/HANG/NOT_RUN honestly. Keep failed attempts. Never invent a pass.
+- Feature branch only; never push main/production/release; preserve existing work.
+- No global installs without approval except the bootstrap in §2. No interactive
+  REPL/PTY/stdin. Long jobs via process tools with blocking waits, not sleep/curl loops.
+- Dolphin runs are serial and short: budget ≈2 vCPU / ≲2 GiB RAM; keep each run ≪25 min.
+- No unrequested roadmap work (lazy flags, block linking, idle detection, new native
+  timing work). Those go in `handoff.md` as next steps.
+- `-mrvl` proves a Wii-targeted DOL only. Never claim GameCube or physical-console success.
+
+## 1. What is actually in the pinned tree
+
+```bash
+cd /home/user
+git clone https://github.com/radicalten/NooDS-Wii.git NooDS-Wii      # only if absent
+cd NooDS-Wii
+git checkout 1c995b48c37ebf3645646968c416958f79264137
+git switch -c feature/arm-ppc-jit
+```
+
+Layout: `Makefile` at the repo root; sources in the **subdirectory** `NooDS-Wii/`.
+Build products land next to the Makefile (`jit.dol`, `NooDS-Wii-interp.dol`, `obj-jit0/1`).
+There is no JIT, no test rig and no `tools/` in the fresh clone: build them.
+
+Interpreter files: `interpreter.{h,cpp}` (class, dispatch, pipeline), `interpreter_alu.cpp`
+(ALU + THUMB data processing), `interpreter_branch.cpp`, `interpreter_transfer.cpp`,
+`interpreter_lookup.cpp` (the dispatch tables). Also relevant: `core.{h,cpp}`,
+`memory.{h,cpp}`, `main.cpp`, `settings.{h,cpp}`, `gpu.*`, `input.*`.
+
+**Dispatch (verified).** `interpreter.h` declares private static member-pointer tables
+`armInstrs[0x1000]` and `thumbInstrs[0x400]`, defined in `interpreter_lookup.cpp`, and the
+private `int runOpcode()`. Indexing:
+
+```cpp
+ARM  : (this->*armInstrs [((opcode >> 16) & 0xFF0) | ((opcode >> 4) & 0xF)])(opcode);
+THUMB: (this->*thumbInstrs[(opcode >> 6) & 0x3FF])(opcode);
+```
+
+ARM rows 0x00–0x1F are data-processing with *register* operand-2; 0x20–0x3F the
+*immediate* operand-2 forms; 0x40–0x7FF single transfers (pre/post × imm/reg × U/B/T);
+0x800–0x8FF block transfers (STMDA/LDMDA/STMIA/LDMIB… × W/U); 0xA00–0xAFF `B`;
+0xB00–0xBFF `BL`; 0xC00–0xCFF and 0xE00–0xEFF CDP/MCR/MRC (mostly `unkArm` here);
+0xF00–0xFFF `swi`. MRS/MSR/multiply/BX/CLZ sit inside the AND/EOR/SUB/TST… rows of
+0x00–0x3F (verified indices: 0x009/0x019/0x029/0x039 = `mul/muls/mla/mlas`; 0x100 `mrsRc`,
+0x120 `msrRc`, 0x121 `bx`, 0x123 `blxReg`, 0x140 `mrsRs`, 0x149 `swpb`, 0x160 `msrRs`,
+0x161 `clz`). Note `B`/`BL` masks: `(op & 0x0E000000) == 0x0A000000` also matches the
+ARMv5 `BLX(imm)` space, so reject `op >> 28 == 0xF` first.
+THUMB index ranges (verified by parsing the table): 0x000–0x05F LSL/LSR/ASR imm5,
+0x060–0x06F ADD/SUB reg, 0x070–0x07F ADD/SUB imm3, 0x080–0x0FF MOV/CMP/ADD/SUB imm8,
+0x100–0x10F format-4 ALU (0=AND,1=EOR,5=ADC,6=SBC,8=TST,9=NEG,10=CMP,11=CMN,12=ORR,
+13=MUL,14=BIC,15=MVN; 2–4,7 = register shifts), 0x110–0x11F ADD/CMP/MOV Hx + BX/BLX,
+0x120–0x13F LDR PC, 0x140–0x17F L/S reg offset, 0x180–0x27F L/S imm5/SP-relative,
+0x280/0x2A0 ADD PC/SP, 0x2C0 ADD SP imm, 0x2D0 PUSH, 0x2F0 POP, 0x300 STMIA, 0x320 LDMIA,
+0x340–0x37F conditional B (0x378 = invalid, 0x37C SWI), 0x380 B, 0x3A0 BLX, 0x3C0 BL head,
+0x3E0 BL tail, everything else `unkThumb`. Read rows 0x40–0xFF before implementing
+transfers/blocks; they were not audited during the bring-up that produced this file.
+
+**Handler naming.** `interpreter_alu.cpp` has no `FORCE_INLINE`-generated layer: it declares
+real members. ALU helpers are the operand-2 functions `lli/llr/lri/lrr/ari/arr/rri/rrr/imm`
+(+`S` variants for flag-setting), and the handlers are generated by the macro
+`ALU_FUNCS(func, S)` into `func{Lli,Llr,Lri,Lrr,Ari,Arr,Rri,Rrr,Imm}` — e.g.
+`Interpreter::addLri`, `andsAri`, `subImm`, plus explicit `mul/mla/muls/mlas`,
+`bx/blxReg/b`, and the THUMB set `lslImmT/lsrImmT/asrImmT/addRegT/subRegT/addImm3T/
+subImm3T/movImm8T/cmpImm8T/addImm8T/subImm8T/andDpT…mvntDpT/addHT/cmpHT/movHT/bxRegT/
+blxRegT/ldrPcT/strImm5T…/addPcT/addSpT/addSpImmT/pushT/popT/beqT…bleT/bT/blSetupT/
+blOffT/blxOffT/swiT/unkThumb`. Grep these literal names; do not invent patterns.
+
+**PC / pipeline convention (verified, matches the two-opcode pipeline).** `runOpcode()`
+pops `pipeline[0]`, then advances `*registers[15] += size` (ARM 4 / THUMB 2) *before*
+calling the handler. Therefore at handler entry r15 = instruction + 2×size (ARM +8,
+THUMB +4); between instructions r15 = next + size. Consequences:
+
+- Cache key: the instruction address is `r15 − 2×size`; any consistent bijection works, but
+  always mix the T bit into the key. Never reuse an ARM key for a THUMB opcode.
+- ARM `BL` return = r15 − 4 (i.e. instruction + 4). THUMB `blSetupT/blOffT` use the
+  already-advanced r15 and set bit 0 on the return address (`r15 − 1`).
+- `flushPipeline()` aligns the raw target (`& ~0x3` ARM / `& ~0x1` THUMB), adds one size,
+  and refills both pipeline slots from `core->memory` (with the `readMap7/9A/9B` fast path
+  via `pcData`). Any stub that changes PC must call the real `flushPipeline()`, not a copy.
+- ARM `BX/BLX(reg)`: `cpsr |= (op0 & BIT(0)) << 5` (ARM) / THUMB clears T when bit0 == 0.
+- Numeric flags follow the reference expressions, e.g. ADD C = `op1 > res`,
+  SUB C = `op1 >= res`, V = `((op2 ^ op1) & ~(res ^ op2)) & BIT(31)`; `adcDpT`'s carry
+  predicate is `op1 > *op0 || (op2 == -1 && oldC)` (a reference quirk — reproduce it, do
+  not "fix" it). THUMB `mulDpT` always rotates by `op2 & 0x1F` (no RRX special case),
+  THUMB `NEG` has a non-obvious C/V form, ARM RSC-S is odd: leave those as fallback.
+
+**Private members.** `core`, `arm7`, `pcData`, `pipeline[2]`, `registers[32]`,
+`registersUsr[16]` + banked arrays, `cpsr`, `spsr`, `cycles`, `runOpcode()`,
+`flushPipeline()`, `exception()`, `setCpsr()`, `swapRegisters()`, `condition[]` are
+private. `registers[]` is an array of *pointers* (banking): always go through
+`registers[n]`, never assume linear addresses. To let a JIT touch this state either add
+`friend class ArmJit;` to `Interpreter`, or expose members/accessors — never guess offsets.
+
+**CPSR/Condition.** `runOpcode` executes `condition[((opcode >> 24) & 0xF0) | (cpsr >> 28)]`
+and returns 1 cycle for "false" and calls `handleReserved` for "reserved" **before** any
+handler runs. Hook the JIT after that gate (e.g. in the `default:` arm), so cond-false and
+reserved opcodes keep the reference's cost and never allocate a stub.
+
+## 2. Reproducible devkitPPC environment
+
+```bash
+sudo apt-get update
+sudo apt-get install -y zstd dolphin-emu xvfb imagemagick mtools libgl1-mesa-dri
+```
+
+Only `/home/user` persists; `/opt` and apt packages can vanish. Re-run the bootstrap.
+Use ONLY `https://wii.leseratte10.de/devkitPro/` (never `pkg.devkitpro.org`, never
+dkp-pacman). GCC alone is not enough: rules/crtls/newlib provide specs and `rvl.ld`.
+Save the manifest as `tools/toolchain-packages.sha256` (devkitPPC-r50, binutils 2.46.0,
+crtls 2.1.0, gcc 16.1.0, newlib 4.6.0, rules 1.2.1, gamecube-tools 1.0.7, libfat-ogc
+2.1.0, libogc 3.1.0) with these digests:
+
+```text
+2b3c3f4773be827960c0fbb985f83f50916c56c54ab5cfcbe5a4239364e6302c  devkitPPC-r50-1-any.pkg.tar.zst
+ec39352d27f668d235de9fa69caeee2d753994b695245075a37c4bfc700547d6  devkitppc-binutils-2.46.0-1-linux_x86_64.pkg.tar.zst
+5a1144d515579eee73bb936ca36a8ea739b00d8cf32af3fa4dda21a039881bcd  devkitppc-crtls-2.1.0-1-any.pkg.tar.zst
+656f0cabcd99a1c0d1510d0fccf5556abac26c3c813113175476d315c5b3da7a  devkitppc-gcc-16.1.0-1-linux_x86_64.pkg.tar.zst
+2c5277c6b07a5558c9fd8e631d958c6d7784860aa55f5c320cb51371bc07e21b  devkitppc-newlib-4.6.0.20260123-4-any.pkg.tar.zst
+0c3394da451c9dfb3b428d9d61b044eb1eafb947b2b5090ff88525f55c785278  devkitppc-rules-1.2.1-1-any.pkg.tar.zst
+e7dea3d441f3951be336a5b52849bdabf191d7157b765b5b3a603ecf6ba233b4  gamecube-tools-1.0.7-1-linux_x86_64.pkg.tar.zst
+9fb965672aaa3a82586715aab15ee4a16d3fc8850cbd2bd8cc4868e1c091d1b9  libfat-ogc-2.1.0-4-any.pkg.tar.zst
+7c2dba9f4ef8cc496e424cd6208e0eddc893c08fff080016321d777d84c5c083  libogc-3.1.0-1-any.pkg.tar.zst
+```
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ROOT=${ROOT:-/home/user}; CACHE="$ROOT/tmp/dkp"; BASE=https://wii.leseratte10.de/devkitPro
+mkdir -p "$CACHE" "$ROOT/evidence"
+packages=(
+ 'devkitPPC/r50%20%282026-05-03%29/devkitPPC-r50-1-any.pkg.tar.zst'
+ 'devkitPPC/r50%20%282026-05-03%29/devkitppc-binutils-2.46.0-1-linux_x86_64.pkg.tar.zst'
+ 'devkitPPC/r50%20%282026-05-03%29/devkitppc-gcc-16.1.0-1-linux_x86_64.pkg.tar.zst'
+ 'file.php/devkitppc-newlib-4.6.0.20260123-4-any.pkg.tar.zst'
+ 'file.php/devkitppc-rules-1.2.1-1-any.pkg.tar.zst'
+ 'file.php/devkitppc-crtls-2.1.0-1-any.pkg.tar.zst'
+ 'libogc/libogc_3.1%20%282026-05-03%29/libogc-3.1.0-1-any.pkg.tar.zst'
+ 'libfat/libfat_2.1.0/libfat-ogc-2.1.0-4-any.pkg.tar.zst'
+ 'other-stuff/gamecube-tools/gamecube-tools-1.0.7-1-linux_x86_64.pkg.tar.zst'
+)
+for rel in "${packages[@]}"; do
+ name=${rel##*/}
+ [[ -s "$CACHE/$name" ]] || { curl -fL --retry 3 "$BASE/$rel" -o "$CACHE/$name.part"; mv "$CACHE/$name.part" "$CACHE/$name"; }
+ expected=$(awk -v name="$name" '$2==name {print $1}' "$(dirname "$0")/toolchain-packages.sha256")
+ [[ ${#expected} = 64 ]] || exit 2
+ printf '%s  %s\n' "$expected" "$CACHE/$name" | sha256sum -c -
+ # devkitPPC-r50 is metadata-only: skip archives with no opt/ payload.
+ # Do NOT use grep -q here: pipefail + early SIGPIPE can falsely reject an archive.
+ if tar --zstd -tf "$CACHE/$name" | grep '^opt/' >/dev/null; then
+  sudo tar --zstd -xf "$CACHE/$name" -C / --wildcards 'opt/*'
+ fi
+done
+(cd "$CACHE" && sha256sum *.pkg.tar.zst) > "$ROOT/evidence/toolchain-packages.sha256"
+```
+
+```bash
+export DEVKITPRO=/opt/devkitpro DEVKITPPC=/opt/devkitpro/devkitPPC
+export PATH=$DEVKITPRO/tools/bin:$DEVKITPPC/bin:$PATH
+powerpc-eabi-gcc --version   # expect GCC 16.1.0
+command -v elf2dol           # /opt/devkitpro/tools/bin/elf2dol (gamecube-tools)
+```
+
+## 3. Makefile requirements
+
+- `make JIT=1 -j4` → `jit.elf`/`jit.dol`; `make JIT=0 -j4` → `NooDS-Wii-interp.elf/.dol`.
+  Default must be `JIT ?= 1`.
+- Separate object trees `obj-jit1`/`obj-jit0`; `-MMD -MP`; a compiler/flags stamp so
+  changing flags never silently reuses stale objects.
+- Compile `.S` with the cross GCC using `-x assembler-with-cpp`; link the resulting
+  objects into **both** variants (an unused bridge must not break `JIT=0`).
+- Link with the cross G++ then run `elf2dol` explicitly; keep both `.map` files.
+- Proven flags: `-mrvl -mcpu=750 -meabi -mhard-float`; C++
+  `-O2 -std=gnu++17 -fsigned-char -ffast-math -ffunction-sections -fdata-sections`;
+  CPP `-DGEKKO -DENDIAN_BIG -DNOODS_JIT=0|1` + libogc and project includes; link
+  `--gc-sections`, `-L/opt/devkitpro/libogc/lib/wii`, `-lasnd -lfat -lwiiuse -lbte -logc -lm`.
+- **devkitPPC predefines `PPC=1`.** Name the encoder namespace `JitPpc`, never `PPC`.
+  A host-only build will not surface this collision; always cross-compile.
+- Record revision, dirty-patch hash, flags and DOL sha256 before every test launch.
+
+## 4. Execution contract
+
+- Keep `runOpcode()` semantics untouched. Do not copy PC math from an older tree; use §1.
+- Share the fetch/condition prologue and call the original decoded handler on fallback
+  **without fetching or advancing twice**. Implement it as a small public
+  `Interpreter::runDecoded(uint32_t opcode)` that only does the table lookup (the caller
+  has already passed the condition gate).
+- Fallback must return the handler's ACTUAL cycle cost, never a guessed constant.
+- NDS ARM9 runs at 2× and ARM7 at ½ rate in the scheduler; do not apply that shift inside
+  the JIT. GBA (`gbaMode`) has a different loop again.
+- One guest instruction per native stub is the proven schedule-equivalent unit; a block
+  that retires several instructions breaks the "one CPU cannot run ahead" invariant.
+- Keep `flushPipeline()` (not a copy) as the only PC-refill path.
+- Save/load states, banking (`swapRegisters`), exceptions and HLE have no JIT-specific
+  parity requirement at first, but a JIT-enabled run must never serialize host pointers.
+- Guard the whole JIT behind a runtime layout check (§5); a miss must degrade to the
+  interpreter, never to corrupt state.
+
+## 5. JIT design contract (what actually worked)
+
+- **One instruction per stub.** Fetch/pipeline/cycle accounting stay in the interpreter;
+  the stub writes registers/flags and returns the cycle count. This is what makes the
+  native path provably scheduling-equivalent.
+- **Cache:** direct-mapped, 8192 entries/CPU, key = `(guest PC | T-bit)`, plus the
+  prefetched opcode compared on **every** dispatch (this is what makes stores/DMA/CP15
+  remaps safe — no write-protection needed). Serial epoch starts nonzero so a zero-filled
+  entry can never match; bump the epoch and clear tags on pool reuse/reset/toggle.
+  Unsupported opcodes are cached as *negative* entries and run `runDecoded`.
+- **Pool:** one 4 MiB `.bss` word array shared by both CPUs; ≤160 PPC words per stub
+  (enforce in the emitter; a runaway generator must fail, not overrun); flush every new
+  stub's 32-byte lines (`dcbst` each line, `sync`, `icbi` each line, `sync; isync`).
+- **Bridge ABI:** `jit_enter(void *code, Interpreter *cpu)` (r3/r4): save caller LR at
+  4(old SP), `stwu` 32 bytes, save r31 at 28(new SP), r31 = cpu, `mtctr`/`bctr`.
+  `jit_return` restores and `blr`s. Stubs return the cycle cost in r3 and tail to
+  `jit_return`; never return through a helper's LR. Helpers must call through
+  `Ctx::callAbs()` which opens its own 32-byte parameter area. Scratch: r3–r12; never
+  touch r2/r13/r14–r30; never use r0 as a D-form base.
+- **Interpreter layout:** `ArmJit` is a member *after* the other fields; `attach()` is
+  called from the `Interpreter` constructor and derives `registers`, `cpsr`, `arm7`
+  offsets from a live instance (`(uintptr_t)&c->registers[0] - (uintptr_t)c`). Reject if
+  any offset ≥32768 (signed D-form). Sanity check: in the bring-up tree the derived values
+  were `registers=48, cpsr=300, arm7=32` (small early-member offsets, all far below the
+  limit). Re-derive on every attach; never copy the numbers, and print them in the log.
+  **The single most expensive bug of the bring-up: `attach()` was never called, all
+  offsets stayed 0, and the JIT silently wrote to the wrong addresses.** The
+  `!valid || !inRange` guard plus a one-line layout dump turned it into a 5-minute find.
+- **NZCV mapping.** PPC `rlwinm` rotates left; source/destination below are LSB bit
+  numbers, MB/ME are PPC MSB numbers:
+
+| Guest bit | Source | LSB src → dst | SH | MB=ME |
+|---|---|---|---:|---:|
+| N (31) | CR0 LT (mfcr bit 31) | 31 → 31 | 0 | 0 |
+| Z (30) | CR0 EQ (mfcr bit 29) | 29 → 30 | 1 | 1 |
+| C (29) | XER CA (bit 29) | 29 → 29 | 0 | 2 |
+| V (28) | XER OV (bit 30) | 30 → 28 | 30 | 3 |
+
+  Merge the nibble with `rlwimi cpsr, flags, 0, 0, 3` (MSB numbering: preserves bits ≤27).
+  Use record-form `addoc./subfco./addeo./subfeo.` so CR0/XER carry identical semantics to
+  the ARM expressions (`addc` CA = carry out, `subfc` CA = NOT borrow, `subfe RT,RB,RA`
+  = RA + ~RB + CA). Harvest `mfcr`/`mfxer` IMMEDIATELY, before any other compare.
+  Seed XER[CA] from guest C before ADC/SBC; clear XER SO/OV before arithmetic.
+  Logical N/Z via `cmpwi r,0` + CR0 (bit31 → N, bit29 → Z). Preserve CPSR bits 27–0
+  (Q, control, mode) exactly. Do not translate ops whose C/V semantics you have not
+  reproduced literally from the handler (RSC-S, THUMB NEG).
+  For condition tests, `mtcrf 0x80, cpsr` maps guest N/Z/C/V onto CR0 LT/GT/EQ/SO — that
+  is a *different* mapping from a compare's EQ→Z, so never share one predicate helper
+  between "test flags" and "compare result" code paths.
+- **Conservative first inventory:** ARM data-processing with immediate or **immediate
+  shift** operand (Rd ≠ r15), ARM9 MUL/MLA (operand-independent cost there), B/BL, BX,
+  BLX(reg); THUMB imm-shift, ADD/SUB reg+imm3, MOV/CMP/ADD/SUB imm8, format-4 ALU
+  (minus NEG), hi-register ADD/CMP/MOV, BX/BLX, all 14 conditional B, B, BL/BLX long.
+  Everything else — all loads/stores, LDM/STM/PUSH/POP, SWI, coprocessor/CP15, PC-writing
+  ALU, register-specified shifts, RRX, ARM7 multiplies, THUMB NEG/ROR/reg-shifts — runs
+  the reference handler. Expand only when the verifier (§6) stays silent.
+- Branch stubs must reproduce the handler's exact PC math and then call the real
+  `flushPipeline()` via a helper before returning 3 cycles.
+- **Memory/transfers (next inventory step, not in the first cut):** delegate MMIO, endian
+  handling, alignment and DMA side-effects to the existing `Memory` methods — never
+  reimplement the map. Guest addresses are not host pointers. Word LDR rotation is
+  `(address & 3) * 8` with the shift-zero case guarded (no shift-by-32 UB). A stored ARM
+  r15 is the handler PC + 4; PC loads, SPSR restoration, writeback aliasing and
+  complex/multi transfers should stay fallback until their exact reference behaviour is
+  reproduced. ARM9 high BIOS addresses (≥0x80000000) are legitimate — a guard there may
+  deopt, it must not declare the PC corrupt.
+- THUMB `BX` clears T when bit0 == 0 (`andc` with 0x20, then `or` the shifted bit);
+  THUMB `BLX` always switches to ARM. A wrong `rlwinm` mask here (e.g. clearing the wrong
+  half of the register) is a silent PC corruption.
+
+## 6. Method: correctness first, then speed
+
+1. Build the **rig and the interpreter baseline first** (§7). Without a baseline you
+   cannot distinguish "JIT bug" from "ROM behaviour".
+2. Land the smallest JIT that executes: one ALU class + the bridge + attach + fallback.
+   Prove native execution happens (stats counters, not logs).
+3. Add **differential verification on day one** and keep it in the tree: on each dispatch
+   snapshot `registers[0..15]`, cpsr, spsr, pipeline[0..1], pcData; run the stub; snapshot
+   again; restore; run `runDecoded`; compare registers/cpsr/pipeline/cycles; **keep the
+   interpreter result** and log the first N mismatches (PC, opcode, expected vs got).
+   A rig key `verify=1` makes this cheap. Also verify the **first execution of every newly
+   compiled stub** — a single wrong instruction can stall the guest long before a second
+   cache hit or a framebuffer diff shows anything (observed: 2 dispatches in 300 frames).
+4. Only expand the native inventory when the verifier is silent across the full run.
+5. Then, and only then, attack performance (§6.1).
+
+### 6.1 Performance expectations and levers
+
+A per-instruction stub that calls across translation units, hashes a key, `ctr`-indirect
+jumps, re-derives flags into a guest register (≈9–10 of ≈20 emitted words) and returns via
+a trampoline is **slower than the reference interpreter** on this workload: measured
+3.7× (GBA, 600 frames) and 1.4× (NDS, 30 frames) slower than the interpreter with the
+same config. Expect first-correct JIT ≈ 1–4× *slower* and plan the fix rather than
+discovering it at G4:
+
+- inline the dispatch fast path into `runOpcode` (kill the cross-TU call per opcode);
+- keep guest flags live in CR0/XER and guest registers in a fixed host mapping, so flags
+  cost no merge sequence and operands cost no pointer-chasing loads;
+- only then consider block/trace chaining — which conflicts with the per-dispatch opcode
+  validation that makes this design safe, so it needs an invalidation design
+  (write-protect or store-snoop). That is roadmap work: document it, don't smuggle it in.
+
+Report both numbers: guest cycles per frame (scheduling equivalence) and host ticks per
+frame (performance). Ticks are Dolphin observations, never physical Wii/GCN speed.
+
+## 7. ROMs, SD image and the deterministic rig
+
+```bash
+cd /home/user; mkdir -p nds gba evidence tmp
+curl -fL https://github.com/RockPolish/rockwrestler/raw/master/rockwrestler.nds -o nds/rockwrestler.nds
+curl -fL https://raw.githubusercontent.com/radicalten/gba-test-suite-mgba-emu/e05e71367964d75d65d2b9dded7240608a097a10/suite.gba -o gba/suite.gba
+printf '%s\n' 'f905e16510b00500d432b62dbfafc33e9a7179187475981fe74d9e691a96069a  nds/rockwrestler.nds' '8cf68cd31c5468a70aca8a1c5b63dc372fe755c40b446cf6aa6d0fc6e3a1f035  gba/suite.gba' | sha256sum -c -
+```
+
+Rockwrestler is 39,433 bytes (MD5 `dfd1770daba69955031c0699d33b1dc6`); suite.gba is
+524,288 bytes. Re-verify before every run; the source repositories are context, not identity.
+
+**SD image** (fresh per run, never reused): 128 MiB raw, MBR partition 1 at 1 MiB,
+type 0x0E, FAT16, files in `::/noods/`. Write the MBR with Python; `mformat -i IMG@@1M`
+(no `-F`, which forces FAT32); mount-free staging with mtools at `IMG@@1M`.
+Stage the ROM, `autoboot.txt` and optional `input.txt`.
+
+**Rig contract** (implement in the DUT; inert when `sd:/noods/autoboot.txt` is absent, so
+the normal UI keeps working):
+`path`, `jit`, `frames`, `dump=frame[,frame]`, `trace`, `log`, `verify`, `id` on separate
+lines. Input file: `FRAME down|up KEY[,KEY…]` with 0–11 =
+A,B,SELECT,START,RIGHT,LEFT,UP,DOWN,R,L,X,Y. Output: `sd:/noods/debug.log`, dumps in
+`sd:/noods/dump/` (`state-N.txt`, `fb-N.bin`, `ram-N.bin`, `trace.txt`). Force direct
+boot, ROM-in-RAM, and disable limiter/frameskip/threaded 2D+3D/audio/ARM7-HLE/DSi/filters
+in both variants; record that config.
+Log per real frame: `frame: n=%u runTicks=%llu ndsCycles=%u fps=%d`.
+
+**`runCore()` is not one frame** (HALT/`updateRun` return early). Add an observer counter
+incremented only in `Core::endFrame()` and loop until it changes before counting a frame,
+applying the next frame-indexed input, or ending a measured frame. Observed increments:
+NDS first 408960 then 560190; GBA first 197120 then 280896 — do not hardcode "408960
+every frame". Time the whole loop that reaches `endFrame` (including GPU work), excluding
+SD I/O and dump writing.
+
+## 8. Dolphin launcher and its file-format traps
+
+- Unique `RUN_ID`; refuse to overwrite; `flock` serialization; close the lock FD in the
+  child (`9>&-`) so timeout/xvfb children cannot leak it.
+- Isolated `tmp/dolruns/RUN_ID/user/{Config,Load}`; copy the exact DUT and hash
+  DUT/ROM/config before launching; record commit + dirty status.
+- `Dolphin.ini`: `CPUCore=1`, `CPUThread=False`, `EmulationSpeed=0.0`, `DSPHLE=True`,
+  `SyncGPU=True`, `DeterministicGPUThread=True`, `EnableCheats=False`, plus
+  **`WiiSDCard=True`, `WiiSDCardPath=<run>/user/Load/WiiSD.raw`, `WiiSDCardAllowWrites=True`,
+  `SDCard=True`, `SDCardPath=<that path>`** — without these keys Dolphin mounts no card and
+  the DUT sees no `sd:/` (verify by reading the device, not by hoping).
+  `GFX.ini`: OGL, `InternalResolution=1`, `MSAA=1`, VSync/force-filtering off.
+- Proven launch (keep every backslash):
+  `LIBGL_ALWAYS_SOFTWARE=1 LP_NUM_THREADS=2 xvfb-run -a -s '-screen 0 640x480x24' timeout --signal=TERM --kill-after=10s <SECS>s /usr/games/dolphin-emu-nogui -u "$RUN/user" -p x11 -v OGL -a HLE -e "$RUN/dut.dol" 9>&- > "$RUN/dolphin.log" 2>&1`
+- Always pull artifacts from the DUT's own `user/Load/WiiSD.raw`, never the staging image.
+- **libfat commits a file's size only on close/sync.** A log left open by a killed process
+  reads back as 0 bytes: checkpoint (fclose + `fopen(...,"a")`) every ~60 frames and call
+  `exit(0)` at the end of a bounded run so Dolphin commits and exits by itself — that turns
+  a 220 s timeout into a 5–15 s run (exit 0 instead of 137).
+- `mcopy` cannot glob inside the image: enumerate with `mdir -i IMG@@1M -b -w ::/noods/dump`
+  and copy each name. Missing/empty artifacts are NOT_RUN, not "identical".
+- Budgets: interpreter GBA ≤300 frames ≈ 5–15 s wall; NDS ≤45 frames with dumps ≈ 5 s;
+  a diverged or slow DUT will burn the whole timeout. A timeout is a signal (preserve the
+  partial log), not an invitation to raise the limit.
+- `--version` on the packaged Dolphin reported `[master] 2503`; ALSA "no card" warnings
+  appear despite Null audio and do not prove failure.
+
+## 9. Tools to write (interfaces)
+
+- `tools/setup-devkitppc.sh` (idempotent, §2) + `tools/toolchain-packages.sha256`.
+- `tools/mksd.sh IMAGE ROM CONFIG [INPUT]` — fresh MBR/FAT16 image per run.
+- `tools/run-dolphin.sh DOL SECONDS IMAGE [RUN_ID]` — launcher above + artifact pull.
+- `tools/compare-runs.py RUN_A RUN_B` — per-frame guest cycles, framebuffer hashes, tick
+  totals/ratio, dump sha256s; prints mismatch counts, never "OK".
+- Worth adding as you go: `test-case.sh ID jit|interp ROM FRAMES SECONDS [INPUT]`,
+  `autodump.sh [--diff A B]`, `perf-report.py` (warm media ticks), `suite-case.py`,
+  and under the rig for the encoder: assembler-vs-emitter byte comparison for every form.
+
+```bash
+export PATH=/opt/devkitpro/tools/bin:/opt/devkitpro/devkitPPC/bin:$PATH
+cd /home/user/NooDS-Wii && make JIT=1 -j4 && make JIT=0 -j4 && sha256sum jit.dol NooDS-Wii-interp.dol
+cd /home/user
+tools/mksd.sh tmp/sd/x.raw nds/rockwrestler.nds tmp/cfg/nds-jit1.txt
+tools/run-dolphin.sh NooDS-Wii/jit.dol 200 tmp/sd/x.raw UNIQUE-nds-jit
+python3 tools/compare-runs.py tmp/dolruns/UNIQUE-nds-ref tmp/dolruns/UNIQUE-nds-jit
+```
+
+## 10. Gates — fresh, on the exact delivered binary
+
+- **G0 Build/provenance:** both variants compile/link with `.S` included; sha256 + flags +
+  revision recorded; `JIT=0` built from the same source with only `NOODS_JIT=0`.
+- **G1 Encoder:** assembler bytes + `objdump` for every PPC form used (host-only harness
+  proves nothing about target macros/ABI).
+- **G2 Accuracy:** same ROM/config/input/frame count in both variants. 10-frame sanity,
+  then 45 real frames comparing CPU registers/banks, CPSR/SPSR, halt, cycles, pipeline,
+  scheduler events, framebuffer and dumped RAM. Missing/empty dumps are NOT_RUN.
+  Trajectories count: compare per-frame `ndsCycles` (scheduling) *and* data (FB/RAM/state).
+- **G2b Bisect:** stop at the first differing frame/state and inspect guest PC/opcode and
+  the emitted stub; do not run long suites on a known-divergent build. A periodic PC sample
+  is not evidence of a hang.
+- **G3 GBA suite:** every group/test in both variants with audited stable IDs (§11),
+  explicit baseline failures vs regressions, no group-boot row substituted for results.
+- **G4 Performance:** fresh pairs, same ROM/count/settings, warm-frame mean host ticks plus
+  native statistics; slow results are valid results.
+
+CSV schema (one row per test/variant/run): `run_id,commit,variant,dol_sha256,rom_sha256,`
+`test_id,test_name,status,notes,evidence`; status ∈ PASS/FAIL/SKIP/HANG/NOT_RUN.
+The tested configuration is HLE BIOS / no proprietary BIOS: record it, and never attribute
+every baseline failure to the JIT.
+
+## 11. GBA suite automation
+
+Drive real keys through Input with frame-indexed press/release (the rig's `input.txt`);
+DSU is optional, never an excuse. Never patch the ROM or infer success from the main menu;
+the selected group must finish (the `Testing...` screen disappears) before its result list
+means anything.
+
+Pinned counts by menu index (1,419 total): 0 memory 36 · 1 io-read 130 · 2 timing 132 ·
+3 timers 26 · 4 timer-irq 9 · 5 shifter 70 · 6 carry 31 · 7 multiply-long 36 ·
+8 bios-math 123 · 9 dma **718** · 10 sio-read 90 · 11 sio-timing 8 · 12 misc-edge 3 ·
+13 video 7. (Do not cap DMA at 160 — that is the result-name buffer size.)
+
+- Right-paging is not `+16`: with `VIEW_SIZE=16`,
+  `if i == n-1: next=0; elif i+16 >= n: next=n-1; elif view+15 == i: next=i+16; else next=view+15`
+  then scroll when `next >= view+16` (`view = next-15`) or `next < view` (`view = next`).
+  From index 0 the first RIGHT selects 15, the second 31 and scrolls. Use result pages, not
+  row-by-row frames (a DMA run timed out at 2614 frames; don't just raise the timeout).
+- Label truncation can duplicate names: include the index in the stable ID and audit all
+  labels independently; a wrong pager silently mislabels everything.
+- Video tests are a separate oracle: the menu hardcodes `passed=true`; invoke each test,
+  capture Actual/Expected (RIGHT selects) and compare pixels against the ROM's expected
+  image and across variants. If no trustworthy capture exists, record NOT_RUN.
+
+Rockwrestler additionally has an on-ROM CPU test menu worth running: an ARMv4/v5 condition
+suite and 11 ARMv5 entries (CLZ, saturating ops, signed multiplies, BLX, PC interworking,
+LDM/STM). Enter with A, select with DOWN, and wait for a real OK/FAIL/TIMEOUT row — do not
+read the main menu as success. Its font is 8192 bytes at file offset 0xDCC, 64 bytes/glyph
+(sha256 `9c9bee00adcdecc27ddc557605a8a2c21351c71dd0aa2dd078dbdc1166ec8b1c`), so displayed
+results can be decoded from pixels if the rig cannot read text directly. Note the historical
+`LDM / STM` FAIL (`FAIL 00B`) before attributing any storage failure to the JIT.
+
+## 12. Deliverables, evidence, snapshot discipline
+
+`deliverables/`: (1) `jit.dol` — the exact tested bytes with sha256, labelled
+verified/candidate honestly; (2) `handoff.md` — status vs gates, native/fallback inventory,
+exact build/SD/run/pull commands, hashed evidence index, Dolphin-only performance table,
+the first failing gate + smallest next step, known limitations; (3) `evidence/` — DOL and
+ROM hashes, configs, input plans, debug logs, dumps, toolchain manifest; (4) a
+`SHA256SUMS` index. Keep an interpreter DOL and its runs alongside for comparison; keep
+failed attempts, clearly separated. Preserve GPL source/licensing with the binary.
+
+Snapshots: only `/home/user` persists and 128 MiB SD images count even when sparse —
+deduplicate images, keep text evidence, and never delete the only copy of an artifact.
+State plainly what was not verified (no physical console, no GameCube build, no
+proprietary BIOS, no save/load JIT parity) rather than implying it.
+
+## 13. Trap catalogue
+
+| ID | Symptom | Cause / smallest fix |
+|---|---|---|
+| T1 | JIT writes garbage state / crashes only under native execution | `attach()` never ran, offsets are 0 (§5); guard on `valid && inRange` and dump the layout |
+| T2 | Runtime goes through the interpreter despite `jit=1` | Check the actual gate (`jit.enabled`) and where `runArm/runThumb` are called; stats counters, not assumptions |
+| T3 | Guest stalls after the first instructions; FB freezes; only 1–2 dispatches | A wrong early instruction/HALT path; use the differential verifier at compile time (§6.3), not a longer run |
+| T4 | cmp/bne never terminates, PC drifts into data | Wrong CR0/XER harvest or rotate; use §5 table and the runtime first-diff |
+| T5 | NZ depends on scratch state | Comparing against r0 instead of `cmpwi r,0`; no compare inside the mfcr/mfxer live range |
+| T6 | Wild PC/LR that looks like a register list | LDM/STM decoded as a branch; B/BL requires `(op & 0x0E000000) == 0x0A000000` |
+| T7 | SIGILL/stale code after a ROM write | Incomplete 32-byte-line dcbst/icbi range, or a stale cache key without the T bit |
+| T8 | Registers corrupt after a helper call | Helper LR/stack misuse, missing parameter area, or r2/r13/CR2–4 clobbered |
+| T9 | Cycle drift but identical data | Fallback returning a guessed cost, or double fetch/PC advance |
+| T10 | ARM7/ARM9 budget wrong on NDS | The scheduler's ×2 / >>1 applied twice or in the JIT; keep it in the scheduler |
+| T11 | “Guest hang” from sampling | Sampling alias; use endFrame counters and full snapshots |
+| T12 | Compile errors on private members | Add `friend class ArmJit;` or an accessor; never guess offsets (§1) |
+| T13 | Host harness green, target red | `PPC=1` macro collision / target ABI; always cross-compile too |
+| T14 | `sd:/` missing, no log at all | Dolphin SD keys absent (§8) — verify by reading the image afterwards |
+| T15 | Log file 0 bytes although the run happened | libfat only commits size on close; checkpoint + `exit(0)` (§8) |
+| T16 | Pulled artifacts empty/missing | Globbing inside the image; enumerate with `mdir -b -w` and reject missing data |
+| T17 | `no such dol` | Relative DUT path resolves under `/home/user/NooDS-Wii`; use an absolute path |
+| T18 | Next run refuses to start | Stale RUN_ID (`refuse overwrite`) or leaked lock FD; new ID, `9>&-` |
+| T19 | Timeout with a still-progressing guest | Diverged/slow DUT or heavy SD I/O; preserve partial evidence, don't raise the timeout blindly |
+| T20 | Emitter overruns or falls through | Enforce the 160-word budget and a single exit per stub; fail compilation, don't run garbage |
+| T21 | Equal CSVs, wrong test labels | Pager semantics + truncated duplicate labels; audit IDs before believing results |
+| T22 | All video rows PASS | The list hardcodes `true`; execute and compare pixels |
+| T23 | `/opt` gone after a reset | Re-run `tools/setup-devkitppc.sh`; nothing outside `/home/user` persists |
