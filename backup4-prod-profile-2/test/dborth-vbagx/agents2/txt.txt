@@ -5,7 +5,10 @@ prompts:
 AGENTS(9).md (Take AGENTS(8)v2.md and feed it the prompt from AGENTS(8)v2.md basically unchanged and hope for the best).
 Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project.
 
+**agent gave an answer after 1h27m, was able to do this with 61.9MB/128.0MB didn't go over budget like previous attempts which have gone to 6700MB+ and had files in its workspace deleted.**
+**the jit file itself was slower than the standard version, but it seemed to be able to use the .py files for gba.suite and allegedly patch something**
 
+continue with your preferred plan of action.
 
 
 AGENTS(8).md (Take AGENTS(7).md and feed it the prompt from AGENTS(7).md basically unchanged and hope for the best).
