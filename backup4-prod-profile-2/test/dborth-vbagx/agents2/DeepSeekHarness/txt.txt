@@ -1,6 +1,7 @@
 Provided this same prompt to Thinking Machines: Inkling (free) OpenRouter using DeepSeekHarness 1 agent 1 subagent Standard Mode.
 Will compare to how lmarena.ai outcome works
 terminal bench 2.1 scores:
+Claude 5 sonnet 80.5% July 2026
 Inkling Small 276b12a 64.7% July 2026
 Inkling 975b41a 63.8% July 2026
 
@@ -12,4 +13,4 @@ Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC 
 **Follow up Q:**
 Can you write a new AGENTS.md file that updates the originally updated one but is suited to this current environment? Specifically the environment at the beginning of the task before you run a single command.
 
-**Produced the following new AGENTS-DSH-v1.md**
+**Produced the following new AGENTS-DSH-v1.md 164 lines total from 311 lines**
