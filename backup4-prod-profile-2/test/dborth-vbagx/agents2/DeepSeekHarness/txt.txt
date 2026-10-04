@@ -13,4 +13,4 @@ Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC 
 **Follow up Q:**
 Can you write a new AGENTS.md file that updates the originally updated one but is suited to this current environment? Specifically the environment at the beginning of the task before you run a single command.
 
-**Produced the following new AGENTS-DSH-v1.md 164 lines total from 311 lines**
+**Produced the following new AGENTS-Ink-dsh-v1.md 164 lines total from 311 lines**
