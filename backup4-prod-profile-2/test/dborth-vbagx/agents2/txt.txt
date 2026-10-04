@@ -5,7 +5,25 @@ prompts:
 
 AGENTS(9).md v4  (Take AGENTS(8)v4-v3-gem3pt8.md failed on 2 attempts with the prompt unchanged so I added the small bit about sharing snippets of its though process as it works)
 cson5 edit .md and feed it the prompt from AGENTS(8)v2.md basically unchanged and hope for the best).
-Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project.P lease give short snippets of your thinking as you work.
+Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project. Please give short snippets of your thinking as you work.
+
+**major success here in asking agent to figure out how to automate the gba.suite testing result is AGENTS(10).md 402 lines https://github.com/mattrbeck/mgba-suite-auto/releases/tag/latest**
+
+**each of my prompts to get AGENTS(10).md (the new gold standard with its gba.suite automated test suite by endrift forked by mattrbeck for automated testing**
+
+
+looks good so far. can you modify the test protocols to use the auto mgba testing suite found here instead? I believe that will help you solve issues with the program: https://github.com/mattrbeck/mgba-suite-auto/releases/tag/latest
+
+continue to optimize the debug logs to utilize the new auto gba suite
+
+tell me about the automated mgba suite. what results did you find?
+
+are you sure about the results of the gba test suite? when running manually there are very different results. the memory test for example should yield 1259/1552.
+
+Great work! Can you make a new AGENTS.md file based on what you learned? The main update to the AGENTS.md is that now I would like you to write to use the automated suite.gba instead of the old initial one. include as much info as needed so that the new agent who reads this file and the new prompt will be able to start fresh from a new repo with only the base NooDS-Wii github repo and the AGENTS.md file
+
+Great work! Can you make a new AGENTS.md file based on what you learned? The main update to the AGENTS.md is that now I would like you to write to use the automated suite.gba instead of the old initial one. include as much info as needed so that the new agent who reads this file and the new prompt will be able to start fresh from a new repo with only the base NooDS-Wii github repo and the AGENTS.md file
+
 
 
 
