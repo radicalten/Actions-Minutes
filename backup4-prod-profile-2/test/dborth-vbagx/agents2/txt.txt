@@ -3,7 +3,7 @@ new attempt 9-30-26 learning the limits of lmarena's workspace:
 prompts:
 
 
-AGENTS(9).md v3  (Take AGENTS(8)v4.md cson5-search condensed version of the v3 condensed)
+AGENTS(9).md v3  (Take AGENTS(8)v4-v3.md cson5-search condensed version of the AGENTS(8)v3.md condensed)
 cson5 edit .md and feed it the prompt from AGENTS(8)v2.md basically unchanged and hope for the best).
 Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project.
 
@@ -22,6 +22,11 @@ Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC 
 
 yes, condense even further, this was a great start
 
+**condensed from 444 to 364 lines**
+
+Great! Let's condense even more if you think that is reasonable. 
+
+**condensed from 364 to 311 line. this seems ok Claude Code's own guidelines are 100 to 200 lines, so this isn't terribly far off the way the 2300 line version was--now its AGENTS(8)v4-v3.md**
 
 AGENTS(9).md (Take AGENTS(8)v2.md and feed it the prompt from AGENTS(8)v2.md basically unchanged and hope for the best).
 Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project.
