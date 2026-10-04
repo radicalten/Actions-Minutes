@@ -1,1 +1,15 @@
+Provided this same prompt to Thinking Machines: Inkling (free) OpenRouter using DeepSeekHarness 1 agent 1 subagent Standard Mode.
+Will compare to how lmarena.ai outcome works
+terminal bench 2.1 scores:
+Inkling Small 276b12a 64.7% July 2026
+Inkling 975b41a 63.8% July 2026
 
+
+AGENTS(9).md v3  (Take AGENTS(8)v4-v3.md cson5-search condensed version of the AGENTS(8)v3.md condensed)
+cson5 edit .md and feed it the prompt from AGENTS(8)v2.md basically unchanged and hope for the best).
+Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project.
+
+**Follow up Q:**
+Can you write a new AGENTS.md file that updates the originally updated one but is suited to this current environment? Specifically the environment at the beginning of the task before you run a single command.
+
+**Produced the following new AGENTS-DSH-v1.md**
