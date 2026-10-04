@@ -18,6 +18,10 @@ Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC 
 
 "Can you fix my AGENTS.md to be substantially shorter? The main thing is I want the AI agent to write a brand new dynamic arm to ppc jit recompiler from scratch to suit the target repo NooDS-wii. The rest is only supposed to be helpful info, but the file itself is too big I think. Use your best judgment: AGENTS.md: <full text of AGENTS(8)v3.md>
 
+**Condensed from 2300 lines to 444 lines, which is great, then it asked if I wanted to condense more so I said yes**
+
+yes, condense even further, this was a great start
+
 
 AGENTS(9).md (Take AGENTS(8)v2.md and feed it the prompt from AGENTS(8)v2.md basically unchanged and hope for the best).
 Our task is the following. I would like to add an ARMv4/v5 (gba/nds) to PowerPC (PPC GCN/Wii) dynamic (JIT) recompiler to the NooDS-Wii codebase. Currently NooDS-Wii uses an interpreter, but for this armv4/v5 to ppc dynarec I would like to use the interpreter only as a fallback mechanism. To achieve this you must configure a devkitppc build environment, create a new makefile that can handle assembly .S files, configure a test environment with dolphin and run the program with both the rockwrestler.nds and suite.gba test roms to verify emulation accuracy. The NooDS-Wii.dol outputs a debug log which you can read to verify and compare performance between versions. For the final output please place the resulting jit.dol file in a deliverable folder, along with a handoff.md file the summarizes current progress, and what is required for the next step. Please refer to the AGENTS.md for additional information on setting up this project.
