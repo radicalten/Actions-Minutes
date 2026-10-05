@@ -2,6 +2,11 @@ new attempt 9-30-26 learning the limits of lmarena's workspace:
 
 prompts:
 
+AGENTS(10).md (New automated testing suite. should work with shorter prompt).
+Please refer to the AGENTS.md for information on setting up this project. Please give short snippets of your thinking as you work.
+
+
+
 
 AGENTS(9).md v4  (Take AGENTS(8)v4-v3-gem3pt8.md failed on 2 attempts with the prompt unchanged so I added the small bit about sharing snippets of its though process as it works)
 cson5 edit .md and feed it the prompt from AGENTS(8)v2.md basically unchanged and hope for the best).
