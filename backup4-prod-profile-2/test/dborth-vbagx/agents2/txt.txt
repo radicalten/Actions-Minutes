@@ -2,6 +2,10 @@ new attempt 9-30-26 learning the limits of lmarena's workspace:
 
 prompts:
 
+AGENTS(11).md (Its AGENTS(11).md which is AGENTS(10).md but now cson5-search has adapted it to use vbagx as a reference. should be good?)
+Please refer to the AGENTS.md for information on setting up this project. Please give short snippets of your thinking as you work.
+
+
 AGENTS(10).md (New automated testing suite. should work with shorter prompt).
 Please refer to the AGENTS.md for information on setting up this project. Please give short snippets of your thinking as you work.
 
