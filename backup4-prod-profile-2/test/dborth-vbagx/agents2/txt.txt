@@ -6,6 +6,12 @@ AGENTS(11).md (Its AGENTS(11).md which is AGENTS(10).md but now cson5-search has
 Please refer to the AGENTS.md for information on setting up this project. Please give short snippets of your thinking as you work.
 
 
+AGENTS(11).md same file but new prompt for dsh thinking-machines free (Its AGENTS(11).md which is AGENTS(10).md but now cson5-search has adapted it to use vbagx as a reference. should be good?)
+Please refer to the AGENTS.md for information on setting up this project. Please give short snippets of your thinking as you work. You will need to adapt the instructions in the AGENTS.md file for this work environment as everything was written with the expectation of a linux workspace, but this is a MacOS environment.  
+
+
+
+
 AGENTS(10).md (New automated testing suite. should work with shorter prompt).
 Please refer to the AGENTS.md for information on setting up this project. Please give short snippets of your thinking as you work.
 
