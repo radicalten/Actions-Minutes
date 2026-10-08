@@ -1,6 +1,12 @@
 Prompts to lm arena ai agents 10-8-26
 
-p1 + follow ups: 
+p2 + follow ups 
+Can you optimize my agents.md for this lm arena environment? my current one does not consider that different agents hand off different tasks and other particularities of this sandbox. 
+
+
+
+
+p1 + follow ups: (this entire chain failed, the agent gave up trying to help and gave 10s responses starting file is agents(11).md).
 Can you create an optimal agents.md template for working on a github repo in this environment? consider the fact that different agents may work on this between turns, and the need for brevity and concise token use
 
 Ok now I would like you to review my current AGENTS.md and suggest changes to meet the requirements of this environment vs the one it was made for. please provide the full new corrected document when done
