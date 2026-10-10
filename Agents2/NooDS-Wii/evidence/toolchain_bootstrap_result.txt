@@ -1,0 +1,5 @@
+STATUS=PASS
+PREFIX=/opt/devkitpro
+GCC_VERSION=powerpc-eabi-g++ (devkitPPC) 16.1.0
+AS_VERSION=GNU assembler (GNU Binutils) 2.46.0.20260210
+ELF2DOL=/opt/devkitpro/tools/bin/elf2dol
