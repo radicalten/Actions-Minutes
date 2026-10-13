@@ -1,0 +1,708 @@
+diff --git a/NooDS-Wii/NooDS-Wii/arm_jit.cpp b/NooDS-Wii/NooDS-Wii/arm_jit.cpp
+index 3137b42..e23ce1d 100644
+--- a/NooDS-Wii/NooDS-Wii/arm_jit.cpp
++++ b/NooDS-Wii/NooDS-Wii/arm_jit.cpp
+@@ -34,6 +34,29 @@ static uint32_t s_leadingLoadCount[2][256];
+ static uint32_t s_leadingLoadLast[2][256];
+ #endif
+ 
++// Diagnostics: per-guest-PC dispatch profile (block hits, stub hits, interpreter
++// fallbacks) per CPU/ISA. Opt-in; used to decide which opcode classes are worth
++// translating natively.
++#ifndef NOODS_JIT_HOTPC
++#define NOODS_JIT_HOTPC 0
++#endif
++#if NOODS_JIT_HOTPC
++#define FBPC_SLOTS 2048
++enum FbKind { FBK_BLOCK = 0, FBK_STUB = 1, FBK_FALLBACK = 2, FBK_KINDS = 3 };
++struct FbSite { uint32_t pc; uint32_t opcode; uint32_t n[FBK_KINDS]; };
++static FbSite s_fbSite[4][FBPC_SLOTS];
++static inline void fbSiteRecord(int idx, uint32_t pc, uint32_t opcode, int kind) {
++    FbSite *tab = s_fbSite[idx];
++    uint32_t key = (pc ^ (pc >> 9) ^ (opcode >> 13)) & (FBPC_SLOTS - 1);
++    for (uint32_t probe = 0; probe < 128; probe++) {
++        FbSite &e = tab[(key + probe) & (FBPC_SLOTS - 1)];
++        uint32_t total = e.n[0] + e.n[1] + e.n[2];
++        if (total == 0) { e.pc = pc; e.opcode = opcode; e.n[kind] = 1; return; }
++        if (e.pc == pc) { e.n[kind]++; e.opcode = opcode; return; }
++    }
++}
++#endif
++
+ #if NOODS_JIT_PROFILE
+ extern "C" {
+     #include <tuxedo/ppc/clock.h>
+@@ -106,6 +129,10 @@ static inline bool isMemClassArm(uint32_t op) {
+ #ifndef NOODS_JIT_KEYINPUT_FAST
+ #define NOODS_JIT_KEYINPUT_FAST 1
+ #endif
++// ARM7 polls IPCSYNC (0x04000180) in its IPC wait loops; it is a plain register with no side effects
++#ifndef NOODS_JIT_IPCSYNC_FAST
++#define NOODS_JIT_IPCSYNC_FAST 1
++#endif
+ static constexpr bool kNativeHalfLoads = NOODS_JIT_NATIVE_HALF_LOADS != 0;
+ static inline bool isNativeLoadArm(bool arm7, uint32_t op) {
+     if ((op >> 28) == 0xFu) return false;
+@@ -124,7 +151,8 @@ static inline bool isNativeLoadArm(bool arm7, uint32_t op) {
+     }
+     // Halfword loads are only translated by default for ARM9: guarded
+     // DISPSTAT reads avoid the interpreter, while ARM7 keeps its old path.
+-    if (!kNativeHalfLoads && !((NOODS_JIT_DISPSTAT_FAST || NOODS_JIT_KEYINPUT_FAST) && !arm7)) return false;
++    if (!kNativeHalfLoads && !((NOODS_JIT_DISPSTAT_FAST || NOODS_JIT_KEYINPUT_FAST) && !arm7)
++                         && !(NOODS_JIT_IPCSYNC_FAST && arm7)) return false;
+     if (((op >> 16) & 0xFu) == 15u) return false;
+     if ((op & 0x0E000090u) == 0x00000090u && (op & 0x60u) == 0x20u) { // LDRH (SH == 01)
+         if ((op & (1u << 22)) == 0) {           // register offset
+@@ -136,18 +164,56 @@ static inline bool isNativeLoadArm(bool arm7, uint32_t op) {
+     return false;
+ }
+ 
+-// Native STRH, pre-indexed immediate offset, no writeback, unconditional, Rn/Rd != PC.
++// Native halfword store (STRH), pre- or post-indexed, immediate or unshifted register offsets,
++// with or without writeback, unconditional, Rn/Rd != PC. emitNativeStoreArm also handles the
++// STR/STRB single-data-transfer encodings, but accepting those still diverges from the interpreter
++// under block compilation on rockwrestler (see notes): a block containing a native STR/STRB ends
++// with a stale pipeline[0]/R15 pair, while the single-instruction build matches exactly, so only
++// the STRH subset is enabled until that is understood.
+ static inline bool isNativeStoreArm(uint32_t op) {
+     if ((op >> 28) != 0xEu) return false;
+-    if ((op & 0x0E000000u) != 0) return false;           // bits 27..25 == 000
+-    if ((op & 0x01400000u) != 0x01400000u) return false; // P=1, I=1
+-    if ((op & 0x00300000u) != 0) return false;           // W=0, L=0
+-    if ((op & 0xF0u) != 0xB0u) return false;             // 1 SH=01 1 (halfword store)
++    if ((op & (1u << 20)) != 0) return false;            // L = 0 (store)
+     if (((op >> 16) & 0xFu) == 15u) return false;
+     if (((op >> 12) & 0xFu) == 15u) return false;
++    const bool pre = (op & (1u << 24)) != 0;
++    const bool wb  = (op & (1u << 21)) != 0;
++    if ((op & 0x0E000090u) != 0x00000090u || (op & 0xF0u) != 0xB0u) return false; // STRH only
++    if (!pre && !wb) { /* P=0,W=0: NooDS's STRH handler still post-updates Rn (see emitter) */ }
++    if ((op & (1u << 22)) == 0) {                        // register offset (unshifted)
++        if ((op & 0xF00u) != 0) return false;
++        if ((op & 0xFu) == 15u) return false;
++    }
+     return true;
+ }
+ 
++// ARM LDR/LDRB/LDRH with Rd == 15: a computed branch. Only pre-indexed forms are compiled natively;
++// post-indexed / unprivileged forms keep their old interpreter fallback. Non-PC loads are untouched.
++static inline bool isPcDestLoadTerminatorArm(bool arm7, uint32_t op) {
++    (void)arm7;
++    if ((op >> 28) == 0xFu) return false;
++    if (((op >> 12) & 0xFu) != 15u) return false;
++    if ((op & (1u << 20)) == 0) return false;              // L (load)
++    if ((op & (1u << 24)) == 0) return false;              // P (pre-indexed only)
++    if (((op >> 16) & 0xFu) == 15u && (op & (1u << 21)) != 0) return false; // PC base with writeback
++    if ((op & 0x0C000000u) == 0x04000000u) {               // LDR / LDRB
++        if ((op & (1u << 25)) != 0) {                      // register offset
++            if ((op & (1u << 4)) != 0) return false;
++            if ((op & 0xFu) == 15u) return false;
++            if (((op >> 5) & 3u) != 0u) return false;      // only LSL-scaled register offsets
++        }
++        return true;
++    }
++    if ((op & 0x0E000090u) == 0x00000090u && (op & 0xF0u) == 0xB0u) { // LDRH only
++        if ((op & (1u << 22)) == 0) {                      // register offset (unshifted)
++            if ((op & 0xF00u) != 0) return false;
++            if ((op & 0xFu) == 15u) return false;
++        }
++        return true;
++    }
++    return false;
++}
++
++
+ // Small static BSS fallback pool if MEM2 allocation is unavailable
+ alignas(32) static uint32_t s_bssPoolFallback[16384];
+ 
+@@ -908,6 +974,188 @@ bool ArmPpcJit::emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opc
+     return true;
+ }
+ 
++// Inline exit for an ARM LDR/LDRB/LDRH targeting PC (computed branch / dispatch table). Mirrors the
++// interpreter's ldrOf / ldrbOf / ldrhOf: the load runs natively when its page is mapped, R15 receives the raw
++// loaded word (after the word / ARM7-halfword misalign rotates), the THUMB bit is latched from bit 0 on ARM9,
++// and the pipeline is refilled inline when the target page is mapped and stays clear of the page ends.
++// Anything else (unmapped source page, THUMB target, guard zone) falls into the interpreter handler for the
++// opcode, which performs the whole instruction. Cycles match the handlers: taken -> prefix + 5, not taken -> +1.
++bool ArmPpcJit::emitPcDestLoadTerminatorArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC,
++                                            int32_t totalDelta, int32_t prefixCycles, bool helperInBlock) {
++    const uint8_t cond = (uint8_t)(opcode >> 28);
++    if (cond == 0xFu) return false;
++    if (!isPcDestLoadTerminatorArm(cpu->arm7, opcode)) return false;
++    const bool single = (opcode & 0x0C000000u) == 0x04000000u;
++    const bool isByte = single && (opcode & (1u << 22)) != 0;
++    const bool isHalf = !single;
++    const bool up = (opcode & (1u << 23)) != 0;
++    const bool wb = (opcode & (1u << 21)) != 0;
++    const bool immOff = single ? ((opcode & (1u << 25)) == 0) : ((opcode & (1u << 22)) != 0);
++    const uint8_t rn = (uint8_t)((opcode >> 16) & 0xF);
++    const uint8_t rm = (uint8_t)(opcode & 0xF);
++    const uint8_t shift = single ? (uint8_t)((opcode >> 7) & 0x1F) : 0;
++    const uint32_t imm = single ? (opcode & 0xFFFu) : (uint32_t)(((opcode >> 4) & 0xF0u) | (opcode & 0xFu));
++
++    const uint32_t brAddr = instrPC + (uint32_t)totalDelta;
++    const uint32_t r15Instr = brAddr + 8u;
++    const int16_t offR15   = (int16_t)(offsetof(Interpreter, registersUsr) + 15 * 4);
++    const int16_t offPcDat = (int16_t)offsetof(Interpreter, pcData);
++    const int16_t offPipe0 = (int16_t)offsetof(Interpreter, pipeline);
++    const int16_t offPipe1 = (int16_t)(offsetof(Interpreter, pipeline) + 4);
++    const int16_t offCpsr  = (int16_t)offsetof(Interpreter, cpsr);
++    const int16_t offCore  = (int16_t)offsetof(Interpreter, core);
++    const uint32_t offReadMap = (uint32_t)(offsetof(Core, memory) + (cpu->arm7 ? offsetof(Memory, readMap7) : offsetof(Memory, readMap9A)));
++
++    auto emitReturn = [&](int cycles, bool addToR3) {
++        if (addToR3) {
++            if (cycles != 0) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)cycles);
++        } else {
++            *p++ = JitPpc::li(JitPpc::R3, (int16_t)cycles);
++        }
++        if (helperInBlock) {
++            *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);
++            *p++ = JitPpc::mtlr(JitPpc::R0);
++        }
++        *p++ = JitPpc::lmw(JitPpc::R28, JitPpc::R1, 16);
++        *p++ = JitPpc::addi(JitPpc::R1, JitPpc::R1, 32);
++        *p++ = JitPpc::blr();
++    };
++
++    // Forward branches into the interpreter-handler path (kind: 0 = beq, 1 = bne, 2 = blt, 3 = bgt)
++    uint32_t *slowFix[8];
++    uint8_t slowKind[8];
++    int slowCount = 0;
++    auto fixSlow = [&](uint8_t kind) { slowFix[slowCount] = p++; slowKind[slowCount] = kind; slowCount++; };
++
++    uint32_t *bNotTaken = nullptr;
++    if (cond != 0xEu) {
++        // Interpreter::condition[(cond << 4) | (cpsr >> 28)]; values are 0/1 for every cond != 0xF
++        *p++ = JitPpc::lwz(JitPpc::R6, JitPpc::R31, offCpsr);
++        *p++ = JitPpc::rlwinm(JitPpc::R6, JitPpc::R6, 4, 28, 31);
++        *p++ = JitPpc::addi(JitPpc::R6, JitPpc::R6, (int16_t)(cond << 4));
++        emitLoadImm32(p, JitPpc::R7, (uint32_t)(uintptr_t)Interpreter::condition);
++        *p++ = JitPpc::add(JitPpc::R7, JitPpc::R7, JitPpc::R6);
++        *p++ = JitPpc::lbz(JitPpc::R6, JitPpc::R7, 0);
++        *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
++        bNotTaken = p++;
++    }
++
++    // Effective address in R3; PC-relative bases use the compile-time instruction PC, never the runtime R15
++    if (rn == 15) emitLoadImm32(p, JitPpc::R3, r15Instr);
++    else emitLoadGuestReg(p, JitPpc::R3, rn);
++    if (immOff) {
++        if (imm != 0) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(up ? (int32_t)imm : -(int32_t)imm));
++    } else {
++        emitLoadGuestReg(p, JitPpc::R4, rm);
++        if (shift) *p++ = JitPpc::slwi(JitPpc::R4, JitPpc::R4, shift);
++        if (up) *p++ = JitPpc::add(JitPpc::R3, JitPpc::R3, JitPpc::R4);
++        else    *p++ = JitPpc::subf(JitPpc::R3, JitPpc::R4, JitPpc::R3);
++    }
++
++    // Mapped read of the loaded value into R8 (same page-map fast path as emitNativeLoadArm)
++    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R3, 12);
++    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
++    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
++    emitLoadImm32(p, JitPpc::R7, offReadMap);
++    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
++    *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
++    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
++    fixSlow(0);
++    *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, (uint8_t)(isByte ? 31 : (isHalf ? 30 : 29)));
++    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R7);
++    if (isByte)      *p++ = JitPpc::lbz(JitPpc::R8, JitPpc::R7, 0);
++    else if (isHalf) *p++ = JitPpc::lhbrx(JitPpc::R8, 0, JitPpc::R7);
++    else             *p++ = JitPpc::lwbrx(JitPpc::R8, 0, JitPpc::R7);
++    if (!isByte) {
++        // Misaligned rotates, exactly as the interpreter handlers apply them
++        if (!isHalf)       *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 27, 28);   // (addr & 3) << 3
++        else if (cpu->arm7) *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);  // (addr & 1) << 3
++        if (!isHalf || cpu->arm7) {
++            *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
++            *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
++        }
++    }
++
++    if (!cpu->arm7) {
++        // Latch the THUMB bit from bit 0; a THUMB target needs the interpreter's 16-bit refill
++        *p++ = JitPpc::rlwinm(JitPpc::R10, JitPpc::R8, 5, 5, 5);
++        *p++ = JitPpc::lwz(JitPpc::R9, JitPpc::R31, offCpsr);
++        *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R9, 0, 27, 25);          // clear T bit
++        *p++ = JitPpc::or_(JitPpc::R9, JitPpc::R9, JitPpc::R10);
++        *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offCpsr);
++        *p++ = JitPpc::andi_rc(JitPpc::R10, JitPpc::R8, 1);
++        fixSlow(1);
++    }
++
++    // ARM target: A = value & ~3, refilled only while it stays clear of the mapped page ends
++    *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R8, 0, 0, 29);               // A
++    *p++ = JitPpc::rlwinm(JitPpc::R10, JitPpc::R9, 0, 20, 29);             // A & 0xFFC
++    *p++ = JitPpc::cmpwi(0, JitPpc::R10, 8);
++    fixSlow(2);
++    *p++ = JitPpc::cmplwi(0, JitPpc::R10, 0xFA0);
++    fixSlow(3);
++    *p++ = JitPpc::srwi(JitPpc::R5, JitPpc::R9, 12);
++    *p++ = JitPpc::slwi(JitPpc::R5, JitPpc::R5, 2);
++    *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offCore);
++    emitLoadImm32(p, JitPpc::R7, offReadMap);
++    *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R7);
++    *p++ = JitPpc::lwzx(JitPpc::R6, JitPpc::R4, JitPpc::R5);
++    *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
++    fixSlow(0);
++
++    if (wb) emitStoreGuestReg(p, JitPpc::R3, rn);                          // pre-index writeback (fast path only)
++
++    *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R10);               // pointer to the word at A
++    *p++ = JitPpc::lwbrx(JitPpc::R11, 0, JitPpc::R7);                      // pipeline[0]
++    *p++ = JitPpc::addi(JitPpc::R7, JitPpc::R7, 4);                        // pcData
++    *p++ = JitPpc::lwbrx(JitPpc::R12, 0, JitPpc::R7);                      // pipeline[1]
++    *p++ = JitPpc::stw(JitPpc::R11, JitPpc::R31, offPipe0);
++    *p++ = JitPpc::stw(JitPpc::R12, JitPpc::R31, offPipe1);
++    *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPcDat);
++    *p++ = JitPpc::addi(JitPpc::R9, JitPpc::R9, 4);                        // R15 = A + 4
++    *p++ = JitPpc::stw(JitPpc::R9, JitPpc::R31, offR15);
++    emitReturn(prefixCycles + 5, false);
++
++    // Slow path: the interpreter handler performs the whole instruction (load, R15, THUMB bit, refill)
++    uint32_t *slow = p;
++    emitLoadImm32(p, JitPpc::R0, r15Instr);
++    *p++ = JitPpc::stw(JitPpc::R0, JitPpc::R31, offR15);
++    *p++ = JitPpc::mr(JitPpc::R3, JitPpc::R31);
++    emitLoadImm32(p, JitPpc::R4, opcode);
++    emitLoadImm32(p, JitPpc::R12, (uint32_t)resolveArmHandler(opcode));
++    *p++ = JitPpc::mtctr(JitPpc::R12);
++    *p++ = JitPpc::bctrl();
++    *p++ = JitPpc::lwz(JitPpc::R0, JitPpc::R1, 36);                        // bctrl clobbered LR
++    *p++ = JitPpc::mtlr(JitPpc::R0);
++    emitReturn(prefixCycles, true);                                        // R3 = handler cycles (5)
++
++    if (bNotTaken) {
++        *bNotTaken = JitPpc::beq((int16_t)((p - bNotTaken) * 4));
++        emitLoadImm32(p, JitPpc::R5, r15Instr);
++        *p++ = JitPpc::stw(JitPpc::R5, JitPpc::R31, offR15);
++        *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, offPcDat);
++        if (totalDelta != 0) *p++ = JitPpc::addi(JitPpc::R4, JitPpc::R4, (int16_t)totalDelta);
++        *p++ = JitPpc::stw(JitPpc::R4, JitPpc::R31, offPcDat);
++        *p++ = JitPpc::addi(JitPpc::R5, JitPpc::R4, -4);
++        *p++ = JitPpc::lwbrx(JitPpc::R6, 0, JitPpc::R5);
++        *p++ = JitPpc::lwbrx(JitPpc::R7, 0, JitPpc::R4);
++        *p++ = JitPpc::stw(JitPpc::R6, JitPpc::R31, offPipe0);
++        *p++ = JitPpc::stw(JitPpc::R7, JitPpc::R31, offPipe1);
++        emitReturn(prefixCycles + 1, false);
++    }
++
++    for (int i = 0; i < slowCount; i++) {
++        const int16_t d = (int16_t)((slow - slowFix[i]) * 4);
++        switch (slowKind[i]) {
++            case 0: *slowFix[i] = JitPpc::beq(d); break;
++            case 1: *slowFix[i] = JitPpc::bne(d); break;
++            case 2: *slowFix[i] = JitPpc::blt(d); break;
++            default: *slowFix[i] = JitPpc::bgt(d); break;
++        }
++    }
++    return true;
++}
++
+ bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles) {
+     const bool single = (opcode & 0x0C000000u) == 0x04000000u;
+     const bool isByte = single && (opcode & (1u << 22)) != 0;
+@@ -953,6 +1201,30 @@ bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcod
+         *bNotDispstat = JitPpc::bne((int16_t)((p - bNotDispstat) * 4));
+     }
+ #endif
++#if NOODS_JIT_IPCSYNC_FAST
++    uint32_t *bIpcSyncDone = nullptr;
++    if (isHalf && cpu->arm7) {
++        // ARM7's IPC wait loops poll IPCSYNC with LDRH; readIpcSync(1) is a plain member read.
++        // Compare the ALIGNED address: Memory::readFallback<uint16_t> aligns before dispatching,
++        // and that value is a diagnostic only, since the interpreter handler is not involved.
++        *p++ = JitPpc::rlwinm(JitPpc::R4, JitPpc::R3, 0, 0, 30);
++        emitLoadImm32(p, JitPpc::R5, 0x04000180u);
++        *p++ = JitPpc::cmplw(0, JitPpc::R4, JitPpc::R5);
++        uint32_t *bNotIpcSync = p++;
++        *p++ = JitPpc::lwz(JitPpc::R4, JitPpc::R31, (int16_t)offsetof(Interpreter, core));
++        const uint32_t offIpcSync = (uint32_t)(offsetof(Core, ipc) + offsetof(Ipc, ipcSync) + sizeof(uint16_t));
++        emitLoadImm32(p, JitPpc::R5, offIpcSync);
++        *p++ = JitPpc::add(JitPpc::R4, JitPpc::R4, JitPpc::R5);
++        *p++ = JitPpc::lhz(JitPpc::R8, JitPpc::R4, 0);
++        // ARM7 misaligned halfword reads rotate the aligned value right by 8 (see ldrhOf)
++        *p++ = JitPpc::rlwinm(JitPpc::R9, JitPpc::R3, 3, 28, 28);
++        *p++ = JitPpc::subfic(JitPpc::R9, JitPpc::R9, 32);
++        *p++ = JitPpc::rlwnm(JitPpc::R8, JitPpc::R8, JitPpc::R9, 0, 31);
++        emitStoreGuestReg(p, JitPpc::R8, rd);
++        bIpcSyncDone = p++;
++        *bNotIpcSync = JitPpc::bne((int16_t)((p - bNotIpcSync) * 4));
++    }
++#endif
+ #if NOODS_JIT_KEYINPUT_FAST
+     uint32_t *bKeyinputDone = nullptr;
+     if (isHalf && !cpu->arm7) {
+@@ -1033,21 +1305,55 @@ bool ArmPpcJit::emitNativeLoadArm(uint32_t *&p, Interpreter *cpu, uint32_t opcod
+     if (bKeyinputDone)
+         *bKeyinputDone = JitPpc::b((int32_t)((join - bKeyinputDone) * 4));
+ #endif
++#if NOODS_JIT_IPCSYNC_FAST
++    if (bIpcSyncDone)
++        *bIpcSyncDone = JitPpc::b((int32_t)((join - bIpcSyncDone) * 4));
++#endif
+ 
+     outCycles = cpu->arm7 ? 3 : 1;
+     return true;
+ }
+ 
+ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles) {
+-    // STRH Rd,[Rn,#+/-imm8]  (pre-indexed, no writeback)
++    // STR / STRB / STRH, pre- or post-indexed, immediate or LSL register offsets
++    const bool single = (opcode & 0x0C000000u) == 0x04000000u;
++    const bool isByte = single && (opcode & (1u << 22)) != 0;
++    const bool isHalf = !single;
++    const bool pre = (opcode & (1u << 24)) != 0;
++    const bool up  = (opcode & (1u << 23)) != 0;
++    // Post-indexed halfword stores post-update the base even when W=0, matching Interpreter::strhPt*
++    const bool wb  = ((opcode & (1u << 21)) != 0) || !pre;
++    const bool immOff = single ? ((opcode & (1u << 25)) == 0) : ((opcode & (1u << 22)) != 0);
+     const uint8_t rn = (uint8_t)((opcode >> 16) & 0xF);
+     const uint8_t rd = (uint8_t)((opcode >> 12) & 0xF);
+-    const bool up = (opcode & (1u << 23)) != 0;
+-    const uint32_t off = ((opcode >> 4) & 0xF0u) | (opcode & 0xFu);
++    const uint8_t rm = (uint8_t)(opcode & 0xF);
++    const uint8_t shift = single ? (uint8_t)((opcode >> 7) & 0x1F) : 0;
++    const uint32_t imm = single ? (opcode & 0xFFFu) : (uint32_t)(((opcode >> 4) & 0xF0u) | (opcode & 0xFu));
+ 
+-    // R3 = guest address; R8 = value (loaded before R11 is used, since guest regs 8..14 clobber R11)
++    // R3 = store address, R28 = writeback value (post-index), R8 = stored value
++    // R8 is loaded before R11 can be used, since guest regs 8..14 are reached through R11
+     emitLoadGuestReg(p, JitPpc::R3, rn);
+-    if (off != 0) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(up ? (int32_t)off : -(int32_t)off));
++    if (pre) {
++        if (immOff) {
++            if (imm != 0) *p++ = JitPpc::addi(JitPpc::R3, JitPpc::R3, (int16_t)(up ? (int32_t)imm : -(int32_t)imm));
++        } else {
++            emitLoadGuestReg(p, JitPpc::R4, rm);
++            if (shift) *p++ = JitPpc::slwi(JitPpc::R4, JitPpc::R4, shift);
++            if (up) *p++ = JitPpc::add(JitPpc::R3, JitPpc::R3, JitPpc::R4);
++            else    *p++ = JitPpc::subf(JitPpc::R3, JitPpc::R4, JitPpc::R3);
++        }
++        if (wb) *p++ = JitPpc::mr(JitPpc::R28, JitPpc::R3);            // writeback = effective address
++    } else {
++        // Post-index: the store targets the base, and the base is updated afterwards
++        if (immOff) {
++            *p++ = JitPpc::addi(JitPpc::R28, JitPpc::R3, (int16_t)(up ? (int32_t)imm : -(int32_t)imm));
++        } else {
++            emitLoadGuestReg(p, JitPpc::R4, rm);
++            if (shift) *p++ = JitPpc::slwi(JitPpc::R4, JitPpc::R4, shift);
++            if (up) *p++ = JitPpc::add(JitPpc::R28, JitPpc::R3, JitPpc::R4);
++            else    *p++ = JitPpc::subf(JitPpc::R28, JitPpc::R4, JitPpc::R3);  // R28 = R3 - R4
++        }
++    }
+     emitLoadGuestReg(p, JitPpc::R8, rd);
+ 
+     // Fast path only if no compiled block lives on this page for either CPU (same test as invalidateSharedAddr).
+@@ -1078,10 +1384,13 @@ bool ArmPpcJit::emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opco
+     *p++ = JitPpc::cmpwi(0, JitPpc::R6, 0);
+     uint32_t *bSlow = p++;                                           // beq slow (patched)
+ 
+-    // Fast path: halfword at (addr & 0xFFE) in the page, stored little-endian
+-    *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, 30);
++    // Fast path: value at (addr & page mask) in the page, stored little-endian
++    *p++ = JitPpc::rlwinm(JitPpc::R7, JitPpc::R3, 0, 20, (uint8_t)(isByte ? 31 : (isHalf ? 30 : 29)));
+     *p++ = JitPpc::add(JitPpc::R7, JitPpc::R6, JitPpc::R7);
+-    *p++ = JitPpc::sthbrx(JitPpc::R8, 0, JitPpc::R7);
++    if (isByte)      *p++ = JitPpc::stb(JitPpc::R8, JitPpc::R7, 0);
++    else if (isHalf) *p++ = JitPpc::sthbrx(JitPpc::R8, 0, JitPpc::R7);
++    else             *p++ = JitPpc::stwbrx(JitPpc::R8, 0, JitPpc::R7);
++    if (wb) emitStoreGuestReg(p, JitPpc::R28, rn);                   // writeback only on the fast path
+     uint32_t *bOver = p++;                                           // b join (patched)
+ 
+     // Slow path: interpreter handler performs the store
+@@ -1452,6 +1761,7 @@ static inline bool isUncondBranchArm(uint32_t op) {
+     return (op >> 28) == 0xEu && (op & 0x0E000000u) == 0x0A000000u;
+ }
+ 
++
+ static inline bool isSingleLoadThumb(uint16_t op) {
+     if ((op & 0xF800u) == 0x4800u) return true; // LDR Rd, [PC, #imm8]
+     if ((op & 0xF000u) == 0x5000u && (op & 0x0E00u) >= 0x0600u) return true; // LDSB/LDR/LDRH/LDRB/LDSH Rd, [Rb, Ro]
+@@ -1708,9 +2018,12 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+     bool firstIsNative = thumb ? canTranslateNativeThumb((uint16_t)opcode0) : canTranslateNativeArm(cpu->arm7, opcode0);
+     bool firstIsLoad   = !firstIsNative && (thumb ? isSingleLoadThumb((uint16_t)opcode0) : isSingleLoadArm(opcode0));
+     bool firstIsBranch = !thumb && !firstIsNative && !firstIsLoad && isUncondBranchArm(opcode0);
+-    if (!firstIsNative && !firstIsLoad && !firstIsBranch) {
++    bool firstIsPcLoad = !thumb && !firstIsNative && !firstIsLoad && !firstIsBranch && isPcDestLoadTerminatorArm(cpu->arm7, opcode0);
++    if (!firstIsNative && !firstIsLoad && !firstIsBranch && !firstIsPcLoad) {
+         return false;
+     }
++    // Blocks that begin with a terminator (branch or PC-destination load) execute only that instruction
++    const bool firstIsTerm = firstIsBranch || firstIsPcLoad;
+ 
+     uint32_t opcode1 = cpu->pipeline[0];
+     uint32_t curPageEpoch = pageEpoch[cpuIdx][(instrPC >> 12) & (PAGE_EPOCH_SIZE - 1)];
+@@ -1721,14 +2034,19 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+     opList[0] = opcode0;
+     uint16_t count = 1;
+     bool hasBranchTerm = false;
++    bool hasPcLoadTerm = false;
+     uint32_t branchOpcode = 0;
+     if (firstIsBranch) {
+         // Branch-only block: the branch itself is the terminator; instructions after it never execute.
+         hasBranchTerm = true;
+         branchOpcode = opcode0;
++    } else if (firstIsPcLoad) {
++        // PC-destination load as the block's only instruction (computed branch / dispatch table)
++        hasPcLoadTerm = true;
++        branchOpcode = opcode0;
+     }
+ 
+-    for (uint16_t m = 1; m < (firstIsBranch ? 1 : MAX_BLOCK_INSTRS); m++) {
++    for (uint16_t m = 1; m < (firstIsTerm ? 1 : MAX_BLOCK_INSTRS); m++) {
+         // Ensure we stay strictly inside the 4 KB page so pcData never crosses a page boundary
+         uint32_t simR15 = r15After0 + m * (uint32_t)step;
+         if ((simR15 & 0xFFFu) < 8u || (simR15 & 0xFFFu) > 0xFA0u) break;
+@@ -1748,6 +2066,10 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+                 hasBranchTerm = true;
+                 branchOpcode = opM;
+                 count++;
++            } else if (isPcDestLoadTerminatorArm(cpu->arm7, opM)) {
++                hasPcLoadTerm = true;
++                branchOpcode = opM;
++                count++;
+             }
+             break;
+         }
+@@ -1761,18 +2083,23 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+             hasBranchTerm = true;
+             branchOpcode = opM;
+             count++;
++        } else if (!thumb && isPcDestLoadTerminatorArm(cpu->arm7, opM)) {
++            hasPcLoadTerm = true;
++            branchOpcode = opM;
++            count++;
+         }
+         break;
+     }
+ 
+-    if (count < 2 && !firstIsBranch) {
++    if (count < 2 && !firstIsTerm) {
+         return false;
+     }
+ 
+     // Pass 2: Backward CPSR flag-liveness analysis across the native prefix
+-    uint16_t nativeCount = hasBranchTerm ? (uint16_t)(count - 1) : count;
++    const bool hasTerm = hasBranchTerm || hasPcLoadTerm;
++    uint16_t nativeCount = hasTerm ? (uint16_t)(count - 1) : count;
+     uint16_t nativeStart = firstIsLoad ? 1u : 0u;
+-    if (nativeCount < nativeStart || (!hasBranchTerm && nativeCount <= nativeStart)) {
++    if (nativeCount < nativeStart || (!hasTerm && nativeCount <= nativeStart)) {
+         return false;
+     }
+     bool emitFlagsList[MAX_BLOCK_INSTRS];
+@@ -1794,8 +2121,9 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+     uint16_t prefixCycles = firstIsLoad ? (uint16_t)(cpu->arm7 ? 3 : 1) : 0;
+     int16_t appliedPcDelta = 0;
+ 
++
+     // Any bctrl helper call inside the block clobbers LR; the epilogues restore it from the frame.
+-    bool helperInBlock = firstIsLoad;
++    bool helperInBlock = firstIsLoad || hasPcLoadTerm;
+     for (uint16_t m = nativeStart; m < nativeCount && !thumb; m++) {
+         if (isNativeLoadArm(cpu->arm7, opList[m]) || isNativeStoreArm(opList[m])) helperInBlock = true;
+     }
+@@ -1834,7 +2162,13 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+     int16_t totalDelta = (int16_t)((count - 1) * step);
+     int16_t remDelta = (int16_t)(totalDelta - appliedPcDelta);
+ 
+-    if (hasBranchTerm && !thumb && emitInlineBranchArm(p, cpu, branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock)) {
++    if (hasPcLoadTerm) {
++        // PC-destination load compiled inline (computed branch); no C round-trip.
++        // The scan predicate and the emitter accept exactly the same encodings, so this cannot fail.
++        if (!emitPcDestLoadTerminatorArm(p, cpu, branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock)) {
++            return false;
++        }
++    } else if (hasBranchTerm && !thumb && emitInlineBranchArm(p, cpu, branchOpcode, instrPC, totalDelta, prefixCycles, helperInBlock)) {
+         // Branch exit compiled inline (same-page ARM B/BL); no C round-trip
+     } else if (hasBranchTerm) {
+         // Tail-call execBranchThumb / execBranchArm directly without touching LR or syncing dead pipeline state on taken branches
+@@ -1891,7 +2225,7 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+     stats.blockCompiles[cpuIdx]++;
+     stats.nativeInstrs[cpuIdx] += (nativeCount - nativeStart);
+     if (firstIsLoad) stats.fallbackInstrs[cpuIdx]++;
+-    if (hasBranchTerm) stats.fallbackInstrs[cpuIdx]++;
++    if (hasTerm) stats.fallbackInstrs[cpuIdx]++;
+ 
+     if (!stats.firstBlockAddr) {
+         stats.firstBlockAddr = start;
+@@ -1912,7 +2246,7 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+     bool blockPure = false;
+ #if NOODS_JIT_POLL_SKIP
+     if (!thumb) {
+-        blockPure = !hasBranchTerm || armPurity(branchOpcode) == 1;
++        blockPure = hasPcLoadTerm ? false : (!hasBranchTerm || armPurity(branchOpcode) == 1);
+         for (uint16_t m = 0; blockPure && m < nativeCount; m++) {
+             int pm = armPurity(opList[m]);
+             blockPure = (m == 0) ? (pm == 1 || pm == 2) : (pm == 1);
+@@ -1920,7 +2254,7 @@ bool ArmPpcJit::compileBlock(Interpreter *cpu, uint32_t instrPC, uint32_t opcode
+     }
+ #endif
+     entry.instrCount = (uint16_t)(count | (blockPure ? 0x8000u : 0u));
+-    entry.prefixCycles = hasBranchTerm ? prefixCycles : (uint16_t)(prefixCycles - 1);
++    entry.prefixCycles = hasTerm ? prefixCycles : (uint16_t)(prefixCycles - 1);
+     entry.code = start;
+     return true;
+ }
+@@ -1961,14 +2295,16 @@ FORCE_INLINE int ArmPpcJit::tryExecuteBlock(Interpreter *cpu, uint32_t instrPC,
+         outIsNative0 = firstIsNative;
+         bool firstIsLoad   = !firstIsNative && (thumb ? isSingleLoadThumb((uint16_t)opcode) : isSingleLoadArm(opcode));
+         bool firstIsBranch = !thumb && !firstIsNative && !firstIsLoad && isUncondBranchArm(opcode);
+-        if (!firstIsNative && !firstIsLoad && !firstIsBranch) return 0;
++        bool firstIsPcLoad = !thumb && !firstIsNative && !firstIsLoad && !firstIsBranch && isPcDestLoadTerminatorArm(cpu->arm7, opcode);
++        if (!firstIsNative && !firstIsLoad && !firstIsBranch && !firstIsPcLoad) return 0;
++        const bool firstIsTerm = firstIsBranch || firstIsPcLoad;
+ 
+         uint32_t r15After0 = cpu->registersUsr[15];
+         if ((r15After0 & 0xFFFu) < 8u || (r15After0 & 0xFFFu) > 0xF80u) return 0;
+ 
+         if (thumb) {
+             if (!canTranslateNativeThumb((uint16_t)opcode1) && !isTerminatorBranchThumb(cpu->arm7, (uint16_t)opcode1)) return 0;
+-        } else if (!firstIsBranch) {
++        } else if (!firstIsTerm) {
+             // A branch-first block never executes I_1, so its successor is irrelevant
+             if (((opcode1 >> 28) != 0xEu || !canTranslateNativeArm(cpu->arm7, opcode1)) && !isTerminatorBranchArm(cpu->arm7, opcode1)) return 0;
+         }
+@@ -2021,6 +2357,11 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure)
+     if (!initialized) init();
+     int cpuIdx = cpu->arm7 ? 1 : 0;
+     stats.dispatches[cpuIdx]++;
++#if NOODS_JIT_HOTPC
++    const uint32_t fbHistPC = cpu->registersUsr[15] - 8;
++    const int fbHistIdx = cpuIdx;
++    fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_BLOCK);
++#endif
+ 
+ #if NOODS_JIT_BLOCKS
+     // Instructions with bit 27 == 1 (B/BL, LDM/STM, SWI, Coprocessor/CP15) or Rd == 15 never start a block
+@@ -2032,12 +2373,18 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure)
+             stats.fallbackInstrs[cpuIdx]++;
+         }
+         if (cpuIdx == 1) { stats.fbOpc7[(opcode >> 20) & 0xFF]++; stats.fbLast7[(opcode >> 20) & 0xFF] = opcode; }
++#if NOODS_JIT_HOTPC
++        fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_FALLBACK);
++#endif
+         { if (Track && outPure) *outPure = armPure(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu]); return fallbackArm(cpu, opcode); }
+     }
+-    if ((opcode & 0x0000F000u) == 0x0000F000u && !uncondBranch) {
++    if ((opcode & 0x0000F000u) == 0x0000F000u && !uncondBranch && !isPcDestLoadTerminatorArm(cpu->arm7, opcode)) {
+         stats.fallbackInstrs[cpuIdx]++;
+         stats.fbClassArm[cpuIdx][(opcode >> 25) & 7]++;
+         if (cpuIdx == 1) { stats.fbOpc7[(opcode >> 20) & 0xFF]++; stats.fbLast7[(opcode >> 20) & 0xFF] = opcode; }
++#if NOODS_JIT_HOTPC
++        fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_FALLBACK);
++#endif
+         { if (Track && outPure) *outPure = armPure(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu]); return fallbackArm(cpu, opcode); }
+     }
+ #endif
+@@ -2053,6 +2400,9 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure)
+         stats.fallbackInstrs[cpuIdx]++;
+         stats.fbClassArm[cpuIdx][(opcode >> 25) & 7]++;
+         if (cpuIdx == 1) { stats.fbOpc7[(opcode >> 20) & 0xFF]++; stats.fbLast7[(opcode >> 20) & 0xFF] = opcode; }
++#if NOODS_JIT_HOTPC
++        fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_FALLBACK);
++#endif
+         { if (Track && outPure) *outPure = armPure(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu]); return fallbackArm(cpu, opcode); }
+     }
+ #endif
+@@ -2073,6 +2423,9 @@ int ArmPpcJit::executeArmCore(Interpreter *cpu, uint32_t opcode, bool *outPure)
+     }
+ 
+     if (Track && outPure) *outPure = armPure(opcode, cpu->registersUsr[(opcode >> 16) & 0xFu]);
++#if NOODS_JIT_HOTPC
++    fbSiteRecord(fbHistIdx, fbHistPC, opcode, FBK_STUB);
++#endif
+     PROF_MARK(1);
+     return jit_enter(entry.code, cpu);
+ }
+@@ -2085,6 +2438,9 @@ int ArmPpcJit::executeThumb(Interpreter *cpu, uint32_t opcode) {
+     if (!initialized) init();
+     int cpuIdx = cpu->arm7 ? 1 : 0;
+     stats.dispatches[cpuIdx]++;
++#if NOODS_JIT_HOTPC
++    fbSiteRecord(2 + cpuIdx, cpu->registersUsr[15] - 4, opcode & 0xFFFFu, FBK_BLOCK);
++#endif
+ 
+     uint32_t instrPC = cpu->registersUsr[15] - 4;
+ 
+@@ -2096,6 +2452,9 @@ int ArmPpcJit::executeThumb(Interpreter *cpu, uint32_t opcode) {
+     if (!isNative0) {
+         stats.fallbackInstrs[cpuIdx]++;
+         stats.fbClassThumb[cpuIdx][(opcode >> 13) & 7]++;
++#if NOODS_JIT_HOTPC
++        fbSiteRecord(2 + cpuIdx, cpu->registersUsr[15] - 4, opcode & 0xFFFFu, FBK_FALLBACK);
++#endif
+ #if NOODS_JIT_THUMB_HIST
+         if (cpu->arm7) s_thumbFallback7[((uint16_t)opcode >> 10) & 63u]++;
+ #endif
+@@ -2302,6 +2661,34 @@ void ArmPpcJit::dumpStats(FILE *f) {
+     }
+ #endif
+     fprintf(f, "JIT_POLL cpu=9 skips=%u iters=%llu cpu=7 skips=%u iters=%llu\n", (unsigned)stats.pollSkips[0], (unsigned long long)stats.pollSkipIters[0], (unsigned)stats.pollSkips[1], (unsigned long long)stats.pollSkipIters[1]);
++#if NOODS_JIT_HOTPC
++    {
++        static const char *const siteNames[4] = {"ARM9_arm", "ARM7_arm", "ARM9_thumb", "ARM7_thumb"};
++        for (int idx = 0; idx < 4; idx++) {
++            static FbSite sorted[FBPC_SLOTS];
++            std::memcpy(sorted, s_fbSite[idx], sizeof(sorted));
++            for (int a = 1; a < FBPC_SLOTS; a++) {
++                FbSite v = sorted[a];
++                uint32_t vTotal = v.n[0] + v.n[1] + v.n[2];
++                if (!vTotal) continue;
++                int b = a - 1;
++                while (b >= 0) {
++                    uint32_t t = sorted[b].n[0] + sorted[b].n[1] + sorted[b].n[2];
++                    if (t < vTotal) { sorted[b + 1] = sorted[b]; b--; } else break;
++                }
++                sorted[b + 1] = v;
++            }
++            for (int r = 0; r < 20; r++) {
++                uint32_t total = sorted[r].n[0] + sorted[r].n[1] + sorted[r].n[2];
++                if (!total) break;
++                fprintf(f, "JIT_HOTPC cpu=%s pc=%08X opcode=%08X disp=%u block=%u stub=%u fallback=%u\n",
++                        siteNames[idx], sorted[r].pc, sorted[r].opcode, total,
++                        sorted[r].n[0], sorted[r].n[1], sorted[r].n[2]);
++            }
++            std::memset(s_fbSite[idx], 0, sizeof(s_fbSite[idx]));
++        }
++    }
++#endif
+ #if NOODS_JIT_PROFILE
+     for (int c = 0; c < 2; c++) {
+         for (int b = 0; b < 16; b++) {
+diff --git a/NooDS-Wii/NooDS-Wii/arm_jit.h b/NooDS-Wii/NooDS-Wii/arm_jit.h
+index e9398eb..8c26ccb 100644
+--- a/NooDS-Wii/NooDS-Wii/arm_jit.h
++++ b/NooDS-Wii/NooDS-Wii/arm_jit.h
+@@ -145,6 +145,7 @@ constexpr inline uint32_t stwx(uint8_t rs, uint8_t ra, uint8_t rb)  { return enc
+ constexpr inline uint32_t lhbrx(uint8_t rd, uint8_t ra, uint8_t rb) { return encodeX(rd, ra, rb, 790u, false); }
+ constexpr inline uint32_t lwbrx(uint8_t rd, uint8_t ra, uint8_t rb) { return encodeX(rd, ra, rb, 534u, false); }
+ constexpr inline uint32_t sthbrx(uint8_t rs, uint8_t ra, uint8_t rb) { return encodeX(rs, ra, rb, 918u, false); }
++constexpr inline uint32_t stwbrx(uint8_t rs, uint8_t ra, uint8_t rb) { return encodeX(rs, ra, rb, 662u, false); }
+ 
+ // 32-39: Integer arithmetic (XO-form)
+ constexpr inline uint32_t add(uint8_t rd, uint8_t ra, uint8_t rb, bool oe = false, bool rc = false)   { return encodeXO(rd, ra, rb, 266u, oe, rc); }
+@@ -383,6 +384,7 @@ private:
+     static bool emitNativeStoreArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, int &outCycles);
+     static void emitHelperR15Sync(uint32_t *&p, bool enter);
+     static bool emitInlineBranchArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
++    static bool emitPcDestLoadTerminatorArm(uint32_t *&p, Interpreter *cpu, uint32_t opcode, uint32_t instrPC, int32_t totalDelta, int32_t prefixCycles, bool helperInBlock);
+ 
+     static void emitLoadGuestReg(uint32_t *&p, uint8_t dstPpc, uint8_t guestReg);
+     static void emitStoreGuestReg(uint32_t *&p, uint8_t srcPpc, uint8_t guestReg);
+diff --git a/NooDS-Wii/NooDS-Wii/ipc.h b/NooDS-Wii/NooDS-Wii/ipc.h
+index 7e614e2..ea0c140 100644
+--- a/NooDS-Wii/NooDS-Wii/ipc.h
++++ b/NooDS-Wii/NooDS-Wii/ipc.h
+@@ -40,6 +40,8 @@ public:
+     void writeIpcFifoSend(bool arm7, uint32_t mask, uint32_t value);
+ 
+ private:
++    friend class ArmPpcJit; // guarded MMIO fast path reads the live IPCSYNC field
++
+     Core *core;
+     std::deque<uint32_t> fifos[2];
+ 
