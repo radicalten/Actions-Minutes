@@ -1,0 +1,29 @@
+source/vba/gba/JIT.h:69:#define JIT_TRACE_MAX_INSTRUCTIONS 42
+source/vba/gba/JIT.h:87:struct JITWriteScope {
+source/vba/gba/JIT.h:93:struct JITWriteScope {
+source/vba/gba/JIT.h:99:struct JITResult {
+source/vba/gba/JITCache.h:27: * JIT_ARENA_SIZE (8MB), HASH_TABLE_SIZE (65536), and SMC_MAP_SIZE are the
+source/vba/gba/JITCache.h:59:#define JIT_ARENA_SIZE					(1024 * 1024 * JIT_ARENA_MB) // must stay <= 32MB: `b` reach
+source/vba/gba/JITCache.h:60:#define HASH_TABLE_SIZE					65536
+source/vba/gba/JITCache.h:61:#define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
+source/vba/gba/JITCache.h:63:#define JIT_ARENA_SIZE					(1024 * 1024 * 8) // 8 MB
+source/vba/gba/JITCache.h:64:#define HASH_TABLE_SIZE					65536
+source/vba/gba/JITCache.h:65:#define SMC_MAP_SIZE                    65536 // 64K pages (1KB page granularity across 64MB)
+source/vba/gba/JITCache.h:67:#define JIT_ARENA_SIZE					(1024 * 1024 * 32) // 32 MB
+source/vba/gba/JITCache.h:68:#define HASH_TABLE_SIZE					(1024 * 1024) // 1MB
+source/vba/gba/JITCache.h:69:#define SMC_MAP_SIZE                    (1024 * 512) // 512K pages (1KB page granularity across 64MB)
+source/vba/gba/JITCache.h:85:class JITCache {
+source/vba/gba/JITCache.h:115:			u32 index = ((pc >> 1) ^ (pc >> 13)) & (HASH_TABLE_SIZE - 1);
+source/vba/gba/JITCompiler.cpp:657:	while (!endBlock && instrCount < JIT_TRACE_MAX_INSTRUCTIONS) {
+source/vba/gba/JITDebugStateLog.h:12: * JIT can do long runs, you may want to reduce JIT_TRACE_MAX_INSTRUCTIONS
+source/vba/gba/JITDebugStateLog.h:28:class JITDebugStateLog {
+source/vba/gba/JITCache.cpp:45:static u8 smcPageFlagsIdle[SMC_MAP_SIZE];
+source/vba/gba/JITCache.cpp:93:	if (arenaOffset + numBytes > JIT_ARENA_SIZE) {
+source/vba/gba/JITCache.cpp:114:	u32 index = ((pc >> 1) ^ (pc >> 13)) & (HASH_TABLE_SIZE - 1);
+source/vba/gba/JITCache.cpp:180:	memset(blockTable, 0, HASH_TABLE_SIZE * sizeof(BasicBlock));
+source/vba/gba/JITCache.cpp:181:	memset(smcRegistry, 0, SMC_MAP_SIZE * sizeof(BasicBlock*));
+source/vba/gba/JITCache.cpp:182:	memset(smcPageFlags, 0, SMC_MAP_SIZE * sizeof(u8));
+source/vba/gba/JITCache.cpp:196:		// Dynamically calculate the Native Mask boundaries based on HASH_TABLE_SIZE
+source/vba/gba/JITCache.cpp:197:		u32 hashBits = __builtin_ctz(HASH_TABLE_SIZE); // 8192 = 13, 32768 = 15, 65536 = 16
+source/vba/gba/JITCache.cpp:268:	// Maximum trace length is (JIT_TRACE_MAX_INSTRUCTIONS+1)*2 bytes. Maximum write size is 36 bytes.
+source/vba/gba/JITCache.cpp:270:	s32 offsetDiff = (s32)(targetEA - ((JIT_TRACE_MAX_INSTRUCTIONS + 1) * 2));
