@@ -1,1 +1,6 @@
+10-15-26
+Background info:
+10-15-26 comparing: Agents2-5 repo (and its copy of dborth vbagx jit implementation) to backup4-prod-profile-2 jit_ppc.cpp gpt6sol-drec16(which uses fable5.1 for drec 16’s source file) and the NooDS-Wii v1.5 release default repo interpreter only. All 3 repos with their respective makefiles are saved in Actions-Minutes Agents2-custom1 3 separate folders.
 
+Prompt:
+At my repo https://github.com/radicalten/Actions-Minutes2 I have 3 separate folders with 1 version each of my nds on Wii emulator NooDS-Wii. default-NooDS-Wii-v1pt5, b4-pp2-NooDS-Wii, and Agents2-5-NooDS-Wii. Both b4-pp2 and Agents2-5 have a version of a Wii PowerPC 750CL (Broadway) dynamic recompiler for both ARM7 (ARMv4T) and ARM9 (ARMv5TE) supporting both ARM and Thumb instruction sets, however neither implementation is perfect yet. Could you compare the implementations and perhaps make a new version entirely which fixes or sidesteps the problems of the two dynamic recompilers? Please write short snippets of your thinking as you work.
