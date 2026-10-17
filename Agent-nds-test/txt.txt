@@ -32,8 +32,13 @@ The goal of this session is to create a test suite for nds, “suite.nds”, wri
 **F11:Thank you. Is it possible to organize the groups into ARM7 ARM7Thumb ARM9 ARM9Thumb? That could help with debugging for agentic automated testing. I agree we should continue to develop these broader thumb categories**
 
 **F12: Looks good. Let’s continue adding thumb tests for ARM7Thumb and ARM9Thumb. Remember again this is all to be automated for ai agent readability**
+(The ai gave up right here, sadly this is as far as it will go)(OH! Passing a security check let it go one more round, although I believe this may be the end for it)
 
 **F13: Great! Let’s work towards a v1.0 release. It should include everything necessary to simply upload the v1.0 folder to an open-source GitHub repo**
+
+**F14: Ok, let's work towards that release-ready build then. Start with your Next: plans.**
+(It seems as soon as I got soft banned with the captcha check they switched me to a lower model as this new one is adding some no so good stuff. Concatenating its words writing ti925t proxy. That’s not even a thing. Time to encase this project in amber. Upload it for storage and have the v5 version work on this version as a base).
+
 
 v4: (run4)
 10-16-26 creating suite.nds v4 based on https://github.com/mattrbeck/mgba-suite-auto/releases/tag/latest and https://github.com/RockPolish/rockwrestler
