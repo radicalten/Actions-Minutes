@@ -1,0 +1,218 @@
+{
+  "schema": 1,
+  "completion": "DEVELOPMENT_COVERAGE_FIRST_NOT_FINAL",
+  "mgba": [
+    {
+      "group": "memory",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "io-read",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "timing",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "timers",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "timer-irq",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "shifter",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "carry",
+      "status": "PORTED_NZCV_VECTORS"
+    },
+    {
+      "group": "multiply-long",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "bios-math",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "dma",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "sio-read",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "sio-timing",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "misc-edge",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "video",
+      "status": "NOT_PORTED"
+    }
+  ],
+  "rockwrestler": {
+    "asserting_groups": 23,
+    "status": "AUTOMATED_UNMODIFIED_ASSERTIONS",
+    "initial_state": "CAPTURED_AS_OBSERVATIONS_NOT_PASS_FAIL"
+  },
+  "cpu": {
+    "arm_functions": 186,
+    "thumb_functions": 74,
+    "exhaustive": false,
+    "exact_qemu_arm7tdmi": false,
+    "arm946_qemu": "3390_SHARED_2012_ARM9_PORTABLE_208_CP15_ALIASES_128_ADAPTED_RAW_ENTRY_PASS;128_MPU_ABORT_UNSUPPORTED;11_ROCK_GROUPS_PASS;256_REGISTER_OPERAND2_PASS;256_COMPARE_OPERAND2_PASS;512_REMAINING_REGISTER_OPERAND2_PASS;800_THUMB_EDGES_PER_PROFILE_PASS;1248_THUMB_MEMORY_PER_PROFILE_PASS;192_THUMB_SP_PER_PROFILE_PASS;216_THUMB_PC_PER_PROFILE_PASS",
+    "uncovered": [
+      "Full load/store addressing/register-alias matrix",
+      "Full source-level mgba multiply-long and shifter ports",
+      "Full PC-dependent shifter/register operand2/immediate encoding matrix (shifted immediate operand2 subset implemented)",
+      "Complete Thumb branch ranges/register aliases/SP-PC forms, stack/exception edge matrix (basic forms implemented)",
+      "ARM7 raw SWI/undefined/abort entry; FIQ entry; IRQ LR/priority/deeper nesting; ARM9 raw selected SYS-origin matrix implemented",
+      "Remaining misaligned modes/regions/bus behavior and memory aborts; selected ARM7 alignment cases now covered",
+      "Full CP15 architecture-specific matrix",
+      "Remaining ARMv5TE DSP/interworking edge cases and full LDRD/STRD register/offset/alias matrix",
+      "Undefined/unpredictable encoding classification",
+      "Cycle timing"
+    ],
+    "arm_vectors": 2637,
+    "thumb_vectors": 753,
+    "shared_vectors": 3390,
+    "arm9_vectors": 9466,
+    "arm7_vectors": 8142,
+    "arm9_only_vectors": 6076,
+    "arm9_only_helpers": 477,
+    "arm7_specific_vectors": 4752,
+    "arm7_specific_helpers": 385,
+    "arm7_specific_result": {
+      "passed": 4729,
+      "failed": 23,
+      "not_run": 0
+    },
+    "arm7_specific_qemu": "956_PORTABLE_PRIVILEGED_CASES_PASS_ARM946_AND_TI925T_PROXY_NOT_EXACT_ARM7",
+    "arm7_profile": "docs/arm7-specific.md",
+    "privileged_new_vectors": 1052,
+    "portable_privileged_qemu_vectors": 956,
+    "nds_irq_vectors": 96,
+    "completion_checklist": "docs/remaining-cases.json",
+    "arm9_profile": "docs/arm9-milestone8.md",
+    "arm9_dsp_vectors": 960,
+    "arm9_privileged_vectors": 956,
+    "arm9_irq_vectors": 96,
+    "arm9_cp15_vectors": 232,
+    "arm9_raw_exception_vectors": 256,
+    "arm7_nested_irq_vectors": 32,
+    "arm9_result": {
+      "passed": 9146,
+      "failed": 320,
+      "not_run": 0
+    },
+    "register_operand2_cases_per_cpu": 256,
+    "register_operand2_qemu": "256_PASS_ARM946_AND_TI925T_PROXY",
+    "register_operand2_profile": "docs/register-operand2.md",
+    "profile_naming_note": "arm9_only/arm7_specific mean appended CPU profiles; portable common tests may appear in both profiles after the stable shared prefix",
+    "compare_operand2_cases_per_cpu": 256,
+    "compare_operand2_qemu": "256_PASS_ARM946_AND_TI925T_PROXY",
+    "compare_operand2_profile": "docs/compare-operand2.md",
+    "remaining_register_operand2_cases_per_cpu": 512,
+    "thumb_edges_cases_per_cpu": 800,
+    "thumb_edges_helpers_per_cpu": 15,
+    "thumb_edges_profile": "docs/thumb-development.md",
+    "scored_groups": {
+      "ARM7": {
+        "group_id": 0,
+        "selected": 4816,
+        "planned": 4816,
+        "passed": 4803,
+        "failed": 13,
+        "not_run": 0,
+        "not_selected": 0,
+        "interrupted": 0
+      },
+      "ARM7Thumb": {
+        "group_id": 1,
+        "selected": 3326,
+        "planned": 3326,
+        "passed": 3316,
+        "failed": 10,
+        "not_run": 0,
+        "not_selected": 0,
+        "interrupted": 0
+      },
+      "ARM9": {
+        "group_id": 2,
+        "selected": 6113,
+        "planned": 6113,
+        "passed": 5889,
+        "failed": 224,
+        "not_run": 0,
+        "not_selected": 0,
+        "interrupted": 0
+      },
+      "ARM9Thumb": {
+        "group_id": 3,
+        "selected": 3353,
+        "planned": 3353,
+        "passed": 3257,
+        "failed": 96,
+        "not_run": 0,
+        "not_selected": 0,
+        "interrupted": 0
+      }
+    },
+    "thumb_memory_cases_per_cpu": 1248,
+    "thumb_memory_helpers_per_cpu": 78,
+    "thumb_memory_profile": "docs/thumb-memory.md",
+    "thumb_sp_cases_per_cpu": 192,
+    "thumb_sp_helpers_per_cpu": 12,
+    "thumb_sp_profile": "docs/thumb-sp.md",
+    "thumb_pc_cases_per_cpu": 216,
+    "thumb_pc_helpers_per_cpu": 54,
+    "thumb_pc_profile": "docs/thumb-pc.md"
+  },
+  "score": {
+    "unit": "test_groups",
+    "denominator": "planned groups including unresolved",
+    "rom_protocol": 3,
+    "abort_score": "partial with explicit unrun",
+    "cpu_vectors": "separate passed and failed counters",
+    "registered_groups": 27,
+    "cpu_group_schema": 3
+  },
+  "reference": "docs/gbatek-coverage.md",
+  "display": {
+    "screens": 2,
+    "detail_pages": 12,
+    "navigation": "LEFT/RIGHT pages; UP/DOWN families/cases/events; A mode; B next failure",
+    "during_hardware_tests": "sub engine disabled; restored at terminal result",
+    "ui_protocol": "docs/dual-screen.md"
+  },
+  "recovery": {
+    "returned_assertions": "CONTINUE_AFTER_BASELINE_RESET",
+    "arm7": "COOPERATIVE_MAIN_RAM_HANDSHAKE",
+    "hard_hang_native_crash": "HOST_CHECKPOINT_RESTART_REQUIRED",
+    "full_plan_observed": "17_PASS_8_GROUP_FAIL_2_NATIVE_CRASH_0_UNRUN",
+    "bare_rom_native_crash_recovery": false
+  },
+  "diagnostics": {
+    "cpu": "every vector runtime inputs/expectations/observations/mask/PC/state; per-family summaries",
+    "original_cpp_instrumented_sites": 117,
+    "original_cpp_observed_events": 160,
+    "other_assertions": "GROUP_ONLY_OR_UNKNOWN",
+    "protocol": "docs/debugging.md",
+    "restart": "immutable trace snapshots and explicit historical restore",
+    "remaining_vector_slots": {
+      "arm9": 362,
+      "arm7": 1686
+    },
+    "trace_version": 4,
+    "trace_capacity_per_cpu": 9828
+  }
+}

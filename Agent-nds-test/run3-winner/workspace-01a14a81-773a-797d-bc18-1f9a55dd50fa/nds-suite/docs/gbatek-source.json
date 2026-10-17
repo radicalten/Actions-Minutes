@@ -1,0 +1,17 @@
+{
+  "url": "https://mgba-emu.github.io/gbatek/",
+  "retrieved": "2026-10-17",
+  "html_sha256": "a701cf0f5be47b23dd31298d7dc593a7cccb3ae9a59087dea940305565025b70",
+  "anchors": [
+    "armcpureference",
+    "arminstructionsummary",
+    "armopcodesdataprocessingalu",
+    "armopcodesmultiplyandmultiplyaccumulatemulmla",
+    "armopcodesmemorysingledatatransferldrstrpld",
+    "armopcodesmemoryhalfworddoublewordandsigneddatatransfer",
+    "armopcodesmemoryblockdatatransferldmstm",
+    "armopcodesmemorysingledataswapswp",
+    "thumbinstructionsummary",
+    "armcpumemoryalignments"
+  ]
+}

@@ -1,0 +1,152 @@
+{
+  "schema": 1,
+  "completion": "PARTIAL_NOT_EXHAUSTIVE",
+  "scope": "remaining ARM7 and ARM9 instruction/system work",
+  "items": [
+    {
+      "area": "banked_sp_lr",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "30 ordered bank pairs, two registers, four input pairs; 240 cases"
+    },
+    {
+      "area": "fiq_r8_r12",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "SYS/FIQ, all five registers, four pairs; 20 cases"
+    },
+    {
+      "area": "spsr_isolation_and_field_writes",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "80 bank-isolation and 40 field-write/restoration cases"
+    },
+    {
+      "area": "cpsr_modes_nzcv",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "six privileged modes x 16 NZCV combinations; not every control-field combination"
+    },
+    {
+      "area": "exception_return_instructions",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "480 software-prepared ARM/Thumb returns to SYS; not exception entry"
+    },
+    {
+      "area": "irq_entry_arm_thumb",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "32 real timer IRQ cases via BIOS callback; not raw LR/vector/latency"
+    },
+    {
+      "area": "user_privilege_and_sp",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "16 real User-mode cases; IRQ-based controlled escape"
+    },
+    {
+      "area": "irq_masks_pending_delivery",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "48 CPSR.I/IME/IE gate cases; no priority/nesting/timing claim"
+    },
+    {
+      "area": "swi_undefined_abort_entry",
+      "status": "NOT_IMPLEMENTED",
+      "scope": "ARM7 vectors are BIOS-owned; requires safe observation strategy and suitable reference, not fabricated results"
+    },
+    {
+      "area": "fiq_entry",
+      "status": "NOT_IMPLEMENTED",
+      "scope": "Banked FIQ state is covered; physical FIQ stimulus/entry is not"
+    },
+    {
+      "area": "irq_lr_priority_nesting",
+      "status": "PARTIAL",
+      "scope": "32 ARM7 timer3-to-timer2 nested IRQ cases implemented; raw LR, priority, deeper/full nesting matrices remain"
+    },
+    {
+      "area": "all_operand_encoding_alias_cross_products",
+      "status": "PARTIAL",
+      "scope": "Shared and specific representative matrices do not cover every legal encoding, register alias or PC use"
+    },
+    {
+      "area": "all_bus_regions_alignment_abort_behavior",
+      "status": "PARTIAL",
+      "scope": "Selected alignment cases use private-WRAM scratch; region/bus/abort matrices remain"
+    },
+    {
+      "area": "cycle_timing",
+      "status": "NOT_VALIDATED",
+      "scope": "Needs controlled hardware baseline; IRQ NOP windows are not timing assertions"
+    },
+    {
+      "area": "exact_arm7_oracle",
+      "status": "UNAVAILABLE",
+      "scope": "Installed QEMU lacks ARM7TDMI; ti925t is only a proxy; real hardware not run"
+    },
+    {
+      "area": "arm9_dsp",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "960 edge cases; not all encodings/register aliases"
+    },
+    {
+      "area": "arm9_privileged_irq",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "956 bank/PSR/return +96 NDS IRQ/User/gating"
+    },
+    {
+      "area": "arm9_cp15_aliases",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "232 register checks;208 QEMU alias cases PASS; full CP15/cache/TCM behavior remains"
+    },
+    {
+      "area": "arm9_raw_exceptions",
+      "status": "PARTIAL_VERIFICATION",
+      "scope": "256 SYS-origin SWI/undefined/MPU-abort cases;128 low-RAM-adapted QEMU entry cases PASS,128 MPU cases unsupported there; no hardware validation"
+    },
+    {
+      "area": "register_controlled_operand2",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "256 cases per CPU: ADC/SBC/AND/EOR x4 shifts x8 counts x2 carry values, fixed operand pair; other ALU/operand/register/alias cross-products remain"
+    },
+    {
+      "area": "flag_only_register_operand2",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "256 cases per CPU: TST/TEQ/CMP/CMN x4 shifts x8 counts x2 carry inputs, fixed operand pair; source register preservation verified"
+    },
+    {
+      "area": "trace_capacity_for_expansion",
+      "status": "IMPLEMENTED_AND_VALIDATED",
+      "scope": "v2 layout:9828 records per CPU; actual7010 ARM9 records cross old limit; full-run/UI/recovery and malformed-trace/runtime guard-page checks pass"
+    },
+    {
+      "area": "remaining_register_operand2_operations",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "512 cases per CPU ADD/SUB/RSB/RSC/ORR/BIC/MOV/MVN; with prior matrices all16 ARM data-processing operations have selected register-shift coverage; broad operands/aliases/encoding forms remain"
+    },
+    {
+      "area": "thumb_register_alu_edges",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "800 cases per CPU: shifts/count boundaries, Rd=Rs aliases, ADC/SBC/NEG/MUL; ARM9 MUL C checked, ARM7 MUL C excluded; remaining Thumb addressing/encoding/register/PC/SP/branch matrices open"
+    },
+    {
+      "area": "four_scored_cpu_isa_groups",
+      "status": "IMPLEMENTED_AND_VALIDATED",
+      "scope": "ARM7/ARM7Thumb/ARM9/ARM9Thumb independent execution and scoring; v3 registry/score/trace, selector isolation, injected hangs resume into Thumb, full diagnostics restored"
+    },
+    {
+      "area": "thumb_aligned_memory",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "1248 cases/78 helpers per CPU; aligned immediate/register/SP loads/stores, signed loads, destination aliases, NZCV/guards/base/offset/SP; wider PC/literal/stack/misalignment/region matrices remain"
+    },
+    {
+      "area": "mixed_boot_trace_provenance",
+      "status": "IMPLEMENTED_AND_VALIDATED",
+      "scope": "trace4 per-record historical bit; runtime writer reattached after ARM9 partial restore; actual fresh Thumb execution retains separate provenance from imported ARM records"
+    },
+    {
+      "area": "thumb_sp_adjustment_address_generation",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "192 cases/12 helpers per CPU; ADD/SUB SP immediate0/4/508, ADD r0/r1,SP immediate0/4/1020; four initial SP displacements/four NZCV patterns; PC-relative, stack transfers and wider register matrices remain"
+    },
+    {
+      "area": "thumb_pc_relative_address_literal",
+      "status": "IMPLEMENTED_DEFINED_MATRIX",
+      "scope": "216 cases/54 helpers per CPU; instruction alignments0/2, offsets0/4/1020, r0/r1, flags and static literals; alignment2 offset0 uses executable BX/NOP literal only; bus-region and broader register matrices remain"
+    }
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "schema": 1,
+  "target": "1.0.0",
+  "status": "BLOCKED",
+  "policy": "coverage_first",
+  "folder": "v1.0",
+  "license_recommendation": "MIT for original project work only, subject to owner approval and upstream clearance",
+  "license_approved": true,
+  "redistribution_cleared": false,
+  "milestones": [
+    {
+      "id": "coverage",
+      "status": "OPEN",
+      "evidence": "docs/remaining-cases.json"
+    },
+    {
+      "id": "licensing",
+      "status": "BLOCKED",
+      "evidence": "docs/v1.0-release.md"
+    },
+    {
+      "id": "current_rom_full_regression",
+      "status": "OPEN",
+      "evidence": "reports/development-validation.json"
+    },
+    {
+      "id": "clean_checkout_build_and_ci",
+      "status": "OPEN"
+    },
+    {
+      "id": "repository_docs_and_templates",
+      "status": "OPEN"
+    },
+    {
+      "id": "verified_standalone_folder",
+      "status": "OPEN"
+    }
+  ],
+  "required_root_files": [
+    "README.md",
+    "LICENSE",
+    "NOTICE.md",
+    "CHANGELOG.md",
+    "CONTRIBUTING.md",
+    "SECURITY.md",
+    "AGENTS.md",
+    "Makefile",
+    "requirements.txt",
+    "upstream-lock.json",
+    "coverage.json",
+    "suite.nds",
+    "SHA256SUMS",
+    "RELEASE.json"
+  ],
+  "required_directories": [
+    "src",
+    "scripts",
+    "tests",
+    "docs",
+    "vendor",
+    "reports",
+    ".github"
+  ],
+  "excluded": [
+    ".git",
+    ".venv",
+    "__pycache__",
+    "work",
+    "core",
+    "credentials",
+    "unselected_images",
+    "old_release_archives"
+  ],
+  "acceptance": [
+    "Every remaining coverage item implemented or explicitly resolved with user-approved scope; no silent exclusions",
+    "Redistribution rights documented for upstream code, generated derivatives, fonts, assets, and combined ROM",
+    "All authoritative evidence matches the released ROM or an explicitly identified oracle ELF",
+    "Known emulator failures remain visible; harness regressions must pass",
+    "A fresh copy builds with documented dependencies and reproduces the released ROM",
+    "CI distinguishes expected backend mismatches from harness errors and unsupported oracles",
+    "Folder includes source, ROM, build/test commands, protocols, licenses, attribution, evidence and hashes",
+    "No secrets, BIOS, firmware, toolchains, nested Git metadata, or workspace-specific paths required",
+    "Package audit and full regression pass before replacing the milestone10 recovery archive"
+  ],
+  "original_code_license": "MIT",
+  "license_approval": "User approved MIT for original project code; upstream rights remain unresolved"
+}
