@@ -1,0 +1,6 @@
+10-17-26 updating suite.nds v3 (v1) at https://github.com/radicalten/Actions-Minutes3
+Can you continue to update, improve, and document my suite.nds automated tester at https://github.com/radicalten/Actions-Minutes3?  It covers ARM7TDMI and ARM946-ES ARM7/ARM9 ARM7Thumb and ARM9Thumb. It utilizes qemu, https://mgba-emu.github.io/gbatek/#armcpureference, https://github.com/RockPolish/rockwrestler, and https://github.com/mattrbeck/mgba-suite-auto/releases/tag/latest as helpful references. You will need DevkitARM to compile nds roms. Please write short snippets of your thinking as you work. Then finish each turn with a summary of the most important information. 
+
+**F1: Thank you. Please improve the suite.nds as much as you can. as you stated the previous session left stale references which needed to be cleaned. now lets improve the suite.nds and see how far we can go. we will make brand new documentation for this**
+
+**F2: Great work! Let’s expand trace capability if possible. And forget the .patch file, simply update or delete whatever files are necessary. I will upload all the updated items at the end**
