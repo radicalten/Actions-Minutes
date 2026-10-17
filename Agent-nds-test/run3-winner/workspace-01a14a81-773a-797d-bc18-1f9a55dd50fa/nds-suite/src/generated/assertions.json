@@ -1,0 +1,825 @@
+{
+  "schema": 1,
+  "instrumented": [
+    {
+      "source": "vendor/rockwrestler/src9/tests/division.cpp",
+      "line": 114,
+      "condition": "fail",
+      "id_expression": "i",
+      "original": "if (fail) fail_test(i);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 10,
+      "condition": "read_from_IPCFIFO(0x000) != 0x12345678",
+      "id_expression": "0x001",
+      "original": "if (read_from_IPCFIFO(0x000) != 0x12345678) fail_test(0x001);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 15,
+      "condition": "!(REG_IPCFIFOCNT & 1)",
+      "id_expression": "0x002",
+      "original": "if (!(REG_IPCFIFOCNT & 1)) fail_test(0x002); // send empty = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 16,
+      "condition": "REG_IPCFIFOCNT & (1 << 1)",
+      "id_expression": "0x003",
+      "original": "if (REG_IPCFIFOCNT & (1 << 1)) fail_test(0x003); // send full = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 17,
+      "condition": "!(REG_IPCFIFOCNT & (1 << 8))",
+      "id_expression": "0x004",
+      "original": "if (!(REG_IPCFIFOCNT & (1 << 8))) fail_test(0x004); // receive empty = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 18,
+      "condition": "REG_IPCFIFOCNT & (1 << 9)",
+      "id_expression": "0x005",
+      "original": "if (REG_IPCFIFOCNT & (1 << 9)) fail_test(0x005); // receive full = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 19,
+      "condition": "REG_IPCFIFOCNT & (1 << 14)",
+      "id_expression": "0x006",
+      "original": "if (REG_IPCFIFOCNT & (1 << 14)) fail_test(0x006); // error = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 29,
+      "condition": "!(REG_IPCFIFOCNT & 1)",
+      "id_expression": "0x008",
+      "original": "if (!(REG_IPCFIFOCNT & 1)) fail_test(0x008); // send empty = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 30,
+      "condition": "REG_IPCFIFOCNT & (1 << 1)",
+      "id_expression": "0x009",
+      "original": "if (REG_IPCFIFOCNT & (1 << 1)) fail_test(0x009); // send full = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 31,
+      "condition": "REG_IPCFIFOCNT & (1 << 8)",
+      "id_expression": "0x00A",
+      "original": "if (REG_IPCFIFOCNT & (1 << 8)) fail_test(0x00A); // receive empty = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 32,
+      "condition": "REG_IPCFIFOCNT & (1 << 14)",
+      "id_expression": "0x00B",
+      "original": "if (REG_IPCFIFOCNT & (1 << 14)) fail_test(0x00B); // error = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 38,
+      "condition": "word != (0x11000000 + i)",
+      "id_expression": "0x010 + i",
+      "original": "if (word != (0x11000000 + i)) fail_test(0x010 + i);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 41,
+      "condition": "!(REG_IPCFIFOCNT & 1)",
+      "id_expression": "0x020",
+      "original": "if (!(REG_IPCFIFOCNT & 1)) fail_test(0x020); // send empty = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 42,
+      "condition": "REG_IPCFIFOCNT & (1 << 1)",
+      "id_expression": "0x021",
+      "original": "if (REG_IPCFIFOCNT & (1 << 1)) fail_test(0x021); // send full = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 43,
+      "condition": "!(REG_IPCFIFOCNT & (1 << 8))",
+      "id_expression": "0x022",
+      "original": "if (!(REG_IPCFIFOCNT & (1 << 8))) fail_test(0x022); // receive empty = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 44,
+      "condition": "REG_IPCFIFOCNT & (1 << 9)",
+      "id_expression": "0x023",
+      "original": "if (REG_IPCFIFOCNT & (1 << 9)) fail_test(0x023); // receive full = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 45,
+      "condition": "REG_IPCFIFOCNT & (1 << 14)",
+      "id_expression": "0x024",
+      "original": "if (REG_IPCFIFOCNT & (1 << 14)) fail_test(0x024); // error = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 49,
+      "condition": "word != 0x1100000F",
+      "id_expression": "0x025",
+      "original": "if (word != 0x1100000F) fail_test(0x025); // seems to fail on desmume/melonDS, passes on no$gba"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 51,
+      "condition": "!(REG_IPCFIFOCNT & 1)",
+      "id_expression": "0x026",
+      "original": "if (!(REG_IPCFIFOCNT & 1)) fail_test(0x026); // send empty = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 52,
+      "condition": "REG_IPCFIFOCNT & (1 << 1)",
+      "id_expression": "0x027",
+      "original": "if (REG_IPCFIFOCNT & (1 << 1)) fail_test(0x027); // send full = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 53,
+      "condition": "!(REG_IPCFIFOCNT & (1 << 8))",
+      "id_expression": "0x028",
+      "original": "if (!(REG_IPCFIFOCNT & (1 << 8))) fail_test(0x028); // receive empty = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 54,
+      "condition": "REG_IPCFIFOCNT & (1 << 9)",
+      "id_expression": "0x029",
+      "original": "if (REG_IPCFIFOCNT & (1 << 9)) fail_test(0x029); // receive full = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 55,
+      "condition": "!(REG_IPCFIFOCNT & (1 << 14))",
+      "id_expression": "0x02A",
+      "original": "if (!(REG_IPCFIFOCNT & (1 << 14))) fail_test(0x02A); // error = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 60,
+      "condition": "!(REG_IPCFIFOCNT & (1 << 14))",
+      "id_expression": "0x02B",
+      "original": "if (!(REG_IPCFIFOCNT & (1 << 14))) fail_test(0x02B); // error = 1"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo.cpp",
+      "line": 65,
+      "condition": "REG_IPCFIFOCNT & (1 << 14)",
+      "id_expression": "0x02C",
+      "original": "if (REG_IPCFIFOCNT & (1 << 14)) fail_test(0x02C); // error = 0"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/ipcfifo_irq.cpp",
+      "line": 52,
+      "condition": "read_from_fifo != 0xA50",
+      "id_expression": "0x002",
+      "original": "if (read_from_fifo != 0xA50) fail_test(0x002);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/sqrt.cpp",
+      "line": 63,
+      "condition": "res != array[i].res",
+      "id_expression": "i",
+      "original": "if (res != array[i].res) fail_test(i);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 14,
+      "condition": "masked_readback != 0x0080000A",
+      "id_expression": "0x000",
+      "original": "if (masked_readback != 0x0080000A) fail_test(0x000);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 21,
+      "condition": "*((vu32*)0x00800000) != DTCM_START",
+      "id_expression": "0x001",
+      "original": "if (*((vu32*)0x00800000) != DTCM_START) fail_test(0x001);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 22,
+      "condition": "*((vu32*)0x00803FFC) != DTCM_END",
+      "id_expression": "0x002",
+      "original": "if (*((vu32*)0x00803FFC) != DTCM_END) fail_test(0x002);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 28,
+      "condition": "*((vu32*)0x00600000) != DTCM_START",
+      "id_expression": "0x003",
+      "original": "if (*((vu32*)0x00600000) != DTCM_START) fail_test(0x003);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 29,
+      "condition": "*((vu32*)0x00604000) != DTCM_START",
+      "id_expression": "0x004",
+      "original": "if (*((vu32*)0x00604000) != DTCM_START) fail_test(0x004);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 30,
+      "condition": "*((vu32*)0x00603FFC) != DTCM_END",
+      "id_expression": "0x005",
+      "original": "if (*((vu32*)0x00603FFC) != DTCM_END) fail_test(0x005);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 31,
+      "condition": "*((vu32*)0x00607FFC) != DTCM_END",
+      "id_expression": "0x006",
+      "original": "if (*((vu32*)0x00607FFC) != DTCM_END) fail_test(0x006);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 41,
+      "condition": "*((vu32*)0x03000000) != DTCM_START",
+      "id_expression": "0x007",
+      "original": "if (*((vu32*)0x03000000) != DTCM_START) fail_test(0x007);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 42,
+      "condition": "*((vu32*)0x033FFFFC) != DTCM_END",
+      "id_expression": "0x008",
+      "original": "if (*((vu32*)0x033FFFFC) != DTCM_END) fail_test(0x008); // + 4 MB"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 46,
+      "condition": "*((vu32*)0x03000000) != DTCM_START",
+      "id_expression": "0x009",
+      "original": "if (*((vu32*)0x03000000) != DTCM_START) fail_test(0x009);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 47,
+      "condition": "*((vu32*)0x03007FFC) != SHWRAM_END2",
+      "id_expression": "0x00A",
+      "original": "if (*((vu32*)0x03007FFC) != SHWRAM_END2) fail_test(0x00A);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 60,
+      "condition": "*((vu32*)0x03000000) != SHWRAM_START1",
+      "id_expression": "0x010",
+      "original": "if (*((vu32*)0x03000000) != SHWRAM_START1) fail_test(0x010);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 61,
+      "condition": "*((vu32*)0x03007FFC) != SHWRAM_END2",
+      "id_expression": "0x011",
+      "original": "if (*((vu32*)0x03007FFC) != SHWRAM_END2) fail_test(0x011);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 73,
+      "condition": "*((vu32*)0x00800000) != (DTCM_START + 1)",
+      "id_expression": "0x012",
+      "original": "if (*((vu32*)0x00800000) != (DTCM_START + 1)) fail_test(0x012);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 74,
+      "condition": "*((vu32*)0x00803FFC) != (DTCM_END + 1)",
+      "id_expression": "0x013",
+      "original": "if (*((vu32*)0x00803FFC) != (DTCM_END + 1)) fail_test(0x013);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 76,
+      "condition": "*((vu32*)0x03000000) != SHWRAM_START1",
+      "id_expression": "0x014",
+      "original": "if (*((vu32*)0x03000000) != SHWRAM_START1) fail_test(0x014); // make sure load-mod write did not touch this value"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 85,
+      "condition": "masked_readback != 0xC",
+      "id_expression": "0x020",
+      "original": "if (masked_readback != 0xC) fail_test(0x020);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 91,
+      "condition": "*((vu32*)0x00000000) != ITCM_START",
+      "id_expression": "0x021",
+      "original": "if (*((vu32*)0x00000000) != ITCM_START) fail_test(0x021);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 92,
+      "condition": "*((vu32*)0x00007FFC) != ITCM_END",
+      "id_expression": "0x022",
+      "original": "if (*((vu32*)0x00007FFC) != ITCM_END) fail_test(0x022);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 96,
+      "condition": "*((vu32*)0x00008000) != ITCM_START",
+      "id_expression": "0x023",
+      "original": "if (*((vu32*)0x00008000) != ITCM_START) fail_test(0x023);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/tcm.cpp",
+      "line": 97,
+      "condition": "*((vu32*)0x0000FFFC) != ITCM_END",
+      "id_expression": "0x024",
+      "original": "if (*((vu32*)0x0000FFFC) != ITCM_END) fail_test(0x024);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 35,
+      "condition": "*((vu32*)0x6800000) != VRAM_A_START",
+      "id_expression": "0x000",
+      "original": "if (*((vu32*)0x6800000) != VRAM_A_START) fail_test(0x000);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 36,
+      "condition": "*((vu32*)0x681FFFC) != VRAM_A_END",
+      "id_expression": "0x001",
+      "original": "if (*((vu32*)0x681FFFC) != VRAM_A_END) fail_test(0x001);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 37,
+      "condition": "*((vu32*)0x6820000) != VRAM_B_START",
+      "id_expression": "0x002",
+      "original": "if (*((vu32*)0x6820000) != VRAM_B_START) fail_test(0x002);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 38,
+      "condition": "*((vu32*)0x683FFFC) != VRAM_B_END",
+      "id_expression": "0x003",
+      "original": "if (*((vu32*)0x683FFFC) != VRAM_B_END) fail_test(0x003);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 39,
+      "condition": "*((vu32*)0x6840000) != VRAM_C_START",
+      "id_expression": "0x004",
+      "original": "if (*((vu32*)0x6840000) != VRAM_C_START) fail_test(0x004);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 40,
+      "condition": "*((vu32*)0x685FFFC) != VRAM_C_END",
+      "id_expression": "0x005",
+      "original": "if (*((vu32*)0x685FFFC) != VRAM_C_END) fail_test(0x005);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 41,
+      "condition": "*((vu32*)0x6860000) != VRAM_D_START",
+      "id_expression": "0x006",
+      "original": "if (*((vu32*)0x6860000) != VRAM_D_START) fail_test(0x006);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 42,
+      "condition": "*((vu32*)0x687FFFC) != VRAM_D_END",
+      "id_expression": "0x007",
+      "original": "if (*((vu32*)0x687FFFC) != VRAM_D_END) fail_test(0x007);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 45,
+      "condition": "ARM7_read_byte(0x4000240) != 0",
+      "id_expression": "0x008",
+      "original": "if (ARM7_read_byte(0x4000240) != 0) fail_test(0x008);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 52,
+      "condition": "ARM7_read_byte(0x4000240) != 1",
+      "id_expression": "0x009",
+      "original": "if (ARM7_read_byte(0x4000240) != 1) fail_test(0x009);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 55,
+      "condition": "ARM7_read_word(0x6000000) != VRAM_C_START",
+      "id_expression": "0x00A",
+      "original": "if (ARM7_read_word(0x6000000) != VRAM_C_START) fail_test(0x00A);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 56,
+      "condition": "ARM7_read_word(0x601FFFC) != VRAM_C_END",
+      "id_expression": "0x00B",
+      "original": "if (ARM7_read_word(0x601FFFC) != VRAM_C_END) fail_test(0x00B);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 62,
+      "condition": "ARM7_read_byte(0x4000240) != 1",
+      "id_expression": "0x00C",
+      "original": "if (ARM7_read_byte(0x4000240) != 1) fail_test(0x00C);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 63,
+      "condition": "ARM7_read_word(0x6020000) != VRAM_C_START",
+      "id_expression": "0x00D",
+      "original": "if (ARM7_read_word(0x6020000) != VRAM_C_START) fail_test(0x00D);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 64,
+      "condition": "ARM7_read_word(0x603FFFC) != VRAM_C_END",
+      "id_expression": "0x00E",
+      "original": "if (ARM7_read_word(0x603FFFC) != VRAM_C_END) fail_test(0x00E);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 71,
+      "condition": "ARM7_read_byte(0x4000240) != 2",
+      "id_expression": "0x00F",
+      "original": "if (ARM7_read_byte(0x4000240) != 2) fail_test(0x00F);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 72,
+      "condition": "ARM7_read_word(0x6000000) != VRAM_D_START",
+      "id_expression": "0x010",
+      "original": "if (ARM7_read_word(0x6000000) != VRAM_D_START) fail_test(0x010);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 73,
+      "condition": "ARM7_read_word(0x601FFFC) != VRAM_D_END",
+      "id_expression": "0x011",
+      "original": "if (ARM7_read_word(0x601FFFC) != VRAM_D_END) fail_test(0x011);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 79,
+      "condition": "ARM7_read_byte(0x4000240) != 3",
+      "id_expression": "0x012",
+      "original": "if (ARM7_read_byte(0x4000240) != 3) fail_test(0x012);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 80,
+      "condition": "ARM7_read_word(0x6000000) != VRAM_D_START",
+      "id_expression": "0x013",
+      "original": "if (ARM7_read_word(0x6000000) != VRAM_D_START) fail_test(0x013);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 81,
+      "condition": "ARM7_read_word(0x601FFFC) != VRAM_D_END",
+      "id_expression": "0x014",
+      "original": "if (ARM7_read_word(0x601FFFC) != VRAM_D_END) fail_test(0x014);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 82,
+      "condition": "ARM7_read_word(0x6020000) != VRAM_C_START",
+      "id_expression": "0x015",
+      "original": "if (ARM7_read_word(0x6020000) != VRAM_C_START) fail_test(0x015);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 83,
+      "condition": "ARM7_read_word(0x603FFFC) != VRAM_C_END",
+      "id_expression": "0x016",
+      "original": "if (ARM7_read_word(0x603FFFC) != VRAM_C_END) fail_test(0x016);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 89,
+      "condition": "*((vu32*)0x6000000) != VRAM_A_START",
+      "id_expression": "0x017",
+      "original": "if (*((vu32*)0x6000000) != VRAM_A_START) fail_test(0x017);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 90,
+      "condition": "*((vu32*)0x601FFFC) != VRAM_A_END",
+      "id_expression": "0x018",
+      "original": "if (*((vu32*)0x601FFFC) != VRAM_A_END) fail_test(0x018);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 96,
+      "condition": "*((vu32*)0x6020000) != VRAM_D_START",
+      "id_expression": "0x019",
+      "original": "if (*((vu32*)0x6020000) != VRAM_D_START) fail_test(0x019);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/vramcnt.cpp",
+      "line": 97,
+      "condition": "*((vu32*)0x603FFFC) != VRAM_D_END",
+      "id_expression": "0x01A",
+      "original": "if (*((vu32*)0x603FFFC) != VRAM_D_END) fail_test(0x01A);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 26,
+      "condition": "*((vu32*)0x3000000) != SHWRAM_START1",
+      "id_expression": "0x000",
+      "original": "if (*((vu32*)0x3000000) != SHWRAM_START1) fail_test(0x000);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 27,
+      "condition": "*((vu32*)0x3003FFC) != SHWRAM_END1",
+      "id_expression": "0x001",
+      "original": "if (*((vu32*)0x3003FFC) != SHWRAM_END1) fail_test(0x001);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 28,
+      "condition": "*((vu32*)0x3004000) != SHWRAM_START2",
+      "id_expression": "0x002",
+      "original": "if (*((vu32*)0x3004000) != SHWRAM_START2) fail_test(0x002);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 29,
+      "condition": "*((vu32*)0x3007FFC) != SHWRAM_END2",
+      "id_expression": "0x003",
+      "original": "if (*((vu32*)0x3007FFC) != SHWRAM_END2) fail_test(0x003);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 31,
+      "condition": "*((vu32*)0x3020000) != SHWRAM_START1",
+      "id_expression": "0x004",
+      "original": "if (*((vu32*)0x3020000) != SHWRAM_START1) fail_test(0x004);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 32,
+      "condition": "*((vu32*)0x3023FFC) != SHWRAM_END1",
+      "id_expression": "0x005",
+      "original": "if (*((vu32*)0x3023FFC) != SHWRAM_END1) fail_test(0x005);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 33,
+      "condition": "*((vu32*)0x3024000) != SHWRAM_START2",
+      "id_expression": "0x006",
+      "original": "if (*((vu32*)0x3024000) != SHWRAM_START2) fail_test(0x006);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 34,
+      "condition": "*((vu32*)0x3027FFC) != SHWRAM_END2",
+      "id_expression": "0x007",
+      "original": "if (*((vu32*)0x3027FFC) != SHWRAM_END2) fail_test(0x007);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 37,
+      "condition": "(ARM7_read_byte(0x4000241) & 3) != 0",
+      "id_expression": "0x008",
+      "original": "if ((ARM7_read_byte(0x4000241) & 3) != 0) fail_test(0x008);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 47,
+      "condition": "ARM7_read_word(0x3800000) != ARM7RAM_START",
+      "id_expression": "0x009",
+      "original": "if (ARM7_read_word(0x3800000) != ARM7RAM_START) fail_test(0x009);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 48,
+      "condition": "ARM7_read_word(0x380FFFC) != ARM7RAM_END",
+      "id_expression": "0x00A",
+      "original": "if (ARM7_read_word(0x380FFFC) != ARM7RAM_END) fail_test(0x00A);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 52,
+      "condition": "ARM7_read_word(0x3000000) != ARM7RAM_START",
+      "id_expression": "0x00B",
+      "original": "if (ARM7_read_word(0x3000000) != ARM7RAM_START) fail_test(0x00B);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 53,
+      "condition": "ARM7_read_word(0x300FFFC) != ARM7RAM_END",
+      "id_expression": "0x00C",
+      "original": "if (ARM7_read_word(0x300FFFC) != ARM7RAM_END) fail_test(0x00C);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 55,
+      "condition": "ARM7_read_word(0x3400000) != ARM7RAM_START",
+      "id_expression": "0x00D",
+      "original": "if (ARM7_read_word(0x3400000) != ARM7RAM_START) fail_test(0x00D);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 56,
+      "condition": "ARM7_read_word(0x340FFFC) != ARM7RAM_END",
+      "id_expression": "0x00E",
+      "original": "if (ARM7_read_word(0x340FFFC) != ARM7RAM_END) fail_test(0x00E);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 63,
+      "condition": "(ARM7_read_byte(0x4000241) & 3) != 1",
+      "id_expression": "0x00F",
+      "original": "if ((ARM7_read_byte(0x4000241) & 3) != 1) fail_test(0x00F);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 66,
+      "condition": "*((vu32*)0x3000000) != SHWRAM_START2",
+      "id_expression": "0x010",
+      "original": "if (*((vu32*)0x3000000) != SHWRAM_START2) fail_test(0x010);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 67,
+      "condition": "*((vu32*)0x3003FFC) != SHWRAM_END2",
+      "id_expression": "0x011",
+      "original": "if (*((vu32*)0x3003FFC) != SHWRAM_END2) fail_test(0x011);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 68,
+      "condition": "*((vu32*)0x304C000) != SHWRAM_START2",
+      "id_expression": "0x012",
+      "original": "if (*((vu32*)0x304C000) != SHWRAM_START2) fail_test(0x012);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 69,
+      "condition": "*((vu32*)0x304FFFC) != SHWRAM_END2",
+      "id_expression": "0x013",
+      "original": "if (*((vu32*)0x304FFFC) != SHWRAM_END2) fail_test(0x013);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 72,
+      "condition": "ARM7_read_word(0x3000000) != SHWRAM_START1",
+      "id_expression": "0x014",
+      "original": "if (ARM7_read_word(0x3000000) != SHWRAM_START1) fail_test(0x014);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 73,
+      "condition": "ARM7_read_word(0x3003FFC) != SHWRAM_END1",
+      "id_expression": "0x015",
+      "original": "if (ARM7_read_word(0x3003FFC) != SHWRAM_END1) fail_test(0x015);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 74,
+      "condition": "ARM7_read_word(0x300C000) != SHWRAM_START1",
+      "id_expression": "0x016",
+      "original": "if (ARM7_read_word(0x300C000) != SHWRAM_START1) fail_test(0x016);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 75,
+      "condition": "ARM7_read_word(0x300FFFC) != SHWRAM_END1",
+      "id_expression": "0x017",
+      "original": "if (ARM7_read_word(0x300FFFC) != SHWRAM_END1) fail_test(0x017);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 82,
+      "condition": "(ARM7_read_byte(0x4000241) & 3) != 2",
+      "id_expression": "0x018",
+      "original": "if ((ARM7_read_byte(0x4000241) & 3) != 2) fail_test(0x018);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 85,
+      "condition": "*((vu32*)0x3000000) != SHWRAM_START1",
+      "id_expression": "0x019",
+      "original": "if (*((vu32*)0x3000000) != SHWRAM_START1) fail_test(0x019);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 86,
+      "condition": "*((vu32*)0x3003FFC) != SHWRAM_END1",
+      "id_expression": "0x01A",
+      "original": "if (*((vu32*)0x3003FFC) != SHWRAM_END1) fail_test(0x01A);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 87,
+      "condition": "*((vu32*)0x304C000) != SHWRAM_START1",
+      "id_expression": "0x01B",
+      "original": "if (*((vu32*)0x304C000) != SHWRAM_START1) fail_test(0x01B);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 88,
+      "condition": "*((vu32*)0x304FFFC) != SHWRAM_END1",
+      "id_expression": "0x01C",
+      "original": "if (*((vu32*)0x304FFFC) != SHWRAM_END1) fail_test(0x01C);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 91,
+      "condition": "ARM7_read_word(0x3000000) != SHWRAM_START2",
+      "id_expression": "0x01D",
+      "original": "if (ARM7_read_word(0x3000000) != SHWRAM_START2) fail_test(0x01D);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 92,
+      "condition": "ARM7_read_word(0x3003FFC) != SHWRAM_END2",
+      "id_expression": "0x01E",
+      "original": "if (ARM7_read_word(0x3003FFC) != SHWRAM_END2) fail_test(0x01E);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 93,
+      "condition": "ARM7_read_word(0x300C000) != SHWRAM_START2",
+      "id_expression": "0x01F",
+      "original": "if (ARM7_read_word(0x300C000) != SHWRAM_START2) fail_test(0x01F);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 94,
+      "condition": "ARM7_read_word(0x300FFFC) != SHWRAM_END2",
+      "id_expression": "0x020",
+      "original": "if (ARM7_read_word(0x300FFFC) != SHWRAM_END2) fail_test(0x020);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 101,
+      "condition": "(ARM7_read_byte(0x4000241) & 3) != 3",
+      "id_expression": "0x021",
+      "original": "if ((ARM7_read_byte(0x4000241) & 3) != 3) fail_test(0x021);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 104,
+      "condition": "ARM7_read_word(0x3000000) != SHWRAM_START1",
+      "id_expression": "0x022",
+      "original": "if (ARM7_read_word(0x3000000) != SHWRAM_START1) fail_test(0x022);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 105,
+      "condition": "ARM7_read_word(0x3003FFC) != SHWRAM_END1",
+      "id_expression": "0x023",
+      "original": "if (ARM7_read_word(0x3003FFC) != SHWRAM_END1) fail_test(0x023);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 106,
+      "condition": "ARM7_read_word(0x300C000) != SHWRAM_START2",
+      "id_expression": "0x024",
+      "original": "if (ARM7_read_word(0x300C000) != SHWRAM_START2) fail_test(0x024);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 107,
+      "condition": "ARM7_read_word(0x300FFFC) != SHWRAM_END2",
+      "id_expression": "0x025",
+      "original": "if (ARM7_read_word(0x300FFFC) != SHWRAM_END2) fail_test(0x025);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 109,
+      "condition": "ARM7_read_word(0x3110000) != SHWRAM_START1",
+      "id_expression": "0x026",
+      "original": "if (ARM7_read_word(0x3110000) != SHWRAM_START1) fail_test(0x026);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 110,
+      "condition": "ARM7_read_word(0x3223FFC) != SHWRAM_END1",
+      "id_expression": "0x027",
+      "original": "if (ARM7_read_word(0x3223FFC) != SHWRAM_END1) fail_test(0x027);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 111,
+      "condition": "ARM7_read_word(0x333C000) != SHWRAM_START2",
+      "id_expression": "0x028",
+      "original": "if (ARM7_read_word(0x333C000) != SHWRAM_START2) fail_test(0x028);"
+    },
+    {
+      "source": "vendor/rockwrestler/src9/tests/wramcnt.cpp",
+      "line": 112,
+      "condition": "ARM7_read_word(0x344FFFC) != SHWRAM_END2",
+      "id_expression": "0x029",
+      "original": "if (ARM7_read_word(0x344FFFC) != SHWRAM_END2) fail_test(0x029);"
+    }
+  ],
+  "uncovered": "Assembly checks and multiline/direct failure paths remain group-only; no per-assertion PASS inference."
+}
