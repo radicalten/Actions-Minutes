@@ -1,0 +1,88 @@
+{
+  "schema": 1,
+  "completion": "PARTIAL_BASELINE",
+  "mgba": [
+    {
+      "group": "memory",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "io-read",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "timing",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "timers",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "timer-irq",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "shifter",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "carry",
+      "status": "PORTED_NZCV_VECTORS"
+    },
+    {
+      "group": "multiply-long",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "bios-math",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "dma",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "sio-read",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "sio-timing",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "misc-edge",
+      "status": "NOT_PORTED"
+    },
+    {
+      "group": "video",
+      "status": "NOT_PORTED"
+    }
+  ],
+  "rockwrestler": {
+    "asserting_groups": 23,
+    "status": "AUTOMATED_UNMODIFIED_ASSERTIONS",
+    "initial_state": "CAPTURED_AS_OBSERVATIONS_NOT_PASS_FAIL"
+  },
+  "cpu": {
+    "vectors_per_cpu": 653,
+    "arm_functions": 17,
+    "thumb_functions": 18,
+    "exhaustive": false,
+    "exact_qemu_arm7tdmi": false,
+    "arm946_qemu": "653_VECTORS_PASS",
+    "uncovered": [
+      "Load/store addressing matrix",
+      "Long multiplies from mgba",
+      "Full barrel shifter and PC operands",
+      "All condition combinations for generated vectors",
+      "Thumb branch/stack/memory formats",
+      "ARM exception entry/return and banked registers",
+      "SWI/undefined/prefetch/data abort behavior",
+      "CP15 architecture-specific matrix",
+      "All ARMv5TE DSP/interworking edge cases",
+      "Undefined/unpredictable encoding classification",
+      "Cycle timing"
+    ]
+  }
+}

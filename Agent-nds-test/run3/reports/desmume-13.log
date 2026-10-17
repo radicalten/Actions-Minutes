@@ -1,0 +1,14 @@
+Microphone successfully inited.
+DeSmuME 0.9.12 git#0 x64-JIT SSE2
+SoftRasterizer: Running using 2 additional threads. (Multithreading enabled.)
+
+ROM game code: ####
+ROM crc: 0CE3618A
+ROM developer: Homebrew
+
+Slot1 auto-selected device type: Retail MC+ROM
+Slot2 auto-selected device type: PassME (0x08)
+CPU mode: Interpreter
+File doesn't appear to have a secure area.
+WIFI: MAC Address = 00:09:BF:12:34:56
+WIFI: Emulation level is OFF.

@@ -1,0 +1,7 @@
+Collecting py-desmume
+  Downloading py_desmume-0.0.9-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (2.9 kB)
+Requirement already satisfied: Pillow>=6.1.0 in /usr/local/lib/python3.13/site-packages (from py-desmume) (12.3.0)
+Downloading py_desmume-0.0.9-cp313-cp313-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (3.4 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 3.4/3.4 MB 28.3 MB/s  0:00:00
+Installing collected packages: py-desmume
+Successfully installed py-desmume-0.0.9

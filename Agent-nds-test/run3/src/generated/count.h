@@ -1,0 +1,1 @@
+#define CPU_VECTOR_COUNT "653"

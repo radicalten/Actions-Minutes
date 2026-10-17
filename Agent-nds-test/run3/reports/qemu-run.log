@@ -1,0 +1,57 @@
+{
+  "version": "QEMU emulator version 10.0.13 (Debian 1:10.0.13+ds-0+deb13u1)\nCopyright (c) 2003-2025 Fabrice Bellard and the QEMU Project developers\n",
+  "exact_arm7tdmi": "UNAVAILABLE",
+  "vectors": 653,
+  "results": [
+    {
+      "cpu": "arm946",
+      "role": "ARM946 CPU functional model; not DS hardware",
+      "status": "PASS",
+      "returncode": 0,
+      "output": "PASS: 653 CPU vectors\n",
+      "command": [
+        "qemu-system-arm",
+        "-M",
+        "integratorcp",
+        "-cpu",
+        "arm946",
+        "-nographic",
+        "-monitor",
+        "none",
+        "-serial",
+        "none",
+        "-audio",
+        "driver=none",
+        "-semihosting-config",
+        "enable=on,target=native",
+        "-kernel",
+        "artifacts/oracle.elf"
+      ]
+    },
+    {
+      "cpu": "ti925t",
+      "role": "ARMv4T proxy only; NOT ARM7TDMI verification",
+      "status": "PASS",
+      "returncode": 0,
+      "output": "PASS: 653 CPU vectors\n",
+      "command": [
+        "qemu-system-arm",
+        "-M",
+        "integratorcp",
+        "-cpu",
+        "ti925t",
+        "-nographic",
+        "-monitor",
+        "none",
+        "-serial",
+        "none",
+        "-audio",
+        "driver=none",
+        "-semihosting-config",
+        "enable=on,target=native",
+        "-kernel",
+        "artifacts/oracle.elf"
+      ]
+    }
+  ]
+}

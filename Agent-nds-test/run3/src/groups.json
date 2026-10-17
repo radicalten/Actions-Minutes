@@ -1,0 +1,102 @@
+[
+  {
+    "id": 0,
+    "name": "CPU ARM9 ALU"
+  },
+  {
+    "id": 1,
+    "name": "CPU ARM7 ALU"
+  },
+  {
+    "id": 2,
+    "name": "CONDITION CODES"
+  },
+  {
+    "id": 3,
+    "name": "CLZ"
+  },
+  {
+    "id": 4,
+    "name": "QADD, QSUB"
+  },
+  {
+    "id": 5,
+    "name": "QDADD, QDSUB"
+  },
+  {
+    "id": 6,
+    "name": "SMULxy"
+  },
+  {
+    "id": 7,
+    "name": "SMLAxy"
+  },
+  {
+    "id": 8,
+    "name": "SMULWy"
+  },
+  {
+    "id": 9,
+    "name": "SMLAWy"
+  },
+  {
+    "id": 10,
+    "name": "SMLALxy"
+  },
+  {
+    "id": 11,
+    "name": "BLX"
+  },
+  {
+    "id": 12,
+    "name": "LDR r15, POP {r15}, LDM {r15}"
+  },
+  {
+    "id": 13,
+    "name": "LDM / STM"
+  },
+  {
+    "id": 14,
+    "name": "IPCSYNC"
+  },
+  {
+    "id": 15,
+    "name": "IPCFIFO"
+  },
+  {
+    "id": 16,
+    "name": "IPCFIFO IRQ"
+  },
+  {
+    "id": 17,
+    "name": "SQRT 32"
+  },
+  {
+    "id": 18,
+    "name": "SQRT 64"
+  },
+  {
+    "id": 19,
+    "name": "DIV 32/32"
+  },
+  {
+    "id": 20,
+    "name": "DIV 64/32"
+  },
+  {
+    "id": 21,
+    "name": "DIV 64/64"
+  },
+  {
+    "id": 22,
+    "name": "WRAM CNT"
+  },
+  {
+    "id": 23,
+    "name": "VRAM CNT"
+  },
+  {
+    "id": 24,
+    "name": "TCM"
+  }
+]

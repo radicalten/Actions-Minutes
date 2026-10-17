@@ -1,0 +1,11 @@
+{
+  "mgba-suite-auto": {
+    "url": "https://github.com/mattrbeck/mgba-suite-auto",
+    "commit": "2b239cfe63f15ec8ab9cbedb4c09498fc98e7b70",
+    "release_tag": "latest"
+  },
+  "rockwrestler": {
+    "url": "https://github.com/RockPolish/rockwrestler",
+    "commit": "b0067a06cddb9bbc9c46ecf0c60a2d572594e581"
+  }
+}

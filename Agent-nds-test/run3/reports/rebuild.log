@@ -1,0 +1,25 @@
+653 vectors generated
+src9/tests/vramcnt.cpp: In function 'void run_tests_vramcnt()':
+src9/tests/vramcnt.cpp:10:83: warning: using value of assignment with 'volatile'-qualified left operand is deprecated [-Wvolatile]
+   10 |     REG_VRAMCNT_A = REG_VRAMCNT_B = REG_VRAMCNT_C = REG_VRAMCNT_D = REG_VRAMCNT_E = 0x80;
+src9/tests/vramcnt.cpp:10:67: warning: using value of assignment with 'volatile'-qualified left operand is deprecated [-Wvolatile]
+   10 |     REG_VRAMCNT_A = REG_VRAMCNT_B = REG_VRAMCNT_C = REG_VRAMCNT_D = REG_VRAMCNT_E = 0x80;
+src9/tests/vramcnt.cpp:10:51: warning: using value of assignment with 'volatile'-qualified left operand is deprecated [-Wvolatile]
+   10 |     REG_VRAMCNT_A = REG_VRAMCNT_B = REG_VRAMCNT_C = REG_VRAMCNT_D = REG_VRAMCNT_E = 0x80;
+src9/tests/vramcnt.cpp:10:35: warning: using value of assignment with 'volatile'-qualified left operand is deprecated [-Wvolatile]
+   10 |     REG_VRAMCNT_A = REG_VRAMCNT_B = REG_VRAMCNT_C = REG_VRAMCNT_D = REG_VRAMCNT_E = 0x80;
+src9/tests/vramcnt.cpp:11:67: warning: using value of assignment with 'volatile'-qualified left operand is deprecated [-Wvolatile]
+   11 |     REG_VRAMCNT_F = REG_VRAMCNT_G = REG_VRAMCNT_H = REG_VRAMCNT_I = 0x80;
+src9/tests/vramcnt.cpp:11:51: warning: using value of assignment with 'volatile'-qualified left operand is deprecated [-Wvolatile]
+   11 |     REG_VRAMCNT_F = REG_VRAMCNT_G = REG_VRAMCNT_H = REG_VRAMCNT_I = 0x80;
+src9/tests/vramcnt.cpp:11:35: warning: using value of assignment with 'volatile'-qualified left operand is deprecated [-Wvolatile]
+   11 |     REG_VRAMCNT_F = REG_VRAMCNT_G = REG_VRAMCNT_H = REG_VRAMCNT_I = 0x80;
+src9/tests/armv5.s: Assembler messages:
+src9/tests/armv5.s:1318: Warning: writeback of base register when in register list is UNPREDICTABLE
+src9/tests/armv5.s:1334: Warning: writeback of base register when in register list is UNPREDICTABLE
+src9/tests/armv5.s:1363: Warning: writeback of base register when in register list is UNPREDICTABLE
+src9/tests/armv5.s:1416: Warning: writeback of base register is UNPREDICTABLE
+src9/tests/armv5.s:1509: Warning: if writeback register is in list, it must be the lowest reg in the list
+/opt/devkitpro/devkitARM/arm-none-eabi/bin/ld: warning: ../../artifacts/arm9.elf has a LOAD segment with RWX permissions
+Nintendo DS rom tool 2.3.1 - Jan  8 2024
+by Rafael Vuijk, Dave Murphy, Alexei Karpenko

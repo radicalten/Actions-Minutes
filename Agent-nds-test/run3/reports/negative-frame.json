@@ -1,0 +1,75 @@
+{
+  "id": 0,
+  "status": "HOST_FRAME_TIMEOUT",
+  "rom_sha256": "8bba1875c44e1b8fa4a660787caf48fe8b5f883b5572117e40077d256cd9b0b7",
+  "last_mailbox": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "startup_observations": {
+    "val_CPSR": [
+      31
+    ],
+    "val_IPCSYNC": [
+      0
+    ],
+    "val_IPCFIFOCNT": [
+      257
+    ],
+    "FIFO_length": [
+      0
+    ],
+    "val_IME": [
+      0
+    ],
+    "val_IE": [
+      0
+    ],
+    "val_IF": [
+      0
+    ],
+    "val_cp15": [
+      73848,
+      0,
+      0,
+      0,
+      0,
+      0,
+      572662306,
+      572662306,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      8388618,
+      12
+    ],
+    "arm7_boot": [
+      0,
+      257,
+      0,
+      0,
+      0,
+      0,
+      31
+    ]
+  },
+  "cpu7_mailbox": [
+    1129338167,
+    0,
+    0,
+    0,
+    0,
+    0
+  ],
+  "pc9": 33585784
+}
