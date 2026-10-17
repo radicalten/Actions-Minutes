@@ -1,0 +1,66 @@
+extern "C" unsigned cpu_family_count(),v5_family_count(),cpu_family(unsigned),v5_family(unsigned);
+extern "C" const char* cpu_family_name(unsigned),*v5_family_name(unsigned);
+extern "C" void cpu_info(unsigned,unsigned*),v5_info(unsigned,unsigned*);
+static unsigned selected_family[2]={0,0},selected_case[2]={1,1},selected_event=0;
+static bool family_mode=true;
+static unsigned total(unsigned c){return c?CPU_ARM7_VECTOR_TOTAL:CPU_ARM9_VECTOR_TOTAL;}
+static unsigned family(unsigned id){return id<=CPU_VECTOR_TOTAL?cpu_family(id):cpu_family_count()+v5_family(id);}
+static unsigned families(unsigned c){return cpu_family_count()+(c?0:v5_family_count());}
+static vu32* trace(unsigned c){return (vu32*)(c?0x02340000:0x02300000);}
+static bool valid_trace(unsigned c){vu32* h=trace(c);return h[0]==0x43545235 && h[3]==total(c) && h[9]==40 && h[10]==CPU_MANIFEST_CRC;}
+static const char* state_name(unsigned s){return s==2?"PASS":s==3?"FAIL":s==1?"IN PROGRESS":"NOT RUN";}
+static void vector_page(unsigned c) {
+ vu32* h=trace(c);bool valid=valid_trace(c);unsigned id=selected_case[c],f=selected_family[c];
+ unsigned info[7];if(id<=CPU_VECTOR_TOTAL)cpu_info(id,info);else v5_info(id,info);
+ vu32* r=h+16+10*(id-1);unsigned state=valid?r[0]:0;
+ if(state)for(unsigned i=0;i<6;i++)info[i]=r[i+4];
+ const char* name=f<cpu_family_count()?cpu_family_name(f):v5_family_name(f-cpu_family_count());
+ text(0,0,c?"ARM7 VECTOR EXPLORER":"ARM9 VECTOR EXPLORER");
+ text(0,1,"FAMILY");dec(7,1,f+1);text(11,1,"/");dec(13,1,families(c));
+ if(valid && h[11])text(19,1,"PRIOR BOOT");
+ text(0,2,name);unsigned n=0;while(name[n] && n<32)n++;if(n==32)text(0,3,name+32);
+ unsigned planned=0,pass=0,fail=0,waiting=0;
+ for(unsigned i=1;i<=total(c);i++)if(family(i)==f){planned++;unsigned s=valid?h[16+10*(i-1)]:0;if(s==2)pass++;else if(s==3)fail++;else waiting++;}
+ text(0,4,"PLAN");dec(5,4,planned);text(11,4,"PASS");dec(16,4,pass);text(22,4,"FAIL");dec(27,4,fail);
+ text(0,5,"UNFINISHED");dec(11,5,waiting);text(17,5,family_mode?"SELECT:FAMILY":"SELECT:CASE");
+ text(0,7,"CASE");dec(5,7,id);text(12,7,state_name(state));
+ text(0,8,"A");hex(2,8,info[0]);text(12,8,"B");hex(14,8,info[1]);
+ text(0,9,"INITIAL");hex(9,9,info[2]);
+ text(0,11,"PRIMARY EXPECT     OBSERVED");hex(0,12,info[3]);
+ if(state>=2){hex(19,12,r[1]);text(0,13,"XOR");hex(9,13,info[3]^r[1]);}else text(19,12,"--------");
+ text(0,15,"AUX EXPECT         OBSERVED");hex(0,16,info[4]);
+ if(state>=2)hex(19,16,r[2]);else text(19,16,"--------");
+ text(0,17,"AUX MASK");hex(9,17,info[5]);if(!info[5])text(19,17,"NOT CHECKED");
+ text(0,18,"MASK XOR");if(state>=2)hex(9,18,(info[4]^r[2])&info[5]);else text(9,18,"--------");
+ text(0,19,"HELPER PC");if(state)hex(11,19,r[3]);else text(11,19,"NOT EXECUTED");
+ text(0,21,"UP/DN:MOVE A:FAM/CASE B:NEXT FAIL");
+ ui[5]=family_mode;ui[6]=f;ui[7]=id;
+}
+static void assertion_page() {
+ vu32* h=(vu32*)0x02380000;unsigned count=h[0]==0x41535235?h[3]:0;
+ text(0,0,"C++ ASSERTION EVENT JOURNAL");text(0,2,"EXECUTED");dec(10,2,count);
+ text(18,2,"DROPPED");dec(26,2,h[4]);
+ if(count){selected_event%=count;vu32* r=h+16+5*selected_event;
+  text(0,4,"EVENT");dec(7,4,selected_event+1);text(15,4,r[4]==1?"PASS":"FAIL");
+  text(0,6,"GROUP");dec(7,6,r[0]);text(0,7,suite_group_name(r[0]));
+  text(0,9,"ASSERT ID");hex(12,9,r[1]);text(0,10,"SOURCE LINE");dec(13,10,r[2]);
+  text(0,12,"FAIL PREDICATE EXPECT 00000000");text(0,13,"OBSERVED");hex(12,13,r[3]);
+ }
+ text(0,16,"EXECUTED EVENTS ONLY");text(0,17,"OTHER CHECKS: GROUP-ONLY/UNKNOWN");
+ text(0,19,"SOURCE EXPRESSIONS IN HOST HTML");text(0,21,"UP/DN:EVENT B:NEXT FAILURE");ui[8]=selected_event;
+}
+static void debug_keys(unsigned page,unsigned keys) {
+ if(page==9 || page==10){unsigned c=page-9,n=total(c),id=selected_case[c];
+  if(keys&KEY_MASK_A)family_mode=!family_mode;
+  if(keys&KEY_MASK_B){if(valid_trace(c))for(unsigned i=1;i<=n;i++){unsigned candidate=(id-1+i)%n+1;if(trace(c)[16+10*(candidate-1)]==3){selected_case[c]=candidate;selected_family[c]=family(candidate);family_mode=false;break;}}}
+  if(keys&(KEY_MASK_UP|KEY_MASK_DOWN)){
+   bool next=keys&KEY_MASK_DOWN;
+   if(family_mode){selected_family[c]=(selected_family[c]+(next?1:families(c)-1))%families(c);for(unsigned i=1;i<=n;i++)if(family(i)==selected_family[c]){selected_case[c]=i;break;}}
+   else for(unsigned i=1;i<=n;i++){unsigned candidate=(id-1+(next?i:n-i))%n+1;if(family(candidate)==selected_family[c]){selected_case[c]=candidate;break;}}
+  }
+ }else if(page==11){vu32* h=(vu32*)0x02380000;unsigned n=h[0]==0x41535235?h[3]:0;if(n){
+  if(keys&KEY_MASK_DOWN)selected_event=(selected_event+1)%n;
+  if(keys&KEY_MASK_UP)selected_event=(selected_event+n-1)%n;
+  if(keys&KEY_MASK_B)for(unsigned i=1;i<=n;i++){unsigned candidate=(selected_event+i)%n;if(h[16+5*candidate+4]==2){selected_event=candidate;break;}}
+ }}
+}
