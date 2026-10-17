@@ -1,0 +1,34 @@
+{
+  "val_CPSR": {
+    "address": 33579244,
+    "bytes": 4
+  },
+  "val_IPCSYNC": {
+    "address": 33760176,
+    "bytes": 2
+  },
+  "val_IPCFIFOCNT": {
+    "address": 33760178,
+    "bytes": 2
+  },
+  "FIFO_length": {
+    "address": 33760180,
+    "bytes": 2
+  },
+  "val_IME": {
+    "address": 33760184,
+    "bytes": 4
+  },
+  "val_IE": {
+    "address": 33760188,
+    "bytes": 4
+  },
+  "val_IF": {
+    "address": 33760192,
+    "bytes": 4
+  },
+  "val_cp15": {
+    "address": 33579248,
+    "bytes": 72
+  }
+}
