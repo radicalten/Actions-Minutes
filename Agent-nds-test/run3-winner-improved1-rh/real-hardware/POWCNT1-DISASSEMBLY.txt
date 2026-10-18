@@ -1,0 +1,26 @@
+POWCNT1 halfword-access verification
+
+Artifact: artifacts/arm9.elf from the successful `make build`
+Disassembler: devkitARM arm-none-eabi-objdump -d -C
+The STRH base-plus-four accesses below target 0x04000304 (POWCNT1).
+
+ARM9 early startup, init_iostate:
+
+0200015c <init_iostate>:
+ 2000174: e59f202c  ldr   r2, [pc, #44]  @ 20001a8 <init_iostate+0x4c>
+ 2000178: e59f002c  ldr   r0, [pc, #44]  @ 20001ac <init_iostate+0x50>
+ 200017c: e1c200b4  strh  r0, [r2, #4]
+ 20001a8: 04000300  .word 0x04000300
+ 20001ac: ffff8003  .word 0xffff8003
+
+Lower-screen initialization, bottom_setup:
+
+02000664 <bottom_setup()>:
+ 2000678: e59f30f4  ldr   r3, [pc, #244] @ 2000774 <bottom_setup()+0x110>
+ 200067c: e59f00f4  ldr   r0, [pc, #244] @ 2000778 <bottom_setup()+0x114>
+ 2000680: e59fe0f4  ldr   lr, [pc, #244] @ 200077c <bottom_setup()+0x118>
+ 2000688: e1c0e0b4  strh  lr, [r0, #4]
+ 2000778: 04000300  .word 0x04000300
+ 200077c: ffff8203  .word 0xffff8203
+
+This verifies the instruction width in the built ARM9 image; it does not prove physical hardware behavior or resolution of the reported white screens.

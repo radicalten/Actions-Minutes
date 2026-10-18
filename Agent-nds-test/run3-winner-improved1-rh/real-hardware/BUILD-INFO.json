@@ -1,0 +1,20 @@
+{
+  "artifact": "suite.nds",
+  "sha256": "8259d5b024014bd24b6fa2dc669c7fd7e1793d9f2e90a3158b553010475872f3",
+  "size_bytes": 2036233,
+  "build_command": "make build",
+  "compiler": "devkitARM GCC 16.1.0",
+  "ndstool": "2.3.1",
+  "trace_version": 5,
+  "arm9_vectors": 13380,
+  "arm7_vectors": 12056,
+  "pinned_upstreams": {
+    "rockwrestler": "b0067a06cddb9bbc9c46ecf0c60a2d572594e581",
+    "mgba-suite-auto": "2b239cfe63f15ec8ab9cbedb4c09498fc98e7b70"
+  },
+  "host_tests": "make host passed",
+  "nds_header_crc": "0x6601 (OK)",
+  "nds_logo_crc": "0x9E1A (OK)",
+  "physical_hardware_tested": false,
+  "desmume_tested": false
+}
