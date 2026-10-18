@@ -1,0 +1,3 @@
+sd:/suite.nds
+MAX_FRAMES=120
+CHECKPOINTS=1,10,120
