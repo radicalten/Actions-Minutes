@@ -1,0 +1,37 @@
+{
+  "schema": 1,
+  "dependencies": [
+    {
+      "name": "mgba-suite-auto",
+      "url": "https://github.com/mattrbeck/mgba-suite-auto.git",
+      "revision": "2b239cfe63f15ec8ab9cbedb4c09498fc98e7b70",
+      "purpose": "Carry-table source and attribution for the 93 imported carry checks.",
+      "license_note": "MIT; preserve the upstream LICENSE and copyright notice.",
+      "required_paths": [
+        "src/carry.c",
+        "LICENSE"
+      ]
+    },
+    {
+      "name": "rockwrestler",
+      "url": "https://github.com/RockPolish/rockwrestler.git",
+      "revision": "b0067a06cddb9bbc9c46ecf0c60a2d572594e581",
+      "purpose": "Original ARM/Thumb and Nintendo DS test groups used by the ROM and QEMU adapter.",
+      "license_note": "No LICENSE/COPYING was found at this revision; redistribution permission is unresolved.",
+      "required_paths": [
+        "src9/entry.s",
+        "src9/framework/main.s",
+        "src9/framework/interwork.s",
+        "src9/tests/tests.h",
+        "src9/tests/armv4.s",
+        "src9/tests/armv5.s",
+        "src7/entry.s",
+        "src7/framework/main.s",
+        "src7/framework/waitloop.cpp",
+        "src7/framework/rw.cpp",
+        "src7/tests/ipcfifo_irq.cpp",
+        "src7/tests/ipcsync.cpp"
+      ]
+    }
+  ]
+}
