@@ -1,0 +1,2 @@
+py-desmume==0.0.9
+Pillow==13.0.0
