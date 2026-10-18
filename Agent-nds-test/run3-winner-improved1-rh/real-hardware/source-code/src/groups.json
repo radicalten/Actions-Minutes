@@ -1,0 +1,118 @@
+[
+  {
+    "id": 0,
+    "name": "ARM7",
+    "cpu": 7,
+    "isa": "ARM"
+  },
+  {
+    "id": 1,
+    "name": "ARM7Thumb",
+    "cpu": 7,
+    "isa": "THUMB"
+  },
+  {
+    "id": 2,
+    "name": "ARM9",
+    "cpu": 9,
+    "isa": "ARM"
+  },
+  {
+    "id": 3,
+    "name": "ARM9Thumb",
+    "cpu": 9,
+    "isa": "THUMB"
+  },
+  {
+    "id": 4,
+    "name": "CONDITION CODES"
+  },
+  {
+    "id": 5,
+    "name": "CLZ"
+  },
+  {
+    "id": 6,
+    "name": "QADD, QSUB"
+  },
+  {
+    "id": 7,
+    "name": "QDADD, QDSUB"
+  },
+  {
+    "id": 8,
+    "name": "SMULxy"
+  },
+  {
+    "id": 9,
+    "name": "SMLAxy"
+  },
+  {
+    "id": 10,
+    "name": "SMULWy"
+  },
+  {
+    "id": 11,
+    "name": "SMLAWy"
+  },
+  {
+    "id": 12,
+    "name": "SMLALxy"
+  },
+  {
+    "id": 13,
+    "name": "BLX"
+  },
+  {
+    "id": 14,
+    "name": "LDR r15, POP {r15}, LDM {r15}"
+  },
+  {
+    "id": 15,
+    "name": "LDM / STM"
+  },
+  {
+    "id": 16,
+    "name": "IPCSYNC"
+  },
+  {
+    "id": 17,
+    "name": "IPCFIFO"
+  },
+  {
+    "id": 18,
+    "name": "IPCFIFO IRQ"
+  },
+  {
+    "id": 19,
+    "name": "SQRT 32"
+  },
+  {
+    "id": 20,
+    "name": "SQRT 64"
+  },
+  {
+    "id": 21,
+    "name": "DIV 32/32"
+  },
+  {
+    "id": 22,
+    "name": "DIV 64/32"
+  },
+  {
+    "id": 23,
+    "name": "DIV 64/64"
+  },
+  {
+    "id": 24,
+    "name": "WRAM CNT"
+  },
+  {
+    "id": 25,
+    "name": "VRAM CNT"
+  },
+  {
+    "id": 26,
+    "name": "TCM"
+  }
+]
