@@ -1,0 +1,90 @@
+{
+  "suite": "NDS 2D Raster Score Suite",
+  "version": "1.8.0",
+  "automatic_start": true,
+  "requires_input": false,
+  "scoring": {
+    "method": "main-engine display capture compared pixelwise to an independent software reference renderer",
+    "capture_size": "256x192 RGB555",
+    "pixels_per_test": 49152,
+    "channel_tolerance_rgb555": 1,
+    "per_test_score": "matched pixels / 49152, displayed as a percentage",
+    "total_score": "sum of matched pixels / (49152 * 8), displayed as a percentage",
+    "difference_image": {
+      "green": "match within tolerance",
+      "red": "missing: actual black, expected nonblack",
+      "pink": "extra: actual nonblack, expected black",
+      "blue": "wrong color or position"
+    },
+    "reference_note": "Reference is spec-derived software rendering, not a captured hardware golden. It reads the test's programmed tile/map/palette inputs, so setup-memory writes are not independently verified.",
+    "capture_limitation": "DS display capture scores the composed main 2D engine only. The sub engine is kept in Mode 0 with only BG0 enabled for the status console; tests do not write its VRAM, palette, layer, or blend registers.",
+    "timeout_handling": "VCOUNT/frame-boundary polling and capture polling are bounded. If video scanlines stall or capture does not complete before its poll budget expires, the card is reported as FRAME/CAPTURE TIMEOUT, skipped, and execution continues. Timed-out cards are excluded from the valid pixel-match total.",
+    "capture_poll_budget_iterations": 4000000,
+    "frame_wait_poll_budget_iterations": 800000
+  },
+  "automatic_timing": {
+    "hold_vblanks_per_test": 30,
+    "vblank_hz_nominal": 60,
+    "nominal_test_result_display_seconds": 0.5,
+    "runs_once_then_stops_on_results_screen": true,
+    "start_button_reruns_suite": true
+  },
+  "tests": [
+    {
+      "id": "01",
+      "title": "Text BG / palette / tile flips",
+      "scored_engine": "main",
+      "features": ["mode 0", "4bpp text BG", "palette banks", "tile map entries", "horizontal flip", "vertical flip"],
+      "reference_model": "software text-BG fetch with palette bank and tile flip handling"
+    },
+    {
+      "id": "02",
+      "title": "Scroll offsets / map wrap",
+      "scored_engine": "main",
+      "features": ["text BG scroll registers", "non-tile-aligned scroll (13,7)", "256x256 text-map wrap"],
+      "reference_model": "software text-BG fetch at screen coordinate plus scroll offset"
+    },
+    {
+      "id": "03",
+      "title": "BG priority / alpha blend",
+      "scored_engine": "main",
+      "features": ["two tiled BG layers", "priority", "alpha source/target masks", "8/16 alpha coefficients"],
+      "reference_model": "software BG composition and RGB555 alpha blend, with one-step channel tolerance"
+    },
+    {
+      "id": "04",
+      "title": "Affine tile BG / wrap",
+      "scored_engine": "main",
+      "features": ["mode 2 affine BG2", "8bpp tile/map", "affine PA/PB/PC/PD", "wrap"],
+      "reference_model": "software affine coordinate transform, 128x128 wrap, tile and palette fetch"
+    },
+    {
+      "id": "05",
+      "title": "Extended 16-bit bitmap BG",
+      "scored_engine": "main",
+      "features": ["mode 5 extended BG2", "256x256 RGB555 bitmap", "opacity bit", "boundary pixels"],
+      "reference_model": "software identity sample from the programmed RGB555 bitmap"
+    },
+    {
+      "id": "06",
+      "title": "Affine bitmap / repeat edge",
+      "scored_engine": "main",
+      "features": ["mode 5 affine bitmap BG2", "affine matrix", "wrap"],
+      "reference_model": "software affine coordinate transform, 256x256 wrap and bitmap fetch"
+    },
+    {
+      "id": "07",
+      "title": "Window mask / BG mosaic",
+      "scored_engine": "main",
+      "features": ["WIN0 bounds", "WININ/WINOUT layer masks", "4x4 BG mosaic"],
+      "reference_model": "software window-boundary layer selection and mosaic sampling"
+    },
+    {
+      "id": "08",
+      "title": "OBJ size / priority / transparency",
+      "scored_engine": "main",
+      "features": ["1D tiled OBJ mapping", "4bpp palette", "8/16/32/64 sizes", "priority", "flip", "transparency"],
+      "reference_model": "software sprite scan/composition over a tiled text background"
+    }
+  ]
+}
