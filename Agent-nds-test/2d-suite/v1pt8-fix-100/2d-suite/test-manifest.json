@@ -1,0 +1,41 @@
+{
+  "rom": "nds-2d-agent-suite.nds",
+  "title": "NDS 2D TEST",
+  "game_code": "N2DT",
+  "description": "Unattended NDS 2D BG/OBJ raster score suite. Each card drives the main 2D engine, captures the composed output with the display-capture unit and compares it against an independent ARM9 software reference rasterizer.",
+  "screen": {
+    "width": 256,
+    "height": 192,
+    "pixels_per_card": 49152,
+    "engine": "main",
+    "capture": "DISPCAPCNT display capture, mode A, VRAM block A"
+  },
+  "scoring": {
+    "format": "RGB555",
+    "tolerance_per_channel": 1,
+    "unit": "matched pixels per card and overall total",
+    "timed_out_cards": "excluded from the pixel-match total and counted separately",
+    "diff_colors": {
+      "green": "match",
+      "red": "missing (actual black, expected nonblack)",
+      "pink": "extra (actual nonblack, expected black)",
+      "blue": "wrong colour or position"
+    }
+  },
+  "cards": [
+    { "id": 1, "name": "Text BG / palette / tile flips", "features": ["mode 0", "4bpp text BG", "map entries", "palette banks", "H/V flips"] },
+    { "id": 2, "name": "Scroll offsets / map wrap", "features": ["BGHOFS/BGVOFS (13, 7)", "map wrapping"] },
+    { "id": 3, "name": "BG priority / alpha blend", "features": ["two text BGs", "priority ordering", "BLDCNT target masks", "EVA/EVB 8/16"] },
+    { "id": 4, "name": "Affine tile BG / wrap", "features": ["mode 2", "8bpp affine BG", "affine matrix", "16x16-tile map", "BGCNT wrap"] },
+    { "id": 5, "name": "Extended 16-bit bitmap BG", "features": ["mode 5", "256x256 RGB555 bitmap", "opacity bit"] },
+    { "id": 6, "name": "Affine bitmap / repeat edge", "features": ["mode 5", "affine bitmap matrix", "wrapping"] },
+    { "id": 7, "name": "Window mask / BG mosaic", "features": ["WIN0 geometry", "WININ/WINOUT layer masks", "4x4 BG mosaic"] },
+    { "id": 8, "name": "OBJ size / priority / transparency", "features": ["1D tiled OBJ mapping", "4bpp sprites", "8/16/32/64-pixel sizes", "H/V flips", "OBJ priority", "transparent pixels"] }
+  ],
+  "reference": "spec-derived software model, not recorded from hardware; a score below 100% signals a pixel mismatch, not necessarily an emulator defect",
+  "build": {
+    "toolchain": "devkitARM + libnds (nds-dev), ndstool via ds_rules",
+    "header_fixup": "tools/fix_header.py",
+    "command": "make clean && make"
+  }
+}
