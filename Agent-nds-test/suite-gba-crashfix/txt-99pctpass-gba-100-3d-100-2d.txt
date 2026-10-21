@@ -1,0 +1,83 @@
+1. Headless Dolphin Benchmark Results (frameskip = 0 on All Runs)
+Overall Accuracy Across All Three Suites
+Test Suite
+Subsystem Measured
+default-NooDS-Wii-v1pt5 Baseline
+NooDS-Wii-v1pt63 (New)
+Change
+suite.gba (mGBA Suite Auto)
+GBA CPU, Memory, I/O, Timing, Prefetch, Timers, IRQs, Math, DMA, SIO
+3,498 / 6,998 (49.99%) (crashed at Frame 24 prior to heap fix)
+6,997 / 6,998 (99.99%)
++3,499 tests (+50.00 pp)
+nds-2d-agent-suite.nds
+NDS 2D BG/OBJ/Blend/Affine/Window/Mosaic
+8 / 8 cards (100.00%)
+8 / 8 cards (100.00%)
+Bit-for-bit identical (0 regressions)
+suite-poly.nds (CPU + 3D)
+NDS ARM9/ARM7 CPU Groups + 3D Polygon Rasterization
+26 / 28 groups (92.86%); 77 / 77 3D scenes (100.00%)
+28 / 28 groups (100.00%); 77 / 77 3D scenes (100.00%)
+
+
+Per-Sub-Suite Breakdown on suite.gba (frameskip = 0)
+Sub-Suite (suite.gba)
+Baseline (v1pt5)
+NooDS-Wii-v1pt63
+Status
+Memory tests
+1,215 / 1,552 (78.29%)
+1,552 / 1,552 (100.00%)
+100% PASS
+I/O read tests
+48 / 130 (36.92%)
+130 / 130 (100.00%)
+100% PASS
+Timing tests
+365 / 2,020 (18.07%)
+2,020 / 2,020 (100.00%)
+100% PASS
+Timer count-up tests
+128 / 936 (13.68%)
+936 / 936 (100.00%)
+100% PASS
+Timer IRQ tests
+0 / 90 (0.00%)
+90 / 90 (100.00%)
+100% PASS
+Shifter tests
+140 / 140 (100.00%)
+140 / 140 (100.00%)
+100% PASS
+Carry tests
+93 / 93 (100.00%)
+93 / 93 (100.00%)
+100% PASS
+Multiply long tests
+52 / 72 (72.22%)
+72 / 72 (100.00%)
+100% PASS
+BIOS math tests
+404 / 615 (65.69%)
+615 / 615 (100.00%)
+100% PASS
+DMA tests
+984 / 1,244 (79.10%)
+1,244 / 1,244 (100.00%)
+100% PASS
+SIO register R/W tests
+65 / 90 (72.22%)
+90 / 90 (100.00%)
+100% PASS
+SIO timing tests
+0 / 4 (0.00%)
+4 / 4 (100.00%)
+100% PASS
+Misc. edge case tests
+4 / 12 (33.33%)
+11 / 12 (91.67%)
++7 tests
+TOTAL (ALL DONE=True)
+3,498 / 6,998 (49.99%)
+6,997 / 6,998 (99.99%)
