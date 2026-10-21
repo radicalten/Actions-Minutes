@@ -1,0 +1,2 @@
+sd:/noods/roms/suite-poly.nds
+MAX_FRAMES=1300
