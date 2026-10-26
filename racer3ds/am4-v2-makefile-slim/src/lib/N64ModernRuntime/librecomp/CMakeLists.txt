@@ -1,0 +1,94 @@
+cmake_minimum_required(VERSION 3.20)
+
+project(librecomp)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED True)
+
+option(RECOMP_NO_MODS "Build without the mod system (no live recompiler, mod loading or hot patching)" OFF)
+option(RECOMP_STATIC_MODS "Mod system for mods baked into the executable at build time (librecomp/static_mods.h), without the live recompiler or native code patching" OFF)
+
+# Define the library
+add_library(librecomp STATIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ai.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/cont.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/config_option.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/config.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/dp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/eep.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/euc-jp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/extensions.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/files.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/flash.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/heap.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/math_routines.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/overlays.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/pak.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/pi.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/print.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/rsp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/sp.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_stubs.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/ultra_translation.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/vi.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../thirdparty/o1heap/o1heap/o1heap.c"
+)
+
+if (RECOMP_NO_MODS)
+    target_sources(librecomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/mods_stub.cpp")
+    target_compile_definitions(librecomp PUBLIC RECOMP_NO_MODS)
+else()
+    target_sources(librecomp PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mods.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_events.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_hooks.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_manifest.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/mod_config_api.cpp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/patcher.cpp"
+    )
+    if (RECOMP_STATIC_MODS)
+        # Only the mod symbol parser from the recompiler.
+        target_sources(librecomp PRIVATE "${PROJECT_SOURCE_DIR}/../N64Recomp/src/mod_symbols.cpp")
+        target_compile_definitions(librecomp PUBLIC RECOMP_STATIC_MODS)
+    endif()
+endif()
+
+target_include_directories(librecomp PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${PROJECT_SOURCE_DIR}/../ultramodern/include"
+    "${PROJECT_SOURCE_DIR}/../thirdparty"
+    "${PROJECT_SOURCE_DIR}/../thirdparty/concurrentqueue"
+    "${PROJECT_SOURCE_DIR}/../thirdparty/o1heap"
+)
+target_include_directories(librecomp PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/librecomp"
+)
+
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+    target_compile_options(librecomp PRIVATE
+    #    -Wall
+    #    -Wextra
+        -Wno-unused-parameter
+    )
+endif()
+
+if (WIN32)
+    add_compile_definitions(NOMINMAX)
+endif()
+
+add_subdirectory(${PROJECT_SOURCE_DIR}/../thirdparty/miniz ${CMAKE_CURRENT_BINARY_DIR}/miniz)
+if (RECOMP_NO_MODS OR RECOMP_STATIC_MODS)
+    # Only the recompiler's headers are needed (overlays.cpp uses a constant
+    # from recompiler/context.h, and game.hpp includes recomp.h, so consumers
+    # need the path too); the live recompiler is not built.
+    target_include_directories(librecomp PUBLIC "${PROJECT_SOURCE_DIR}/../N64Recomp/include")
+    target_link_libraries(librecomp PRIVATE ultramodern)
+else()
+    add_subdirectory(${PROJECT_SOURCE_DIR}/../N64Recomp ${CMAKE_CURRENT_BINARY_DIR}/N64Recomp EXCLUDE_FROM_ALL)
+    target_link_libraries(librecomp PRIVATE ultramodern N64Recomp LiveRecomp)
+endif()
+target_link_libraries(librecomp PUBLIC miniz)
