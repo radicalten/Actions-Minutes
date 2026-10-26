@@ -1,0 +1,72 @@
+#ifndef __RECOMP_ADDRESSES_HPP__
+#define __RECOMP_ADDRESSES_HPP__
+
+#include <cstdint>
+#include "ultramodern/ultra64.h"
+#include "recomp.h"
+
+namespace recomp {
+#if defined(__3DS__)
+    // The 3DS commits all of this, so it is only the game's 8 MB, the patch RAM
+    // above it (RAMBASE 0x80801000 in the patches' linker script) and the
+    // recomp heap. RECOMP_MEM_SIZE_MB overrides it per game.
+#   ifndef RECOMP_MEM_SIZE_MB
+#       define RECOMP_MEM_SIZE_MB 16
+#   endif
+    constexpr size_t mem_size = (size_t)RECOMP_MEM_SIZE_MB * 1024ULL * 1024ULL;
+    constexpr size_t allocation_size = mem_size;
+#else
+    // 512MB (kseg0 size): the part of the address space that is readable/writable.
+    constexpr size_t kseg0_size = 512ULL * 1024ULL * 1024ULL;
+    // A title whose own code touches hardware registers directly (kseg1, 0xA4000000+)
+    // can raise this with RECOMP_MEM_SIZE_MB so those accesses land in scratch memory
+    // instead of faulting. The heap never extends past kseg0_size either way.
+#   ifdef RECOMP_MEM_SIZE_MB
+    constexpr size_t mem_size = RECOMP_MEM_SIZE_MB * 1024ULL * 1024ULL;
+    static_assert(mem_size >= kseg0_size);
+#   else
+    constexpr size_t mem_size = kseg0_size;
+#   endif
+    // 4GB (the full address space)
+    constexpr size_t allocation_size = 4096ULL * 1024ULL * 1024ULL;
+#endif
+    // We need a place in rdram to hold the PI handles, so pick an address in extended rdram
+    constexpr int32_t cart_handle = 0x80800000;
+    constexpr int32_t drive_handle = (int32_t)(cart_handle + sizeof(OSPiHandle));
+    constexpr int32_t flash_handle = (int32_t)(drive_handle + sizeof(OSPiHandle));
+    constexpr int32_t flash_handle_end = (int32_t)(flash_handle + sizeof(OSPiHandle));
+    constexpr int32_t patch_rdram_start = 0x80801000;
+    static_assert(patch_rdram_start >= flash_handle_end);
+#if defined(__3DS__)
+    // Where the recomp heap starts when there are no mods: just past the
+    // patches' RAM. RECOMP_HEAP_START overrides it per game (it must sit above
+    // the patches' .bss end, which their link map reports).
+#   ifndef RECOMP_HEAP_START
+#       define RECOMP_HEAP_START 0x80A00000
+#   endif
+    constexpr int32_t heap_rdram_start = (int32_t)RECOMP_HEAP_START;
+    static_assert((uint32_t)heap_rdram_start - 0x80000000u < mem_size, "heap start outside RDRAM");
+    // Baked mods' sections (RECOMP_STATIC_MODS) go there, and the heap after them.
+    constexpr int32_t mod_rdram_start = heap_rdram_start;
+#else
+    constexpr int32_t mod_rdram_start = 0x81000000;
+#endif
+
+    // Flashram occupies the same physical address as sram, but that issue is avoided because libultra exposes
+    // a high-level interface for flashram. Because that high-level interface is reimplemented, low level accesses
+    // that involve physical addresses don't need to be handled for flashram.
+    constexpr uint32_t sram_base = 0x08000000;
+    constexpr uint32_t rom_base = 0x10000000;
+    constexpr uint32_t drive_base = 0x06000000;
+
+    void register_heap_exports();
+    uint32_t heap_rdram_address();
+    void init_heap(uint8_t* rdram, uint32_t address);
+    void* alloc(uint8_t* rdram, size_t size);
+    void free(uint8_t* rdram, void* mem);
+}
+
+extern "C" void recomp_alloc(uint8_t* rdram, recomp_context* ctx);
+extern "C" void recomp_free(uint8_t* rdram, recomp_context* ctx);
+
+#endif
