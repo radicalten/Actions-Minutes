@@ -1,0 +1,65 @@
+Racer 3DS - Nintendo 3DS build target for sp00nznet/racer
+==========================================================
+
+This repository vendors complete, already-integrated source trees. There are
+no patch files to apply and no downloads performed at build time. Each vendored
+component keeps its original license file in its own directory; the summary
+below is an index, not a substitute for those licenses.
+
+Top-level components
+--------------------
+
+platform/3ds/                         New code written for this target (MIT).
+                                      The 3DS GameDesc, host functions, CMake
+                                      packaging glue and HOME Menu icon.
+
+lib/rt64-3ds/                         RT64-equivalent PICA200 renderer and 3DS
+                                      platform runtime (MIT, see
+                                      lib/rt64-3ds/LICENSE). Includes the CMake
+                                      packaging modules, RSF template and shader
+                                      build rules used by this target.
+
+lib/N64ModernRuntime/                 N64ModernRuntime fork with the resolved
+                                      3DS changes vendored directly in its
+                                      sources (GNU GPL v3, see
+                                      lib/N64ModernRuntime/COPYING). Its
+                                      librecomp/ and ultramodern/ subtrees
+                                      provide the recompilation runtime, and
+                                      thirdparty/ holds the components listed
+                                      below.
+
+lib/N64ModernRuntime/N64Recomp/       N64Recomp recompiler toolchain and
+                                      RSPRecomp, used as host tools (MIT, see
+                                      lib/N64ModernRuntime/N64Recomp/LICENSE).
+
+Vendored third-party components (each with its license in place)
+-----------------------------------------------------------------
+
+lib/N64ModernRuntime/thirdparty/:
+  concurrentqueue, json, miniz, o1heap, sse2neon, xxHash
+lib/N64ModernRuntime/N64Recomp/lib/:
+  ELFIO, fmt, rabbitizer, sljit, tomlplusplus
+lib/rt64-3ds/third_party/:
+  GamepadMotionHelpers
+
+ROM-derived data
+----------------
+
+No ROM-derived data is committed or redistributed: no recompiled game
+functions, no RSP microcode output, no textures and no audio. The ROM itself is
+never copied into the repository. Running tools/3ds/recompile.sh generates
+such data locally under platform/3ds/generated/ (gitignored) from the user's
+own legally-owned ROM, and a locally built Racer3DS.cia therefore contains
+code derived from that ROM. It must not be redistributed without the rights to
+do so.
+
+At runtime the game expects the user's ROM at
+sdmc:/3ds/racer/baserom.z64 and validates it with an XXH3 hash
+(0x9B89D0F9EBC12D32) before starting.
+
+Trademarks
+----------
+
+Star Wars and Episode I: Racer are trademarks of their respective owners.
+This project is an unofficial, non-commercial technical port and is not
+affiliated with or endorsed by the trademark holders.
