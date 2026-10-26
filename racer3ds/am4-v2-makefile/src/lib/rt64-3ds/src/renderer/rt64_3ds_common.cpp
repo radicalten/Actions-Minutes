@@ -1,0 +1,32 @@
+// Settings, the per-game description, and the host-function hooks shared by
+// every renderer implementation.
+#include "rt64_3ds.h"
+
+#include <cstdio>
+
+namespace {
+rt64_3ds::RenderDesc g_desc{};
+rt64_3ds::Settings g_settings{};
+rt64_3ds::FrameStats g_stats{};
+volatile bool g_first_person = false;
+char g_data_dir[160] = "sdmc:/3ds";
+}
+
+void rt64_3ds::set_data_dir(const char* dir) { snprintf(g_data_dir, sizeof(g_data_dir), "%s", dir); }
+void rt64_3ds::data_path(char* out, size_t size, const char* name) { snprintf(out, size, "%s/%s", g_data_dir, name); }
+FILE* rt64_3ds::data_fopen(const char* name, const char* mode) {
+    char path[224];
+    data_path(path, sizeof(path), name);
+    return fopen(path, mode);
+}
+
+void rt64_3ds::set_render_desc(const RenderDesc& desc) { g_desc = desc; }
+const rt64_3ds::RenderDesc& rt64_3ds::render_desc() { return g_desc; }
+rt64_3ds::ScreenGeometry rt64_3ds::screen_geometry() { return ScreenGeometry::make((int)g_desc.vi_width, (int)g_desc.vi_height); }
+rt64_3ds::Settings& rt64_3ds::settings() { return g_settings; }
+const rt64_3ds::FrameStats& rt64_3ds::stats() { return g_stats; }
+rt64_3ds::FrameStats& rt64_3ds::mutable_stats() { return g_stats; }
+void rt64_3ds::set_first_person(bool on) { g_first_person = on; }
+bool rt64_3ds::first_person_scene() { return g_first_person; }
+
+
