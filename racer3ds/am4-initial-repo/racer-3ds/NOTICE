@@ -1,0 +1,16 @@
+Racer 3DS - Nintendo 3DS build target for sp00nznet/racer
+
+platform/3ds/            new code for this target, MIT.
+N64ModernRuntime,        their respective licences (see COPYING / LICENSE in each
+N64Recomp, RT64          repository). runtime-patches/ contains small additive edits;
+                         runtime-patches/n64modernruntime-3ds.patch is the full diff.
+platform/3ds/include/font8x8.h
+                         an 8x8 bitmap font rasterised from DejaVu Sans Mono.
+                         DejaVu fonts are under the Bitstream Vera licence:
+                         Copyright (c) 2003 by Bitstream, Inc. All Rights Reserved.
+                         DejaVu changes are in the public domain.
+                         https://dejavu-fonts.github.io/License.html
+
+No ROM-derived data (recompiled game code, RSP microcode, textures, audio) is included in
+this folder. The .3dsx and .cia contain no game code: they are the platform layer and a
+self-test that reads the user's own ROM from the SD card and validates its CRC.
