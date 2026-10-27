@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Racer 3DS Offline Builder</title>
+<style>
+  :root { color-scheme: dark; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; background: #0c1117; color: #eef3f6; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: radial-gradient(ellipse at 80% 0%, #1b3039 0, #0c1117 48%); min-height: 100vh; }
+  main { max-width: 760px; margin: 0 auto; padding: 48px 24px 72px; }
+  .eyebrow { color: #8cdee1; font-size: .74rem; text-transform: uppercase; font-weight: 750; letter-spacing: .16em; }
+  h1 { font-size: clamp(2rem, 6vw, 3.3rem); letter-spacing: -.045em; line-height: 1.05; margin: 12px 0; }
+  .lead { color: #bdcbd1; line-height: 1.6; margin: 0; max-width: 590px; }
+  .card { margin-top: 30px; padding: 26px; background: #141d25; border: 1px solid #2c3b46; border-radius: 14px; box-shadow: 0 22px 70px #0003; }
+  .number { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 8px; background: #31585d; color: #b3f0ed; margin-right: 10px; font-size: .8rem; }
+  h2 { font-size: 1.05rem; margin: 0 0 13px; letter-spacing: -.01em; }
+  p, li { color: #b9c7ce; line-height: 1.55; font-size: .93rem; }
+  .hint { margin: 0 0 16px 36px; }
+  .asset-status { margin: 8px 0 0; color: #a5c3c6; font-size: .83rem; }
+  .rom-step { margin-top: 25px; }
+  input[type=file] { display: block; width: 100%; padding: 13px; background: #0c141a; border: 1px dashed #617882; border-radius: 9px; color: #d8e6eb; font: inherit; }
+  input[type=file]::file-selector-button { border: 0; border-radius: 6px; background: #2e424c; color: #fff; padding: 8px 12px; margin-right: 13px; font-weight: 650; cursor: pointer; }
+  button, .download { border: 0; border-radius: 8px; background: #a7e9e1; color: #102825; padding: 12px 19px; font: inherit; font-size: .93rem; font-weight: 750; cursor: pointer; text-decoration: none; display: inline-block; }
+  button:hover, .download:hover { background: #cef8f2; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  button.secondary { background: #263641; color: #e3edef; }
+  button.secondary:hover { background: #344955; }
+  .actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
+  .muted { color: #8ea1aa; font-size: .83rem; }
+  .privacy { display: flex; gap: 11px; margin-top: 20px; padding-top: 18px; border-top: 1px solid #2b3a45; }
+  .privacy svg { flex: none; color: #9de8de; }
+  .privacy p { margin: 0; font-size: .85rem; }
+  #work[hidden], #results[hidden], #error[hidden], #cancel[hidden] { display: none; }
+  #work { margin-top: 26px; }
+  .statusrow { display: flex; justify-content: space-between; gap: 12px; font-weight: 650; font-size: .9rem; }
+  .detail { min-height: 1.3em; margin: 7px 0 12px; color: #9eb0b8; font-size: .83rem; }
+  progress { width: 100%; height: 9px; border: 0; border-radius: 99px; overflow: hidden; background: #293a43; accent-color: #a7e9e1; }
+  progress::-webkit-progress-bar { background: #293a43; }
+  progress::-webkit-progress-value { background: #a7e9e1; border-radius: 99px; }
+  progress::-moz-progress-bar { background: #a7e9e1; border-radius: 99px; }
+  #error { margin-top: 18px; border: 1px solid #8b514a; color: #ffd5cb; background: #3a2624; border-radius: 9px; padding: 13px 15px; white-space: pre-wrap; font-size: .88rem; overflow-wrap: anywhere; }
+  #results { margin-top: 22px; padding: 20px; background: #183330; border: 1px solid #386e65; border-radius: 10px; }
+  #results h2 { margin-bottom: 5px; }
+  #results p { margin: 5px 0; }
+  .instructions { margin: 23px 2px 0; }
+  .instructions h2 { margin-top: 25px; }
+  .instructions ol { padding-left: 22px; }
+  code { color: #e3f5f3; background: #26343d; border-radius: 4px; padding: 2px 5px; overflow-wrap: anywhere; }
+  details { margin-top: 18px; color: #9db1ba; font-size: .85rem; }
+  summary { cursor: pointer; font-weight: 650; }
+  pre { white-space: pre-wrap; overflow-wrap: anywhere; background: #0b1318; padding: 12px; border-radius: 8px; max-height: 210px; overflow: auto; font: .76rem/1.5 ui-monospace, monospace; }
+  footer { margin-top: 30px; color: #8298a2; font-size: .78rem; line-height: 1.55; }
+  footer button { padding: 0; background: none; color: #9ddbd7; font-size: inherit; text-decoration: underline; font-weight: 500; }
+  footer button:hover { background: none; color: #d3fffa; }
+  @media(max-width: 560px) { main { padding: 30px 16px 50px; } .card { padding: 20px; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">Offline · browser-only · experimental</div>
+  <h1>Racer 3DS Builder</h1>
+  <p class="lead">Turn your own supported N64 ROM into the 3DS homebrew files, entirely on your computer.</p>
+  <section class="card" aria-label="Build Racer 3DS">
+    <h2><span class="number">1</span>Select the assets folder</h2>
+    <p class="hint">After extracting the ZIP, choose its <code>assets</code> folder. Your browser may call this permission “Upload”; the files stay local.</p>
+    <input id="asset-folder" type="file" webkitdirectory directory multiple aria-label="Choose the extracted assets folder">
+    <p id="asset-status" class="asset-status" aria-live="polite">No assets folder selected.</p>
+    <h2 class="rom-step"><span class="number">2</span>Select your ROM</h2>
+    <p class="hint">Choose the supported US NEPE <code>.z64</code> ROM, or a ZIP containing it. The exact revision is checked before the build.</p>
+    <input id="rom" type="file" accept=".z64,.zip,application/zip,application/octet-stream" aria-label="Choose your ROM or ZIP">
+    <div class="actions"><button id="build" disabled>Build 3DS files</button><button id="cancel" class="secondary" hidden>Cancel build</button><span class="muted">Keep this tab open while building.</span></div>
+    <div class="privacy">
+      <svg width="19" height="20" viewBox="0 0 20 20" fill="none" aria-hidden="true"><path d="M10 1.7 16 4v4.6c0 4-2.5 7.2-6 9.1-3.5-1.9-6-5.1-6-9.1V4l6-2.3Z" stroke="currentColor" stroke-width="1.5"/><path d="m7.1 9.8 1.9 1.9 3.8-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <p><strong>Private by design.</strong> The builder makes no network requests. The selected assets and ROM are read locally; generated code stays in browser memory until you download the outputs.</p>
+    </div>
+    <div id="work" hidden aria-live="polite">
+      <div class="statusrow"><span id="status">Preparing…</span><span id="percentage">0%</span></div>
+      <p id="detail" class="detail"></p><progress id="progress" max="100" value="0" aria-label="Build progress"></progress>
+      <details><summary>Build details</summary><pre id="log"></pre></details>
+    </div>
+    <div id="error" hidden role="alert"></div>
+    <div id="results" hidden>
+      <h2>Build complete</h2><p>Download both files. They contain ROM-derived code; keep them private.</p>
+      <div class="actions"><a class="download" id="download3dsx" download="Racer3DS.3dsx">Download .3dsx</a><a class="download" id="downloadcia" download="Racer3DS.cia">Download .cia</a></div>
+    </div>
+  </section>
+  <section class="instructions">
+    <h2><span class="number">3</span>Put the files on your 3DS</h2>
+    <ol><li>Copy your original, uncompressed ROM to <code>SD:/3ds/racer/baserom.z64</code>.</li><li>Copy the homebrew file to <code>SD:/3ds/Racer3DS.3dsx</code>, or install the CIA with a compatible installer.</li></ol>
+    <p>Use a current desktop browser with WebAssembly and enough free memory. The first compilation can take several minutes. This is experimental; hardware and audio behavior may differ from emulation.</p>
+  </section>
+  <footer>Unofficial community project. No ROM is included. Audio interpreter provenance and third-party licenses are included in the source package. <button id="sources" type="button" disabled>Download source and licenses</button> (select the assets folder first).</footer>
+</main>
+<script type="text/plain" id="worker-source">/* Offline Racer 3DS build worker. All binary assets are supplied from the selected local assets
+   folder; the only fetch implementation below serves those verified assets. */
+'use strict';
+
+const pendingAssets = new Map();
+let requestNumber = 0;
+const decoder = new TextDecoder();
+const encoder = new TextEncoder();
+let started = false;
+
+function progress(step, percent, detail = '') {
+  postMessage({ type: 'progress', step, percent, detail });
+}
+function note(text) {
+  if (text) postMessage({ type: 'log', text: String(text) });
+}
+function requestCompressed(name) {
+  const id = ++requestNumber;
+  return new Promise((resolve, reject) => {
+    pendingAssets.set(id, { resolve, reject });
+    postMessage({ type: 'asset-request', id, name });
+  });
+}
+async function asset(name) {
+  const buffer = await requestCompressed(name);
+  if (!globalThis.DecompressionStream) {
+    throw new Error('This browser does not support built-in gzip decompression. Use a recent desktop Chrome, Edge, or Firefox.');
+  }
+  const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+function scriptUrl(bytes) {
+  return URL.createObjectURL(new Blob([bytes], { type: 'text/javascript' }));
+}
+async function loadClassicScript(name) {
+  const url = scriptUrl(await asset(name));
+  try { importScripts(url); } finally { URL.revokeObjectURL(url); }
+}
+async function loadModule(name, rewrite = null) {
+  let bytes = await asset(name);
+  if (rewrite) bytes = encoder.encode(rewrite(decoder.decode(bytes)));
+  const url = scriptUrl(bytes);
+  try { return await import(url); } finally { URL.revokeObjectURL(url); }
+}
+function checkCode(code, description, errors) {
+  if (code !== undefined && code !== 0) {
+    throw new Error(`${description} failed (exit ${code}).${errors ? '\n' + errors.slice(-4000) : ''}`);
+  }
+}
+function readText(fs, path) { return fs.readFile(path, { encoding: 'utf8' }); }
+function writePyFile(fs, path, data) {
+  fs.mkdirTree(path.slice(0, path.lastIndexOf('/')) || '/');
+  fs.writeFile(path, data);
+}
+function toolOutput(label) {
+  let errors = '';
+  return {
+    options: {
+      print: () => {},
+      printErr: line => { errors += String(line) + '\n'; }
+    },
+    error: () => errors ? `${label}: ${errors}` : ''
+  };
+}
+
+async function initializePython() {
+  progress('Preparing offline Python', 3, 'Loading Pyodide from the selected assets folder');
+  // Do not allow a mistaken asset URL to turn into a network request.
+  const map = {
+    'pyodide.asm.wasm': 'pyodide-wasm',
+    'python_stdlib.zip': 'pyodide-stdlib',
+    'pyodide-lock.json': 'pyodide-lock'
+  };
+  globalThis.fetch = async input => {
+    const url = typeof input === 'string' ? input : input.url || String(input);
+    const prefix = 'https://racer.invalid/pyodide/';
+    if (!url.startsWith(prefix)) throw new Error('Network access is disabled in this offline builder.');
+    const name = url.slice(prefix.length);
+    if (!Object.hasOwn(map, name)) throw new Error(`Unexpected offline Pyodide asset: ${name}`);
+    const bytes = await asset(map[name]);
+    return new Response(bytes, { headers: { 'content-type': name.endsWith('.wasm') ? 'application/wasm' : 'application/octet-stream' } });
+  };
+  await loadClassicScript('pyodide-js');
+  await loadClassicScript('pyodide-asm-js');
+  const lock = JSON.parse(decoder.decode(await asset('pyodide-lock')));
+  const py = await loadPyodide({
+    indexURL: 'https://racer.invalid/pyodide/',
+    lockFileContents: lock,
+    packageBaseUrl: 'https://racer.invalid/pyodide/'
+  });
+  py.setStdout({ batched: line => note(line) });
+  py.setStderr({ batched: line => note(line) });
+  return py;
+}
+
+async function generateSources(py, raw) {
+  const fs = py.FS;
+  progress('Checking your ROM', 8, 'Validating the exact supported US revision');
+  writePyFile(fs, '/input.rom', raw);
+  raw = null;
+  writePyFile(fs, '/source.zip', await asset('game-source'));
+  const romPath = py.runPython(`
+import os, sys, zipfile
+with zipfile.ZipFile('/source.zip') as archive:
+    archive.extractall('/')  # verified local, ROM-independent source archive
+ROOT = '/release-candidate3-fixed'
+sys.path.insert(0, ROOT + '/tools/3ds')
+from prepare_rom import prepare
+os.makedirs('/rom-stage', exist_ok=True)
+rom_path = prepare('/input.rom', '/rom-stage')
+rom_path.as_posix()
+`);
+  fs.unlink('/source.zip');
+  note('ROM verified: supported US NEPE revision.');
+  const root = '/release-candidate3-fixed';
+  fs.mkdirTree('/work/tools'); fs.mkdirTree('/work/src'); fs.mkdirTree('/work/rsp');
+  for (const name of ['recomp.toml', 'symbols.toml']) {
+    writePyFile(fs, '/work/' + name, fs.readFile(root + '/recomp/' + name));
+  }
+  for (const name of ['fix_fallthroughs.py', 'post_recomp_patches.py', 'gen_lookup_table.py']) {
+    writePyFile(fs, '/work/tools/' + name, fs.readFile(root + '/recomp/tools/' + name));
+  }
+  let rom = fs.readFile(romPath);
+
+  progress('Recompiling the game', 12, 'Running N64Recomp locally');
+  {
+    const { default: factory } = await loadModule('n64recomp');
+    const log = toolOutput('N64Recomp');
+    const tool = await factory(log.options);
+    tool.FS.mkdir('/work'); tool.FS.chdir('/work');
+    tool.FS.writeFile('baserom.z64', rom);
+    tool.FS.writeFile('recomp.toml', fs.readFile('/work/recomp.toml'));
+    tool.FS.writeFile('symbols.toml', fs.readFile('/work/symbols.toml'));
+    const code = tool.callMain(['recomp.toml']);
+    checkCode(code, 'N64Recomp', log.error());
+    const generated = tool.FS.readdir('RecompiledFuncs').filter(n => n !== '.' && n !== '..');
+    if (generated.filter(n => /^funcs_\d+\.c$/.test(n)).length !== 28 || !generated.includes('lookup.cpp')) {
+      throw new Error('N64Recomp did not generate the expected game sources.');
+    }
+    fs.mkdirTree('/work/RecompiledFuncs');
+    for (const file of generated) {
+      writePyFile(fs, '/work/RecompiledFuncs/' + file, tool.FS.readFile('RecompiledFuncs/' + file));
+    }
+    tool.FS.unlink('baserom.z64');
+  }
+
+  progress('Patching generated code', 19, 'Applying the tested Racer fixes');
+  py.runPython(`
+import os, runpy, sys
+os.chdir('/work')
+for script in ('fix_fallthroughs.py', 'post_recomp_patches.py'):
+    sys.argv = [script]
+    runpy.run_path('/work/tools/' + script, run_name='__main__')
+`);
+
+  progress('Recompiling audio microcode', 23, 'Running RSPRecomp locally');
+  {
+    const { default: factory } = await loadModule('rsprecomp');
+    const log = toolOutput('RSPRecomp');
+    const tool = await factory(log.options);
+    tool.FS.mkdir('/work'); tool.FS.chdir('/work'); tool.FS.mkdir('rsp');
+    tool.FS.writeFile('baserom.z64', rom);
+    const original = readText(fs, root + '/recomp/rsp/aspMain.toml');
+    const config = original.replace('rom_file_path = "../baserom.z64"', 'rom_file_path = "baserom.z64"')
+                           .replace('output_file_path = "aspMain.cpp"', 'output_file_path = "rsp/aspMain.cpp"');
+    tool.FS.writeFile('aspMain.toml', config);
+    const code = tool.callMain(['aspMain.toml']);
+    checkCode(code, 'RSPRecomp', log.error());
+    const rsp = tool.FS.readFile('rsp/aspMain.cpp');
+    if (!decoder.decode(rsp).includes('RspExitReason aspMain(')) throw new Error('RSP entry point was not generated.');
+    writePyFile(fs, '/work/rsp/aspMain.cpp', rsp);
+    tool.FS.unlink('baserom.z64');
+  }
+  rom = null;
+  // Delete temporary copies early; the chosen input and the downloadable outputs
+  // remain owned by the browser/user and are never silently modified.
+  if (romPath !== '/input.rom') fs.unlink(romPath);
+  fs.unlink('/input.rom');
+  py.runPython(`
+os.chdir('/work')
+sys.argv = ['gen_lookup_table.py']
+runpy.run_path('/work/tools/gen_lookup_table.py', run_name='__main__')
+`);
+  return root;
+}
+
+async function compileAndLink(py, root) {
+  progress('Preparing the ARM compiler', 28, 'Loading the offline WebAssembly toolchain');
+  // A blob module has no hierarchical base URL. Point the compiler's internal
+  // resource lookups to a virtual URL; the supplied loader serves all assets.
+  const llvm = await loadModule('llvm-js', text => text.replaceAll('import.meta.url', '"https://racer.invalid/llvm/bundle.js"'));
+  const llvmAssets = {
+    'llvm.core.wasm': 'llvm-core', 'llvm.core2.wasm': 'llvm-core2',
+    'llvm.core3.wasm': 'llvm-core3', 'llvm.core4.wasm': 'llvm-core4',
+    'llvm-resources.tar': 'llvm-resources'
+  };
+  llvm.setAssetLoader(async name => {
+    if (!Object.hasOwn(llvmAssets, name)) throw new Error('Unexpected LLVM asset: ' + name);
+    return await asset(llvmAssets[name]);
+  });
+  const s = llvm.createSession();
+  const fs = py.FS;
+  const copyTree = async (src, dest) => {
+    for (const name of fs.readdir(src)) {
+      if (name === '.' || name === '..') continue;
+      const p = src + '/' + name, q = dest + '/' + name;
+      const st = fs.stat(p);
+      if (fs.isDir(st.mode)) await copyTree(p, q);
+      else if (fs.isFile(st.mode)) await s.writeFile(q, fs.readFile(p));
+    }
+  };
+  for (const sub of ['N64Recomp/include', 'ultramodern/include', 'librecomp/include']) {
+    await copyTree(root + '/lib/N64ModernRuntime/' + sub, '/work/include/' + sub.split('/')[0]);
+  }
+  await s.writeFile('/work/include/racer_host_protos.h', fs.readFile(root + '/platform/3ds/racer_host_protos.h'));
+  await copyTree('/work/RecompiledFuncs', '/work/src');
+  await s.writeFile('/work/src/section_table.cpp', fs.readFile('/work/src/section_table.cpp'));
+  await s.writeFile('/work/src/aspMain.cpp', fs.readFile('/work/rsp/aspMain.cpp'));
+  const common = [
+    '--target=arm-none-eabi', '--sysroot=/usr', '-march=armv6k', '-mtune=mpcore',
+    '-mfloat-abi=hard', '-mfpu=vfp', '-fshort-enums', '-Wno-builtin-macro-redefined',
+    '-D__INT32_TYPE__=long int', '-D__UINT32_TYPE__=long unsigned int',
+    '-D__INT_LEAST32_TYPE__=long int', '-D__UINT_LEAST32_TYPE__=long unsigned int',
+    '-D__INT_FAST8_TYPE__=int', '-D__UINT_FAST8_TYPE__=unsigned int',
+    '-D__INT_FAST16_TYPE__=int', '-D__UINT_FAST16_TYPE__=unsigned int',
+    '-D__WINT_TYPE__=unsigned int', '-ffunction-sections', '-fdata-sections',
+    '-D__3DS__', '-DARM11', '-DNDEBUG', '-fno-strict-aliasing', '-w',
+    '-I/work/src', '-I/work/include', '-I/work/include/N64Recomp',
+    '-I/work/include/ultramodern', '-I/work/include/librecomp'
+  ];
+  const funcs = fs.readdir('/work/RecompiledFuncs').filter(n => /^funcs_\d+\.c$/.test(n))
+    .sort((a, b) => Number(a.match(/\d+/)[0]) - Number(b.match(/\d+/)[0]));
+  const jobs = [
+    ...funcs.map(name => ({ name, tool: 'clang', flags: ['-std=gnu17', '-O2', '-Wno-implicit-function-declaration', '-include', '/work/include/racer_host_protos.h'] })),
+    { name: 'lookup.cpp', tool: 'clang++', flags: ['-std=gnu++20', '-O2', '-fexceptions', '-frtti', '-include', '/work/include/racer_host_protos.h'] },
+    { name: 'section_table.cpp', tool: 'clang++', flags: ['-std=gnu++20', '-O2', '-fexceptions', '-frtti', '-DRECOMP_NO_MODS', '-DMINIZ_STATIC_DEFINE'] },
+    { name: 'aspMain.cpp', tool: 'clang++', flags: ['-std=gnu++20', '-O3', '-fexceptions', '-frtti', '-DRECOMP_NO_MODS', '-DMINIZ_STATIC_DEFINE'] }
+  ];
+  let index = 0;
+  for (const job of jobs) {
+    progress('Compiling for Nintendo 3DS', 30 + Math.floor(48 * index / jobs.length), `${index + 1} of ${jobs.length}: ${job.name}`);
+    const output = '/work/obj/' + job.name + '.o';
+    let errors = '';
+    const code = await s.run([job.tool, ...common, ...job.flags, '-c', '/work/src/' + job.name, '-o', output], {
+      stdout: () => {}, stderr: chunk => { if (chunk) errors += decoder.decode(chunk); }
+    });
+    checkCode(code, 'Compiler (' + job.name + ')', errors);
+    const object = await s.readFile(output);
+    if (!object || object.length < 20 || object[0] !== 0x7f || object[1] !== 0x45 || object[18] !== 40) {
+      throw new Error('The compiler did not produce a valid ARM object: ' + job.name);
+    }
+    index++;
+  }
+
+  progress('Linking the game', 80, 'Combining compiled code with the 3DS runtime');
+  writePyFile(fs, '/runtime.zip', await asset('runtime'));
+  py.runPython(`
+import zipfile
+with zipfile.ZipFile('/runtime.zip') as archive:
+    archive.extractall('/runtime')  # verified local, ROM-independent libraries
+`);
+  fs.unlink('/runtime.zip');
+  for (const name of fs.readdir('/runtime').filter(n => n !== '.' && n !== '..')) {
+    await s.writeFile('/link/' + name, fs.readFile('/runtime/' + name));
+  }
+  const objects = ['/work/obj/section_table.cpp.o', '/work/obj/aspMain.cpp.o', '/work/obj/lookup.cpp.o', ...funcs.map(f => '/work/obj/' + f + '.o')];
+  const args = [
+    'ld.lld', '--defsym=__sync_synchronize=__sync_synchronize_dmb', '-m', 'armelf',
+    '-T', '/link/3dsx.ld', '--emit-relocs', '--gc-sections', '-o', '/link/Racer3DS',
+    '/link/3dsx_crt0.o', '/link/crti.o', '/link/crtbegin.o', '/link/main.o', '/link/api.o', ...objects,
+    '/link/librecomp_3ds.a', '/link/librt64_3ds.a', '/link/libultramodern.a',
+    '/link/liblibrecomp.a', '/link/libminiz.a', '/link/libcitro3d.a', '/link/libctru.a',
+    '/link/libultramodern.a', '/link/libstdc++.a', '/link/libm.a',
+    '--start-group', '/link/libgcc.a', '/link/libc.a', '/link/libsysbase.a', '--end-group',
+    '/link/crtend.o', '/link/crtn.o'
+  ];
+  let errors = '';
+  const code = await s.run(args, { stdout: () => {}, stderr: chunk => { if (chunk) errors += decoder.decode(chunk); } });
+  checkCode(code, 'ARM linker', errors);
+  const elf = await s.readFile('/link/Racer3DS');
+  if (!elf || elf.length < 100000 || elf[0] !== 0x7f || elf[18] !== 40) throw new Error('Linker did not produce a valid ARM executable.');
+  return elf;
+}
+
+async function packageOutputs(py, root, elf) {
+  const fs = py.FS;
+  progress('Preparing 3DS metadata', 85, 'Creating the homebrew icon');
+  let smdhBytes;
+  {
+    const { default: factory } = await loadModule('smdhtool');
+    const log = toolOutput('smdhtool');
+    const tool = await factory(log.options);
+    tool.FS.mkdir('/work'); tool.FS.chdir('/work');
+    tool.FS.writeFile('icon.png', fs.readFile(root + '/platform/3ds/icon.png'));
+    const code = tool.callMain(['--create', 'Star Wars Racer 3DS', 'Star Wars Episode I: Racer (N64 recompilation)', ' ', 'icon.png', 'icon.smdh']);
+    checkCode(code, 'Icon tool', log.error());
+    smdhBytes = tool.FS.readFile('icon.smdh');
+    if (smdhBytes.length !== 14016) throw new Error('Icon metadata has an unexpected size.');
+  }
+  progress('Creating the 3DSX', 88, 'Packaging the homebrew application');
+  let dsx;
+  {
+    const { default: factory } = await loadModule('3dsxtool');
+    const log = toolOutput('3dsxtool');
+    const tool = await factory(log.options);
+    tool.FS.mkdir('/work'); tool.FS.chdir('/work');
+    tool.FS.writeFile('input.elf', elf); tool.FS.writeFile('icon.smdh', smdhBytes);
+    const code = tool.callMain(['input.elf', 'Racer3DS.3dsx', '--smdh=icon.smdh']);
+    checkCode(code, '3DSX packager', log.error());
+    dsx = tool.FS.readFile('Racer3DS.3dsx').slice();
+    if (dsx.length < 100000 || decoder.decode(dsx.slice(0, 4)) !== '3DSX') throw new Error('Invalid 3DSX output.');
+  }
+  progress('Creating the CIA', 92, 'Packaging the installable application; this may take a little longer');
+  let cia;
+  {
+    const { default: factory } = await loadModule('makerom');
+    const log = toolOutput('makerom');
+    const tool = await factory(log.options);
+    tool.FS.mkdir('/work'); tool.FS.chdir('/work');
+    tool.FS.writeFile('input.elf', elf); tool.FS.writeFile('icon.smdh', smdhBytes);
+    let rsf = readText(fs, root + '/lib/rt64-3ds/cia/template.rsf')
+      .replaceAll('@TITLE@', 'Star Wars Racer 3DS').replaceAll('@PRODUCT@', 'RACER-3DS').replaceAll('@UNIQUEID@', '0xF9048');
+    tool.FS.writeFile('app.rsf', rsf);
+    const code = tool.callMain(['-f', 'cia', '-o', 'Racer3DS.cia', '-elf', 'input.elf', '-rsf', 'app.rsf', '-icon', 'icon.smdh', '-exefslogo', '-target', 't']);
+    checkCode(code, 'CIA packager', log.error());
+    cia = tool.FS.readFile('Racer3DS.cia').slice();
+    if (cia.length < 100000) throw new Error('CIA output is unexpectedly small.');
+  }
+  return { dsx, cia };
+}
+
+async function runBuild(buffer) {
+  try {
+    if (buffer.byteLength > 128 * 1024 * 1024) throw new Error('The selected file is too large to be the supported ROM or ZIP.');
+    const py = await initializePython();
+    const root = await generateSources(py, new Uint8Array(buffer));
+    const elf = await compileAndLink(py, root);
+    const { dsx, cia } = await packageOutputs(py, root, elf);
+    progress('Build complete', 100, 'Both private outputs are ready to download.');
+    postMessage({ type: 'done', dsx: dsx.buffer, cia: cia.buffer }, [dsx.buffer, cia.buffer]);
+  } catch (error) {
+    postMessage({ type: 'failure', message: error && error.message ? error.message : String(error), stack: error && error.stack ? String(error.stack) : '' });
+  }
+}
+
+self.onmessage = event => {
+  const data = event.data;
+  if (data.type === 'asset') {
+    const request = pendingAssets.get(data.id);
+    if (request) {
+      pendingAssets.delete(data.id);
+      if (data.error) request.reject(new Error(data.error)); else request.resolve(data.buffer);
+    }
+  } else if (data.type === 'start' && !started) {
+    started = true;
+    runBuild(data.buffer);
+  }
+};
+</script>
+
+<script>
+'use strict';
+// The manifest covers the compressed local assets, not the user's ROM.
+const ASSET_MANIFEST = {"3dsxtool":{"sha256":"bae6fdce691512b9389145482fafbd64020d2e5070d1022eef6b393c24cd1d7a","size":42093},"game-source":{"sha256":"6ea5bec053369050c00e48bf4c6bf946a257c2ec2c9ed2d2b836581a9664cefc","size":1444377},"llvm-core":{"sha256":"05cdeb10e89b34f781cc441ccd8cad87505fb4eeea92becc7a298f8996904c81","size":19544029},"llvm-core2":{"sha256":"588d457c6d9155313b32f2ecc9d403d8084e25e6ad2018ecca2410e25fc550fc","size":13789},"llvm-core3":{"sha256":"8eb7d5abe1ca42ded8a048950a25e05ef4beb7298f457a56a69a5624a1b5a72c","size":1597},"llvm-core4":{"sha256":"d154feb30299180f898ca5add7bef608989f7c8033644fd0210eae4046ef279d","size":467},"llvm-js":{"sha256":"e380f3836fe1a8a45a08bfb92ce3bcd50222bbe959b623cebc5b2bc0232d3b8a","size":30896},"llvm-resources":{"sha256":"9e778ab4926e280dee0d9371ce12dcd5c34b4221efb52f3c5c42b53afaae86b6","size":4136678},"makerom":{"sha256":"36f84b0a9c3373a2f382b87af770437bc93b3b0dbdd7ddf7c107c4f806cdf5de","size":360960},"n64recomp":{"sha256":"57ebd74906f88dcea8f187e473372d16e8bde9abb50936e4331b66f2ec52f483","size":418199},"pyodide-asm-js":{"sha256":"50048cca5f389af4249a4daedf35612c4d31523cc8d2e6dfb7458bc3ab4f1da2","size":220695},"pyodide-js":{"sha256":"39aeacd3efee38733ad18b2023f2ee64dd9de624ff240e290570daa968b83221","size":6887},"pyodide-lock":{"sha256":"3c3409c5006e7a7d457761125bfd12e4469bf4cf821742d8680ae49e30786f3b","size":25680},"pyodide-stdlib":{"sha256":"ea1ca68829374813e799e02a6c13b69c4f345da14e0e0ac085268d3dc6797f1d","size":2377711},"pyodide-wasm":{"sha256":"fb2df70f7a06a4179a6334a7f42ff66f5d3d5613ea0599e886e1f1139afce423","size":2832335},"rsprecomp":{"sha256":"ae71e084ee8d9ac9040ad0bf04012295c9a523fe69a1ccff961ad82ca75d03f3","size":275025},"runtime":{"sha256":"9349bdb51bd4affcd7d82c5145dd7522c198c47616fae7e42f3cc04b666cecb0","size":4993844},"smdhtool":{"sha256":"e80ee5948b3c46cb69ad48a4a96f2249c5041e303fca465017bb40ec83a1ec99","size":51735},"source-bundle":{"sha256":"1a765c8b92c7ba5312aa9f69c036657e198fe0394bfad8d715a9fff424ec3d4f","size":2948205}};
+const $ = id => document.getElementById(id);
+const folderInput = $('asset-folder'), romInput = $('rom'), buildButton = $('build');
+const cancelButton = $('cancel'), sourceButton = $('sources');
+let worker = null, outputUrls = [], chosenAssets = new Map();
+
+function addLog(text) {
+  const el = $('log'); el.textContent = (el.textContent + text + '\n').slice(-18000); el.scrollTop = el.scrollHeight;
+}
+function clearOutputs() {
+  for (const url of outputUrls) URL.revokeObjectURL(url);
+  outputUrls = []; $('results').hidden = true;
+}
+function setWorking(active) {
+  folderInput.disabled = active;
+  romInput.disabled = active;
+  buildButton.disabled = active || chosenAssets.size !== Object.keys(ASSET_MANIFEST).length || !romInput.files.length;
+  sourceButton.disabled = active || chosenAssets.size !== Object.keys(ASSET_MANIFEST).length;
+  cancelButton.hidden = !active;
+}
+function setError(message) { $('error').textContent = message; $('error').hidden = false; }
+function clearError() { $('error').textContent = ''; $('error').hidden = true; }
+function selectAssets() {
+  clearOutputs(); clearError();
+  const expected = Object.keys(ASSET_MANIFEST);
+  const matching = new Map(), duplicates = [];
+  for (const file of folderInput.files) {
+    if (!file.name.endsWith('.gz')) continue;
+    const name = file.name.slice(0, -3);
+    if (!Object.hasOwn(ASSET_MANIFEST, name)) continue;
+    if (matching.has(name)) duplicates.push(name); else matching.set(name, file);
+  }
+  const missing = expected.filter(name => !matching.has(name));
+  const wrongSize = expected.filter(name => matching.has(name) && matching.get(name).size !== ASSET_MANIFEST[name].size);
+  chosenAssets = new Map();
+  if (duplicates.length) {
+    $('asset-status').textContent = 'Choose the assets folder itself; duplicate files were found.';
+    setError('The selected folder has duplicate tool files: ' + duplicates.join(', '));
+  } else if (missing.length) {
+    $('asset-status').textContent = 'This folder does not contain all required builder assets.';
+    setError('Choose the extracted assets folder. Missing: ' + missing.slice(0, 6).map(n => n + '.gz').join(', ') + (missing.length > 6 ? '…' : ''));
+  } else if (wrongSize.length) {
+    $('asset-status').textContent = 'One or more tool files have the wrong size.';
+    setError('These asset files are incomplete or belong to another version: ' + wrongSize.map(n => n + '.gz').join(', '));
+  } else {
+    chosenAssets = matching;
+    $('asset-status').textContent = 'Assets folder ready (' + expected.length + ' tool files found).';
+  }
+  setWorking(false);
+}
+async function compressedAsset(name) {
+  const entry = ASSET_MANIFEST[name], file = chosenAssets.get(name);
+  if (!entry || !file) throw new Error('Select the extracted assets folder before building. Missing: ' + name + '.gz');
+  if (!globalThis.crypto || !globalThis.crypto.subtle) {
+    throw new Error('This browser cannot verify local assets. Try a recent desktop Chrome, Edge, or Firefox.');
+  }
+  const buffer = await file.arrayBuffer();
+  const hash = await crypto.subtle.digest('SHA-256', buffer);
+  const hex = Array.from(new Uint8Array(hash), n => n.toString(16).padStart(2, '0')).join('');
+  if (hex !== entry.sha256) throw new Error('The asset ' + name + '.gz is damaged or does not match this builder. Extract the ZIP again.');
+  return new Uint8Array(buffer);
+}
+async function sourceDownload() {
+  try {
+    clearError();
+    if (!globalThis.DecompressionStream) throw new Error('A newer desktop browser is required for the source download.');
+    const compressed = await compressedAsset('source-bundle');
+    const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream('gzip'));
+    const blob = await new Response(stream).blob();
+    const url = URL.createObjectURL(blob), a = document.createElement('a');
+    a.href = url; a.download = 'racer-browser-builder-source-and-licenses.zip'; a.click();
+    setTimeout(() => URL.revokeObjectURL(url), 60000);
+  } catch (e) { setError(e.message || String(e)); }
+}
+sourceButton.addEventListener('click', sourceDownload);
+folderInput.addEventListener('change', selectAssets);
+romInput.addEventListener('change', () => { clearOutputs(); clearError(); if (!worker) setWorking(false); });
+cancelButton.addEventListener('click', () => {
+  if (worker) worker.terminate();
+  worker = null; setWorking(false);
+  $('status').textContent = 'Build cancelled'; $('detail').textContent = 'Temporary build data was discarded.'; addLog('Build cancelled.');
+});
+buildButton.addEventListener('click', async () => {
+  if (!romInput.files.length || worker || chosenAssets.size !== Object.keys(ASSET_MANIFEST).length) return;
+  clearOutputs(); clearError(); $('work').hidden = false; $('log').textContent = '';
+  $('progress').value = 0; $('percentage').textContent = '0%'; $('status').textContent = 'Reading your file'; $('detail').textContent = 'Your ROM stays on this device.';
+  setWorking(true);
+  let activeWorker = null;
+  try {
+    if (!globalThis.Worker || !globalThis.WebAssembly || !globalThis.DecompressionStream || !globalThis.crypto?.subtle) {
+      throw new Error('This browser lacks a required offline feature. Try a recent desktop Chrome, Edge, or Firefox.');
+    }
+    const file = romInput.files[0];
+    if (file.size > 128 * 1024 * 1024) throw new Error('The selected file is too large to be the supported ROM or ZIP.');
+    const workerUrl = URL.createObjectURL(new Blob([$('worker-source').textContent], {type:'text/javascript'}));
+    activeWorker = new Worker(workerUrl); URL.revokeObjectURL(workerUrl); worker = activeWorker;
+    activeWorker.onerror = event => {
+      if (worker !== activeWorker) return;
+      setError(event.message || 'The browser worker stopped unexpectedly. Try another browser or free memory.');
+      addLog(event.message || 'Worker error'); activeWorker.terminate(); worker = null; setWorking(false);
+    };
+    activeWorker.onmessage = event => {
+      const message = event.data;
+      if (message.type === 'asset-request') {
+        compressedAsset(message.name).then(bytes => {
+          if (worker === activeWorker) activeWorker.postMessage({type:'asset', id:message.id, buffer:bytes.buffer}, [bytes.buffer]);
+        }, error => {
+          if (worker === activeWorker) activeWorker.postMessage({type:'asset', id:message.id, error:error.message || String(error)});
+        });
+      } else if (message.type === 'progress') {
+        $('status').textContent = message.step; $('percentage').textContent = message.percent + '%';
+        $('progress').value = message.percent; $('detail').textContent = message.detail;
+      } else if (message.type === 'log') addLog(message.text);
+      else if (message.type === 'failure') {
+        if (worker !== activeWorker) return;
+        setError(message.message); addLog(message.stack || message.message); activeWorker.terminate(); worker = null; setWorking(false);
+      } else if (message.type === 'done') {
+        if (worker !== activeWorker) return;
+        const x = URL.createObjectURL(new Blob([message.dsx], {type:'application/octet-stream'}));
+        const c = URL.createObjectURL(new Blob([message.cia], {type:'application/octet-stream'}));
+        outputUrls = [x, c]; $('download3dsx').href = x; $('downloadcia').href = c; $('results').hidden = false;
+        activeWorker.terminate(); worker = null; setWorking(false);
+      }
+    };
+    const buffer = await file.arrayBuffer();
+    if (worker === activeWorker) activeWorker.postMessage({type:'start', buffer}, [buffer]);
+  } catch (e) {
+    if (activeWorker) activeWorker.terminate();
+    if (worker === activeWorker) worker = null;
+    setWorking(false); setError(e.message || String(e));
+  }
+});
+</script>
+</body>
+</html>
